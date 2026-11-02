@@ -2,6 +2,8 @@
 
 macOS 上独立于代理客户端运行的 TUN 出口保护工具，使用 Rust、系统 PF 和终端界面。
 
+当前开发目标为 **代理 UID 兼容模式**：可信 TUN 承接普通流量，在批准物理链路上允许已批准 socket UID 的 TCP/UDP，以保留代理规则模式直连；其他未授权直连阻断。当前用户选择 UID 0，因此同条件的其他 root socket 也可直连，不能承诺仅代理程序或所有业务隐藏真实出口。该方向尚未实现；UID 不是 PID/签名身份，实际节点 IP/端口不会硬编码。
+
 **当前交付是可运行的只读工程框架，尚未提供防泄漏保护。** `tunlatchd` 仅提供网卡发现与状态查询，始终报告保护未知；不会访问 `/dev/pf`、调用 `pfctl`、更改路由或安装启动项。请使用普通用户运行。
 
 ## 构建与试运行
@@ -54,12 +56,31 @@ crates/
 | 固定工具链、工作区、lint、锁文件、CI、依赖检查策略 | 已建立 |
 | 普通用户服务 → 有界 Unix Socket → CLI / TUI | 可运行，只读 |
 | 网卡快照 | 原生 `getifaddrs`，保留 IPv4、IPv6 和 IPv6 scope；不是路由或身份验证 |
-| 配置 | 严格版本/字段/大小校验，只读；不持久化、不应用 |
+| 配置 | CLI 保留严格 v1 校验；`core::policy` 已实现有界 v2 草稿、显式迁移、规范化/摘要和条件规则判定；不持久化、不应用 |
 | PF、已有连接约束、必要直连例外 | 待原型与实机验证 |
-| 可信 TUN 绑定、事件通知、自动恢复 | 待实现 |
+| 绑定领域模型 | 已实现候选/未受信报告/关联/确认分型，确认与刷新必须核对新采集序号及 FD 实例；没有实际可信 TUN 或 PF 资格 |
+| 网络事件、平台身份采集、自动恢复 | 待实现 |
 | 特权授权、原子持久化、LaunchDaemon、安装卸载、离线解锁 | 待设计与实现 |
 
-下一步先完成 PF 能力验证：anchor 实际执行顺序与共存、失败时的事务行为、启用引用、接口绑定状态和已有连接处理。确认这些机制后再接入保护启停，不以 UI 或模型测试替代内核与物理出口证据。
+下一步先完成 PF 能力验证：socket user 的双栈 TCP/UDP、unknown/其他 UID 对照及撤销后的旧连接，连同 anchor 实际执行顺序与共存、事务、启用引用和接口复用。确认这些机制后再接入保护启停，不以 UI 或模型测试替代内核与物理出口证据。当前 v2 草稿模型没有 UID 授权；后续将通过独立受保护策略接入，文件导入不能生成批准。
+
+`tunlatch-core` 的 v2 配置和绑定 API 是无系统副作用的领域模型。普通规则的允许只返回
+`NeedsEgressAuthorization`，直连例外仅是候选；一致的采集报告不等于真实平台事实。
+`EnforcementQualifiedBinding` 当前不可安全构造。原有 CLI/IPC 未接入这些新能力，仍报告保护未知。
+
+PF 实验准备工具可用普通用户运行：
+
+```sh
+cargo run -p tunlatch-platform --example pf_lab --locked -- plan
+TUNLATCH_LAB_DIR=$(mktemp -d /tmp/tunlatch-pf-lab.XXXXXX)
+cargo run -p tunlatch-platform --example pf_lab --locked -- prepare "$TUNLATCH_LAB_DIR"
+"$TUNLATCH_LAB_DIR/pf-lab" recover
+```
+
+工具只生成候选计划、规则文本和独立准备程序；`recover` 默认也只展示计划。
+**所有实机请求均被拒绝，即使提供两个 opt-in 标志也不会执行 PF。当前没有可用的实机恢复包。**
+固定 anchor 名称、标签、收据或模拟测试均不证明内核资源归属；完整预检、可信程序部署、
+有界进程监督、接口复用、状态选择、引用和流量采集仍须补齐，实机操作另行审核。
 
 贡献约定见 [AGENTS.md](AGENTS.md)，完整工程检查见 [CI 配置](.github/workflows/ci.yml)，安全边界见 [SAFETY.md](SAFETY.md)。本地 `docs/` 保存需求、调研和编码指导，按已有 `.gitignore` 设置保留为本地资料；本 README 记录可随代码交付的架构与能力边界。
 
