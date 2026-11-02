@@ -1,0 +1,8 @@
+# Local planning and project documents
+/docs/
+
+# Rust build output
+/target/
+
+# macOS metadata
+.DS_Store
