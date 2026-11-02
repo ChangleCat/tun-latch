@@ -1339,7 +1339,9 @@ dependencies = [
 name = "tunlatch-platform"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "nix",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tunlatch-core",
