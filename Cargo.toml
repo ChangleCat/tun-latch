@@ -1,0 +1,50 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "GPL-3.0-only"
+repository = "https://github.com/ChangleCat/tun-latch"
+publish = false
+
+[workspace.dependencies]
+tunlatch-core = { path = "crates/tunlatch-core" }
+tunlatch-platform = { path = "crates/tunlatch-platform" }
+tunlatch-ipc = { path = "crates/tunlatch-ipc" }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+nix = { version = "0.31.3", default-features = false, features = ["net", "user"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tempfile = "3.23.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+exit = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+overflow-checks = true

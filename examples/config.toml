@@ -1,0 +1,3 @@
+# Read-only framework configuration. No PF enforcement is implemented yet.
+schema_version = 1
+desired = "disabled"

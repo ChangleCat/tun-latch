@@ -1,0 +1,45 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: rustup show active-toolchain
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit and local socket integration tests (no root, no PF writes)
+        run: cargo test --workspace --all-targets --locked
+      - name: Documentation tests
+        run: cargo test --workspace --doc --locked
+      - name: Public API documentation
+        run: cargo doc --workspace --no-deps --locked
+      - name: Release build
+        run: cargo build --workspace --release --locked
+      - name: Install pinned dependency checker
+        run: cargo install cargo-deny --version 0.20.2 --locked --root target/tools
+      - name: Dependency advisories, licenses and sources
+        run: target/tools/bin/cargo-deny --locked check
