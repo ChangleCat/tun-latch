@@ -8,7 +8,9 @@ use tunlatch_core::control::{SimulationError, SimulationObservation, SimulationR
 use tunlatch_core::status::{CommittedPolicy, ObservedProtection};
 use tunlatch_ipc::endpoint::ServerSocket;
 use tunlatch_ipc::protocol::{ErrorCode, PROTOCOL_VERSION, Request, RequestEnvelope};
-use tunlatch_ipc::{IpcError, query_simulation, query_status, submit_simulation};
+use tunlatch_ipc::{
+    IpcError, query_network_status, query_simulation, query_status, submit_simulation,
+};
 
 #[tokio::test]
 async fn observer_rejects_simulation_and_preserves_actual_state() -> anyhow::Result<()> {
@@ -34,14 +36,13 @@ async fn observer_rejects_simulation_and_preserves_actual_state() -> anyhow::Res
         ));
     }
     let first = query_status(dir.path()).await?;
-    let second = query_status(dir.path()).await?;
     assert_eq!(first.committed, CommittedPolicy::Unmanaged);
     assert_eq!(first.desired, DesiredProtection::Disabled);
     assert!(matches!(first.observed, ObservedProtection::Unknown { .. }));
-    assert!(
-        matches!((first.network_observation, second.network_observation),
-        (Some(first), Some(second)) if first.generation < second.generation)
-    );
+    let (with_network, first_scan) = query_network_status(dir.path()).await?;
+    let (_, next_scan) = query_network_status(dir.path()).await?;
+    assert_eq!(with_network.observed, first.observed);
+    assert!(first_scan.generation < next_scan.generation);
     stop.send(())
         .map_err(|()| anyhow::anyhow!("service already stopped"))?;
     task.await??;

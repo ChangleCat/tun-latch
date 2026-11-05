@@ -9,7 +9,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use tunlatch_core::config::DesiredProtection;
 use tunlatch_core::control::{SimulationRequest, SimulationStatus};
-use tunlatch_ipc::{query_simulation, query_status, submit_simulation};
+use tunlatch_ipc::{query_network_status, query_simulation, query_status, submit_simulation};
 
 #[derive(Parser)]
 #[command(
@@ -29,6 +29,9 @@ enum Command {
         runtime_dir: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Request extended scan diagnostics from a supporting service.
+        #[arg(long)]
+        network_details: bool,
     },
     /// Open the read-only terminal dashboard (q: quit, r: refresh).
     Tui {
@@ -124,12 +127,32 @@ enum ConfigCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Args::parse().command {
-        Command::Status { runtime_dir, json } => {
-            let status = query_status(&runtime_dir)
-                .await
-                .context("cannot obtain current status; protection is unknown")?;
+        Command::Status {
+            runtime_dir,
+            json,
+            network_details,
+        } => {
+            let (status, observation) = if network_details {
+                let (status, observation) = query_network_status(&runtime_dir)
+                    .await
+                    .context("cannot obtain network details; protection is unknown")?;
+                (status, Some(observation))
+            } else {
+                (
+                    query_status(&runtime_dir)
+                        .await
+                        .context("cannot obtain current status; protection is unknown")?,
+                    None,
+                )
+            };
             if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
+                let output = match observation {
+                    Some(observation) => {
+                        serde_json::json!({"status": status, "network_observation": observation})
+                    }
+                    None => serde_json::to_value(&status)?,
+                };
+                println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!("Protection: UNKNOWN — PF backend not implemented");
                 println!(
@@ -140,6 +163,12 @@ async fn main() -> anyhow::Result<()> {
                     "Discovered interfaces: {}; trusted TUN: none",
                     status.interfaces.len()
                 );
+                if let Some(observation) = observation {
+                    println!(
+                        "Network scan: generation {}; on-demand rescan",
+                        observation.generation
+                    );
+                }
             }
         }
         Command::Tui { runtime_dir } => tui::run(&runtime_dir).await?,

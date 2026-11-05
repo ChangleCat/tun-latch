@@ -98,14 +98,39 @@ pub struct Status {
     pub observed: ObservedProtection,
     /// Interfaces from one discovery pass. This is not a trusted binding list.
     pub interfaces: Vec<NetworkInterface>,
-    /// Scan diagnostics, absent when talking to an older observer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_observation: Option<NetworkObservation>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_wire_shape_remains_readable_by_strict_existing_clients()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Frozen pre-extension schema: older clients reject every unknown field.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyStatus {
+            desired: DesiredProtection,
+            committed: CommittedPolicy,
+            observed: ObservedProtection,
+            interfaces: Vec<NetworkInterface>,
+        }
+        let status = Status {
+            desired: DesiredProtection::Disabled,
+            committed: CommittedPolicy::Unmanaged,
+            observed: ObservedProtection::Unknown {
+                reason: UnknownReason::BackendNotImplemented,
+            },
+            interfaces: vec![],
+        };
+        let legacy: LegacyStatus = serde_json::from_slice(&serde_json::to_vec(&status)?)?;
+        assert_eq!(legacy.desired, status.desired);
+        assert_eq!(legacy.committed, status.committed);
+        assert_eq!(legacy.observed, status.observed);
+        assert_eq!(legacy.interfaces, status.interfaces);
+        Ok(())
+    }
 
     #[test]
     fn ipv6_only_interface_is_a_candidate_without_granting_trust()

@@ -119,8 +119,9 @@ async fn handle(mut stream: UnixStream, state: ServiceState) -> Result<(), IpcEr
             code: ErrorCode::UnsupportedVersion,
         }
     } else {
+        let include_network = matches!(&request.request, Request::NetworkStatus {});
         match request.request {
-            Request::Status {} => {
+            Request::Status {} | Request::NetworkStatus {} => {
                 // Native enumeration can block; keep it off the async I/O worker. Do not drop
                 // its JoinHandle on a deadline: a started native call cannot be cancelled.
                 let observer = Arc::clone(&state.network);
@@ -133,18 +134,25 @@ async fn handle(mut stream: UnixStream, state: ServiceState) -> Result<(), IpcEr
                 })
                 .await
                 {
-                    Ok(Ok((interfaces, generation))) => Reply::Status {
-                        status: Status {
+                    Ok(Ok((interfaces, generation))) => {
+                        let status = Status {
                             desired: state.desired,
                             committed: CommittedPolicy::Unmanaged,
                             observed: pf::observe(),
                             interfaces,
-                            network_observation: Some(NetworkObservation {
-                                generation,
-                                collection: NetworkCollection::OnDemandRescan,
-                            }),
-                        },
-                    },
+                        };
+                        if include_network {
+                            Reply::NetworkStatus {
+                                status,
+                                network_observation: NetworkObservation {
+                                    generation,
+                                    collection: NetworkCollection::OnDemandRescan,
+                                },
+                            }
+                        } else {
+                            Reply::Status { status }
+                        }
+                    }
                     result => {
                         tracing::error!(?result, "network observation failed");
                         Reply::Error {

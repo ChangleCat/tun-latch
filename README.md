@@ -27,10 +27,13 @@ cargo run -p tunlatchd -- --runtime-dir "$TUNLATCH_RUNTIME_DIR"
 
 ```sh
 cargo run -p tunlatch -- status --runtime-dir /tmp/tunlatch.XXXXXX --json
+cargo run -p tunlatch -- status --runtime-dir /tmp/tunlatch.XXXXXX --network-details --json
 cargo run -p tunlatch -- tui --runtime-dir /tmp/tunlatch.XXXXXX
 ```
 
 TUI 优先展示候选 TUN，支持 `↑` / `↓`、`j` / `k` 和翻页键浏览全部网卡；`q` / `Esc` / `Ctrl-C` 退出、`r` 刷新，每 2 秒获取一次状态。后台不可用或刷新失败后清除上次快照并显示错误。关闭 TUI 不会停止后台。前台后台服务用 `Ctrl-C` 或 `SIGTERM` 结束，等待在途请求及已开始的原生枚举退出后清理自己创建的 socket。
+
+普通 `status` 保持已有响应格式，旧 CLI/TUI 也能继续查询新服务。`--network-details` 显式请求带扫描代次和采集方式的扩展结果；JSON 包含 `status` 和 `network_observation` 两部分，需支持该操作的服务。
 
 服务不会覆盖已有 `control.sock`。若服务被 `SIGKILL` 导致路径残留，先确认原服务已结束，再手动移除该临时目录内的 socket；不要删除仍在运行的服务端点。当前目录只存放开发 socket，删除它不涉及 PF 恢复或停用。
 

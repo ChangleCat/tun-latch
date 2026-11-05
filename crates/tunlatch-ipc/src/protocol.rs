@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use tunlatch_core::control::{SimulationError, SimulationRequest, SimulationStatus};
-use tunlatch_core::status::Status;
+use tunlatch_core::status::{NetworkObservation, Status};
 
 /// Current wire schema. A future version must negotiate or fail explicitly.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -25,6 +25,8 @@ pub enum Request {
     // Serde unit variants ignore extra fields even with deny_unknown_fields. An empty
     // struct variant enforces the closed request schema.
     Status {},
+    /// Explicitly request scan diagnostics without extending the original status response.
+    NetworkStatus {},
     /// Submit to the explicitly enabled in-memory simulation only.
     Simulate {
         /// Bounded typed simulation intent, never an actual PF command.
@@ -52,6 +54,13 @@ pub enum Reply {
     Status {
         /// Observed service state.
         status: Status,
+    },
+    /// Extended observation, returned only for an explicit network status request.
+    NetworkStatus {
+        /// Actual status, retaining the original wire shape.
+        status: Status,
+        /// Diagnostic generation and collection method, never a trust assertion.
+        network_observation: NetworkObservation,
     },
     /// State of the isolated simulation, with no actual protection claim.
     Simulation {

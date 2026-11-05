@@ -10,7 +10,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UnixStream;
 use tunlatch_core::control::{SimulationError, SimulationRequest, SimulationStatus};
-use tunlatch_core::status::Status;
+use tunlatch_core::status::{NetworkObservation, Status};
 
 use crate::protocol::{
     ErrorCode, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, ResponseEnvelope,
@@ -70,6 +70,19 @@ pub fn verify_peer(stream: &UnixStream) -> Result<(), IpcError> {
 pub async fn query_status(runtime_dir: &Path) -> Result<Status, IpcError> {
     match exchange(runtime_dir, Request::Status {}).await? {
         Reply::Status { status } => Ok(status),
+        _ => Err(IpcError::UnexpectedReply),
+    }
+}
+
+/// Request scan diagnostics explicitly, preserving compatibility of ordinary status queries.
+pub async fn query_network_status(
+    runtime_dir: &Path,
+) -> Result<(Status, NetworkObservation), IpcError> {
+    match exchange(runtime_dir, Request::NetworkStatus {}).await? {
+        Reply::NetworkStatus {
+            status,
+            network_observation,
+        } => Ok((status, network_observation)),
         _ => Err(IpcError::UnexpectedReply),
     }
 }

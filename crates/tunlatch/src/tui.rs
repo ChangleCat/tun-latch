@@ -247,7 +247,6 @@ mod tests {
                 reason: UnknownReason::BackendNotImplemented,
             },
             interfaces,
-            network_observation: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
         let mut selection = ListState::default().with_selected(Some(0));
