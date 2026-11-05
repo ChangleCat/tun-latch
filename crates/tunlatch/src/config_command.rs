@@ -96,6 +96,34 @@ impl Drop for TempFile {
     }
 }
 
+fn allocate_export_file(
+    parent: &Path,
+    destination: &Path,
+    next_temp: &AtomicU64,
+) -> anyhow::Result<(TempFile, File)> {
+    (0..128)
+        .find_map(|_| {
+            let sequence = next_temp.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".tunlatch-{}-{sequence}.tmp", std::process::id()));
+            // A self-rename would leave the destination owned by the temporary-file guard.
+            if path.file_name() == destination.file_name() {
+                return None;
+            }
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => Some(Ok((TempFile(path), file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .context("cannot allocate temporary export file")?
+        .map_err(Into::into)
+}
+
 /// Write normalized v2 TOML via a temporary file in the destination directory.
 /// Existing files are replaced only when `overwrite` is true.
 pub fn export(source: &Path, destination: &Path, overwrite: bool) -> anyhow::Result<String> {
@@ -117,22 +145,7 @@ pub fn export(source: &Path, destination: &Path, overwrite: bool) -> anyhow::Res
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let (temp, mut file) = (0..128)
-        .find_map(|_| {
-            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(".tunlatch-{}-{sequence}.tmp", std::process::id()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => Some(Ok((TempFile(path), file))),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .context("cannot allocate temporary export file")??;
+    let (temp, mut file) = allocate_export_file(parent, destination, &NEXT_TEMP)?;
     file.write_all(output.as_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -179,6 +192,28 @@ mod tests {
     }
     const VALID: &str =
         "schema_version = 2\ndesired = \"disabled\"\nrules = []\ndirect_exceptions = []\n";
+
+    #[test]
+    fn config_command_temporary_file_never_occupies_destination() -> anyhow::Result<()> {
+        let dir = Dir(directory()?);
+        let name = format!(".tunlatch-{}-0.tmp", std::process::id());
+        for destination in [
+            dir.0.0.join(&name),
+            Path::new("relative").join(&name),
+            PathBuf::from(&name),
+        ] {
+            let sequence = AtomicU64::new(0);
+            let (temp, file) = allocate_export_file(&dir.0.0, &destination, &sequence)?;
+            assert_ne!(temp.0.file_name(), destination.file_name());
+            assert!(!dir.0.0.join(&name).exists());
+            assert!(temp.0.is_file());
+            let temporary_path = temp.0.clone();
+            drop(file);
+            drop(temp);
+            assert!(!temporary_path.exists());
+        }
+        Ok(())
+    }
 
     #[test]
     fn config_command_round_trip_and_preview() -> anyhow::Result<()> {
