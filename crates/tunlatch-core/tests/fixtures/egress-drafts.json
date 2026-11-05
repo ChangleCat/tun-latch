@@ -1,0 +1,991 @@
+{
+  "scope": "Authorization draft/digest subset only, not full runtime or real approval.",
+  "source_sha256": "a6012291f4ffc78c3fbc911920d4bd4da76346fd26edf9956615ca6bb248427b",
+  "excluded_categories": {
+    "decision": 179,
+    "apply": 12,
+    "transition": 8,
+    "envelope": 3
+  },
+  "cases": [
+    {
+      "id": "empty-authorizations",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [],
+        "system_profiles": []
+      },
+      "expect": {
+        "accepted": true
+      }
+    },
+    {
+      "id": "normal-authorizations",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "accepted": true
+      }
+    },
+    {
+      "id": "toml-authorizations",
+      "kind": "authorization",
+      "format": "toml",
+      "input": "proxy_uid_grants = []\nsystem_profiles = []\n",
+      "expect": {
+        "accepted": true
+      }
+    },
+    {
+      "id": "missing-array",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": []
+      },
+      "expect": {
+        "error": "MissingField"
+      }
+    },
+    {
+      "id": "no-new-version-field",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "schema_version": 1
+      },
+      "expect": {
+        "error": "UnknownField"
+      }
+    },
+    {
+      "id": "cannot-import-approval",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "approved": true
+      },
+      "expect": {
+        "error": "UnknownField"
+      }
+    },
+    {
+      "id": "array-type",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": false
+      },
+      "expect": {
+        "error": "InvalidType"
+      }
+    },
+    {
+      "id": "invalid-uid--1",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": -1,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidValue"
+      }
+    },
+    {
+      "id": "invalid-uid-True",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": true,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidType"
+      }
+    },
+    {
+      "id": "invalid-uid-0",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": "0",
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidType"
+      }
+    },
+    {
+      "id": "invalid-uid-4294967295",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 4294967295,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidValue"
+      }
+    },
+    {
+      "id": "invalid-selection-protocols-[]",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidSelection"
+      }
+    },
+    {
+      "id": "invalid-selection-protocols-['tcp', 'tcp']",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "tcp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidSelection"
+      }
+    },
+    {
+      "id": "invalid-selection-protocols-['icmp']",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "icmp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidSelection"
+      }
+    },
+    {
+      "id": "invalid-selection-families-['IPv4']",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "IPv4"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidSelection"
+      }
+    },
+    {
+      "id": "invalid-selection-families-['ipv4', 'ipv4']",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv4"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidSelection"
+      }
+    },
+    {
+      "id": "invalid-recipe",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "all_icmp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "InvalidSelection"
+      }
+    },
+    {
+      "id": "recipe-wrong-family",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "AddressFamilyMismatch"
+      }
+    },
+    {
+      "id": "too-many-grants",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "u0",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u1",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u2",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u3",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u4",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "link_min",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "TooManyItems"
+      }
+    },
+    {
+      "id": "duplicate-id-across-authorizations",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "proxy_root",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "error": "DuplicateId"
+      }
+    },
+    {
+      "id": "maximum-four-plus-four",
+      "kind": "authorization",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "u0",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u1",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u2",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "u3",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": [
+          {
+            "id": "s0",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "s1",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "s2",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          },
+          {
+            "id": "s3",
+            "recipes": [
+              "dhcpv4_client",
+              "dhcpv6_client",
+              "ipv6_host_control",
+              "related_icmp_errors"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ]
+      },
+      "expect": {
+        "accepted": true
+      }
+    },
+    {
+      "id": "raw-authorization-over-limit",
+      "kind": "authorization",
+      "format": "json",
+      "input": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 ",
+      "expect": {
+        "error": "InputTooLarge"
+      }
+    },
+    {
+      "id": "duplicate-json-key",
+      "kind": "authorization",
+      "format": "json",
+      "input": "{\"proxy_uid_grants\":[],\"proxy_uid_grants\":[],\"system_profiles\":[]}",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    },
+    {
+      "id": "fixed-digest-empty",
+      "kind": "authorization_digest",
+      "input": {
+        "proxy_uid_grants": [],
+        "system_profiles": []
+      },
+      "expect": {
+        "canonical_hex": "7b2270726f78795f7569645f6772616e7473223a5b5d2c2273797374656d5f70726f66696c6573223a5b5d7d",
+        "sha256": "ef255c1fa60856ae39f1d6a1f88c054cb495c6d3a2f1739180539ea66d225b66"
+      }
+    },
+    {
+      "id": "fixed-digest-root",
+      "kind": "authorization_digest",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "tcp",
+              "udp"
+            ],
+            "families": [
+              "ipv4",
+              "ipv6"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": []
+      },
+      "expect": {
+        "canonical_hex": "7b2270726f78795f7569645f6772616e7473223a5b7b226567726573735f70726f66696c65223a227072696d617279222c2266616d696c696573223a5b2269707634222c2269707636225d2c226964223a2270726f78795f726f6f74222c2270726f746f636f6c73223a5b22746370222c22756470225d2c22756964223a307d5d2c2273797374656d5f70726f66696c6573223a5b5d7d",
+        "sha256": "5d5e1e432584466116db32747ebf0fd7fa1769d74ff01ced3871e3c0b7a6fc3f"
+      }
+    },
+    {
+      "id": "reordered-sets-keep-same-digest",
+      "kind": "authorization_digest",
+      "input": {
+        "proxy_uid_grants": [
+          {
+            "id": "proxy_root",
+            "uid": 0,
+            "protocols": [
+              "udp",
+              "tcp"
+            ],
+            "families": [
+              "ipv6",
+              "ipv4"
+            ],
+            "egress_profile": "primary"
+          }
+        ],
+        "system_profiles": []
+      },
+      "expect": {
+        "canonical_hex": "7b2270726f78795f7569645f6772616e7473223a5b7b226567726573735f70726f66696c65223a227072696d617279222c2266616d696c696573223a5b2269707634222c2269707636225d2c226964223a2270726f78795f726f6f74222c2270726f746f636f6c73223a5b22746370222c22756470225d2c22756964223a307d5d2c2273797374656d5f70726f66696c6573223a5b5d7d",
+        "sha256": "5d5e1e432584466116db32747ebf0fd7fa1769d74ff01ced3871e3c0b7a6fc3f"
+      }
+    },
+    {
+      "id": "authorization-invalid-unicode",
+      "kind": "authorization",
+      "format": "json",
+      "input": "{\"proxy_uid_grants\":[],\"system_profiles\":[],\"x\":\"\\ud800\"}",
+      "expect": {
+        "error": "InvalidEncoding"
+      }
+    },
+    {
+      "id": "authorization-nonfinite-json",
+      "kind": "authorization",
+      "format": "json",
+      "input": "{\"proxy_uid_grants\":[],\"system_profiles\":[],\"x\":NaN}",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    },
+    {
+      "id": "authorization-exact-raw-budget",
+      "kind": "authorization",
+      "format": "json",
+      "input": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    {\"proxy_uid_grants\":[],\"system_profiles\":[]}",
+      "expect": {
+        "accepted": true
+      }
+    },
+    {
+      "id": "authorization-deep-data",
+      "kind": "authorization",
+      "format": "json",
+      "input": "{\"proxy_uid_grants\":[],\"system_profiles\":[],\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":{\"x\":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    }
+  ]
+}

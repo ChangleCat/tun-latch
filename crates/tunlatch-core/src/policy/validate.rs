@@ -81,7 +81,7 @@ fn number<T: TryFrom<u64>>(value: &Value, maximum: u64, path: &str) -> Result<T,
         .map_err(|_| error(PolicyErrorCode::InvalidValue, path))
 }
 
-fn id(value: &Value, path: &str) -> Result<PolicyId, PolicyError> {
+pub(super) fn id(value: &Value, path: &str) -> Result<PolicyId, PolicyError> {
     let text = value
         .as_str()
         .ok_or_else(|| error(PolicyErrorCode::InvalidId, path))?;

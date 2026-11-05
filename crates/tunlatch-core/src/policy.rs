@@ -6,7 +6,7 @@
 //! Ordinary `allow` results still require independently established egress authorization. Neither
 //! these drafts nor their hashes are capabilities or evidence of kernel enforcement.
 
-mod decode;
+pub(crate) mod decode;
 mod model;
 mod validate;
 
@@ -95,6 +95,12 @@ pub enum PolicyErrorCode {
     /// The validated configuration cannot fit the canonical JSON budget.
     #[error("CanonicalConfigTooLarge")]
     CanonicalConfigTooLarge,
+    /// An authorization set is empty, duplicated, or outside its closed enum domain.
+    #[error("InvalidSelection")]
+    InvalidSelection,
+    /// The normalized authorization draft exceeds its independent byte budget.
+    #[error("AuthorizationTooLarge")]
+    AuthorizationTooLarge,
 }
 
 /// Typed input error that reports location and limits without reproducing the full configuration.
@@ -108,7 +114,7 @@ pub struct PolicyError {
 }
 
 impl PolicyError {
-    fn new(code: PolicyErrorCode, path: impl Into<String>) -> Self {
+    pub(crate) fn new(code: PolicyErrorCode, path: impl Into<String>) -> Self {
         Self {
             code,
             path: diagnostic_path(path.into()),
@@ -117,7 +123,7 @@ impl PolicyError {
         }
     }
 
-    fn bounded(
+    pub(crate) fn bounded(
         code: PolicyErrorCode,
         path: impl Into<String>,
         limit: usize,
@@ -173,6 +179,9 @@ fn diagnostic_path(path: String) -> String {
 pub struct PolicyId(String);
 
 impl PolicyId {
+    pub(crate) fn from_value(value: &serde_json::Value, path: &str) -> Result<Self, PolicyError> {
+        validate::id(value, path)
+    }
     /// Return the stable identifier text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -510,7 +519,7 @@ fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, PolicyError> {
         .map_err(|_| PolicyError::new(PolicyErrorCode::InvalidSyntax, "config"))
 }
 
-fn digest(domain: &[u8], content: &[u8]) -> PolicyDigest {
+pub(crate) fn digest(domain: &[u8], content: &[u8]) -> PolicyDigest {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(content);

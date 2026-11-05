@@ -578,6 +578,15 @@ impl CorrelatedBinding {
 }
 
 impl VerifiedCurrentBinding {
+    pub(crate) fn request_identity(&self) -> impl Serialize + '_ {
+        (
+            &self.evidence.stamp,
+            &self.evidence.interface,
+            &self.evidence.process,
+            &self.evidence.socket,
+        )
+    }
+
     /// Return the last checked collection counter, scoped to the observer epoch.
     pub fn collection_sequence(&self) -> u64 {
         self.evidence.collection_sequence

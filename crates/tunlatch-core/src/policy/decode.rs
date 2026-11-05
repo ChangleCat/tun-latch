@@ -18,10 +18,10 @@ struct Budget {
 }
 
 impl Budget {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         Self {
-            bytes: MAX_POLICY_INPUT_BYTES,
-            nodes: MAX_POLICY_INPUT_BYTES,
+            bytes: limit,
+            nodes: limit,
             error: None,
         }
     }
@@ -110,6 +110,15 @@ impl<'de> Visitor<'de> for Seed<'_> {
             MAX_RULES
         } else if self.path == "config.direct_exceptions" {
             MAX_DIRECT_EXCEPTIONS
+        } else if self.path == "authorizations.proxy_uid_grants"
+            || self.path == "authorizations.system_profiles"
+            || self.path.starts_with("authorizations.") && self.path.ends_with(".recipes")
+        {
+            4
+        } else if self.path.starts_with("authorizations.")
+            && (self.path.ends_with(".families") || self.path.ends_with(".protocols"))
+        {
+            2
         } else if self.path.ends_with(".source_ports") || self.path.ends_with(".destination_ports")
         {
             MAX_PORT_RANGES
@@ -180,6 +189,12 @@ fn field_path(parent: &str, key: &str) -> String {
         "purpose",
         "description",
         "egress_profile",
+        "proxy_uid_grants",
+        "system_profiles",
+        "uid",
+        "protocols",
+        "families",
+        "recipes",
     ];
     let label = if FIELDS.contains(&key) {
         key
@@ -192,36 +207,51 @@ fn field_path(parent: &str, key: &str) -> String {
 pub(super) fn deserialize_value<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Value, D::Error> {
-    let mut budget = Budget::new();
+    deserialize_with_limit(deserializer, MAX_POLICY_INPUT_BYTES, "config")
+}
+
+pub(crate) fn deserialize_with_limit<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    limit: usize,
+    root: &str,
+) -> Result<Value, D::Error> {
+    let mut budget = Budget::new(limit);
     Seed {
         budget: &mut budget,
-        path: "config".into(),
+        path: root.into(),
         depth: 0,
     }
     .deserialize(deserializer)
 }
 
-fn text(input: &[u8]) -> Result<&str, PolicyError> {
-    if input.len() > MAX_POLICY_INPUT_BYTES {
+fn text<'a>(input: &'a [u8], limit: usize, root: &str) -> Result<&'a str, PolicyError> {
+    if input.len() > limit {
         return Err(PolicyError::bounded(
             PolicyErrorCode::InputTooLarge,
-            "config",
-            MAX_POLICY_INPUT_BYTES,
+            root,
+            limit,
             input.len(),
         ));
     }
-    std::str::from_utf8(input)
-        .map_err(|_| PolicyError::new(PolicyErrorCode::InvalidEncoding, "config"))
+    std::str::from_utf8(input).map_err(|_| PolicyError::new(PolicyErrorCode::InvalidEncoding, root))
 }
 
 pub(super) fn toml(input: &[u8]) -> Result<Value, PolicyError> {
-    let source = text(input)?;
+    toml_with_limit(input, MAX_POLICY_INPUT_BYTES, "config")
+}
+
+pub(crate) fn toml_with_limit(
+    input: &[u8],
+    limit: usize,
+    root: &str,
+) -> Result<Value, PolicyError> {
+    let source = text(input, limit, root)?;
     let deserializer = toml::Deserializer::parse(source)
-        .map_err(|_| PolicyError::new(PolicyErrorCode::InvalidSyntax, "config"))?;
-    let mut budget = Budget::new();
+        .map_err(|_| PolicyError::new(PolicyErrorCode::InvalidSyntax, root))?;
+    let mut budget = Budget::new(limit);
     match (Seed {
         budget: &mut budget,
-        path: "config".into(),
+        path: root.into(),
         depth: 0,
     })
     .deserialize(deserializer)
@@ -229,19 +259,27 @@ pub(super) fn toml(input: &[u8]) -> Result<Value, PolicyError> {
         Ok(value) => Ok(value),
         Err(_) => Err(match budget.error {
             Some(error) => error,
-            None => PolicyError::new(PolicyErrorCode::InvalidSyntax, "config"),
+            None => PolicyError::new(PolicyErrorCode::InvalidSyntax, root),
         }),
     }
 }
 
 pub(super) fn json(input: &[u8]) -> Result<Value, PolicyError> {
-    let source = text(input)?;
-    check_surrogates(source)?;
+    json_with_limit(input, MAX_POLICY_INPUT_BYTES, "config")
+}
+
+pub(crate) fn json_with_limit(
+    input: &[u8],
+    limit: usize,
+    root: &str,
+) -> Result<Value, PolicyError> {
+    let source = text(input, limit, root)?;
+    check_surrogates(source).map_err(|error| PolicyError::new(error.code(), root))?;
     let mut deserializer = serde_json::Deserializer::from_slice(input);
-    let mut budget = Budget::new();
+    let mut budget = Budget::new(limit);
     let result = (Seed {
         budget: &mut budget,
-        path: "config".into(),
+        path: root.into(),
         depth: 0,
     })
     .deserialize(&mut deserializer);
@@ -249,12 +287,12 @@ pub(super) fn json(input: &[u8]) -> Result<Value, PolicyError> {
         Ok(value) => {
             deserializer
                 .end()
-                .map_err(|_| PolicyError::new(PolicyErrorCode::InvalidSyntax, "config"))?;
+                .map_err(|_| PolicyError::new(PolicyErrorCode::InvalidSyntax, root))?;
             Ok(value)
         }
         Err(_) => Err(match budget.error {
             Some(error) => error,
-            None => PolicyError::new(PolicyErrorCode::InvalidSyntax, "config"),
+            None => PolicyError::new(PolicyErrorCode::InvalidSyntax, root),
         }),
     }
 }
