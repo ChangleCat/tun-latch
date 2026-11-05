@@ -39,6 +39,8 @@ Use `#[test]`, `#[tokio::test]`, and Ratatui's `TestBackend`. Name tests after b
 
 Use `feat(<scope>): <summary>` for commit subjects, e.g. `feat(scaffold): establish Rust workspace and engineering checks`. Choose concrete scopes and imperative summaries. Keep commits focused. PRs describe behavior, issues, validation, and limitations; include captures for TUI changes. Update `Cargo.lock` with dependencies.
 
+Once code changes or additions form a coherent, independently reviewable commit and their relevant checks pass, commit them promptly without waiting for another request. Before staging new files, decide whether they belong in version control or `.gitignore`; keep generated output, local evidence, sensitive data, and unrelated work out of the commit.
+
 ## Security & Configuration Boundaries
 
 The service is a read-only observer; PF enforcement is unimplemented. Separate desired, committed, and observed states; never present unknown protection as active. Interface names/indices never establish trust. Keep IPC bounded and same-user. Resource cleanup must not disable protection. Read `SAFETY.md` before changing privileges, PF, or recovery.

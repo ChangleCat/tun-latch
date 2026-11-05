@@ -4,5 +4,8 @@
 # Rust build output
 /target/
 
+# Python helper bytecode
+__pycache__/
+
 # macOS metadata
 .DS_Store
