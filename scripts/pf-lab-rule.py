@@ -6,6 +6,7 @@ operator-present exclusive window. This is not a privileged service, automatic
 crash recovery, kernel object authentication, or a leak protection mechanism.
 """
 import argparse
+from enum import Enum
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from typing import NamedTuple, Optional
 
 _spec = importlib.util.spec_from_file_location("tunlatch_reference", Path(__file__).with_name("pf-lab-reference.py"))
 reference = importlib.util.module_from_spec(_spec)
@@ -29,6 +31,17 @@ BASE_FILES = tuple("before-" + key + ".txt" for key, _ in ROOT_QUERIES)
 FILES = ("boot.txt", "candidate.pf", "empty.pf", "stage.txt", "clear.txt",
          "closed.json") + BASE_FILES
 MARKERS = ("stage-once", "baseline-ready", "load-intent", "recovery-once")
+
+
+class SlotState(Enum):
+    ABSENT = "absent"
+    EMPTY = "empty"
+    RULES = "rules"
+
+
+class Slot(NamedTuple):
+    state: SlotState
+    rules: Optional[bytes]
 
 
 def profile(session):
@@ -169,11 +182,14 @@ class System:
         # The shared transport accepts only the exact known ALTQ stderr notice;
         # zero-exit kernel errors remain errors, including for an empty slot.
         anchor = profile(self.session)[0]
-        allowed = tuple(query for _, query in ROOT_QUERIES) + (("-s", "info"), ("-s", "References"))
+        allowed = tuple(query for _, query in ROOT_QUERIES) + (("-s", "info"), ("-s", "References"), ("-s", "Anchors"))
         allowed += tuple(("-a", anchor, "-s", kind) for kind in ("nat", "Tables", "Anchors", "rules"))
         if args not in allowed:
             raise Refused("只允许闭合的根/本次槽查询")
-        return reference.root("/sbin/pfctl", *args)
+        try:
+            return reference.root("/sbin/pfctl", *args)
+        except Refused as error:
+            raise Refused("PF读取失败 [" + " ".join(args) + "]；未将错误当空：\n" + str(error)) from error
 
     def submit(self, anchor, empty):
         if anchor != profile(self.session)[0] or type(empty) is not bool:
@@ -219,39 +235,60 @@ class Rules:
         names = inventory(self.system.query("-v", "-s", "Anchors"))
         if names - {self.anchor} != inventory(before["inventory"]):
             raise Refused("出现外来目录或本次子目录，不能接管")
+        # XNU DIOCGETRULESETS/SET on the root enumerates all top-level anchor
+        # objects, including unattached ones. Cross-check the nonrecursive view
+        # against the recursive view; absence is a namespace observation, NOT
+        # a successful empty-filter read. We never turn a query error into empty.
+        top = inventory(self.system.query("-s", "Anchors"))
+        if top != {name for name in names if "/" not in name}:
+            raise Refused("根目录两种列表不一致，规则槽是否存在未知")
+        if self.anchor not in top:
+            return Slot(SlotState.ABSENT, None)
         for kind in ("nat", "Tables", "Anchors"):
             if self.system.query("-a", self.anchor, "-s", kind):
                 raise Refused("规则槽含NAT、表或子目录，拒绝清理")
-        # An inventory omission is never an empty-filter result. A failed
-        # direct read stays unknown, even if the name was not enumerated.
-        return self.system.query("-a", self.anchor, "-s", "rules"), self.anchor in names
+        rules = self.system.query("-a", self.anchor, "-s", "rules")
+        return Slot(SlotState.RULES if rules else SlotState.EMPTY, rules)
 
-    def stage(self, capture, confirm, stop_after_submit=False):
+    def unsubmitted(self):
+        if (not all(self.system.exists(n) for n in ("stage-once", "baseline-ready"))
+                or any(self.system.exists(n) for n in
+                       ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json"))):
+            raise Refused("仅可接续有完整前态且从未记录提交意图/结果的首次提交；不重放或重置标记")
+
+    def stage(self, capture, confirm, stop_after_submit=False, resume=False):
         self.inspect()
+        if resume:
+            self.unsubmitted()
         reference.check_capture(capture)
         expected = self.canonicalizer(self.anchor, self.rules)
         if not confirm():
             raise Refused("已取消，不暂存规则")
         reference.check_capture(capture)
         self.disabled()
-        self.system.mark("stage-once")
+        if not resume:
+            self.system.mark("stage-once")
+        before = self.baseline() if resume else None
         for index, (key, args) in enumerate(ROOT_QUERIES, 1):
-            data = self.system.baseline(key, args)
+            data = before[key] if resume else self.system.baseline(key, args)
             q = json.loads((Path(capture) / f"query-{index:02}.json").read_text())
             if data != q["stdout"].encode():
                 raise Refused("直接系统前态与刚完成采集不一致")
         self.baseline()  # Includes absence; baseline data is never cleanup permission.
-        self.system.mark("baseline-ready")
-        if self.current()[0]:
-            raise Refused("首次提交前直接读取本次槽非空；不覆盖未认领规则")
+        if not resume:
+            self.system.mark("baseline-ready")
+        if self.current().state != SlotState.ABSENT:
+            raise Refused("首次提交前规则槽已经存在；不覆盖或认领现有对象")
         self.disabled()
+        if resume:
+            self.unsubmitted()
         self.system.mark("load-intent")
         self.system.submit(self.anchor, False)
         if stop_after_submit:
             raise Refused("按计划在系统提交命令返回后退出：尚未查询后态，请由另一入口核对恢复；不是内核阶段故障注入")
         self.inspect()
         self.disabled()
-        if self.current()[0] != expected:
+        if self.current().rules != expected:
             raise Refused("规则后态与解析器输出不同；保留现场供独立接管")
 
     def recover(self, confirm):
@@ -261,8 +298,8 @@ class Rules:
             raise Refused("提交意图不完整或已有恢复尝试，不自动接管/重试")
         expected = self.canonicalizer(self.anchor, self.rules)
         self.disabled()
-        current, _ = self.current()
-        if current not in (b"", expected):
+        current = self.current()
+        if current.rules not in (None, b"", expected):
             raise Refused("槽内不是本次固定规则或空态；拒绝删除未知规则")
         # A present administrator explicitly takes over one object after confirming
         # every original writer ended and the exclusive window is still continuous.
@@ -271,18 +308,20 @@ class Rules:
             raise Refused("已取消，不恢复规则")
         self.inspect()
         self.disabled()
-        rechecked, _ = self.current()
+        rechecked = self.current()
         if rechecked != current:
             raise Refused("确认期间规则变化，停止")
         self.system.mark("recovery-once")
-        if current:
+        if current.rules:
             self.system.submit(self.anchor, True)
         self.inspect()
         self.disabled()
-        after, remains = self.current()
-        if after:
+        after = self.current()
+        if after.rules:
             raise Refused("本次filter未清空，结果未知；不重试")
-        result = {"filter_empty": True, "anchor_listed_in_inventory": remains,
+        result = {"payload_absent": True, "slot_state": after.state.value,
+                  "filter_empty": True if after.state == SlotState.EMPTY else None,
+                  "anchor_listed_in_inventory": after.state != SlotState.ABSENT,
                   "empty_anchor_metadata": "preserved; not global or parent deletion",
                   "PF_disabled_zero_references_observed": True,
                   "blocking_or_failure_safety_qualified": False}
@@ -297,6 +336,9 @@ def plan():
             "rules": "4 fixed lo0 loopback TCP/UDP block rules, port55000; no state creation",
             "submit": ["/sbin/pfctl", "-a", "<own literal>", "-R", "-o", "none", "-f", "<root candidate.pf>"],
             "recover": ["/sbin/pfctl", "-a", "<same own literal>", "-R", "-o", "none", "-f", "<root empty.pf>"],
+            "slot_observations": "absent via consistent recursive/root-child inventories; existing slots require direct content reads; query errors stay errors",
+            "resume_before_submit": "existing complete baseline and no load-intent/result/recovery evidence; fresh matching capture; no marker reset or replay",
+            "recover_result": "payload_absent; filter_empty is true only after a direct empty read, null if the named namespace is absent",
             "fault": "optional ordinary controller exit after system submit returns; no claim of internal kernel phase",
             "limits": ["Exclusive, operator-present manual takeover; no automatic ownership from a receipt.",
                        "No privileged descendant deadline/reclamation or power-loss atomicity.",
@@ -306,25 +348,26 @@ def plan():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", default="plan", choices=("plan", "prepare", "status", "stage", "recover"))
+    parser.add_argument("action", nargs="?", default="plan", choices=("plan", "prepare", "status", "stage", "resume-before-submit", "recover"))
     parser.add_argument("session", nargs="?")
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--stop-after-submit", action="store_true")
     args = parser.parse_args()
     if os.geteuid() == 0:
         raise Refused("不要sudo整个程序")
-    if args.action != "stage" and (args.capture or args.stop_after_submit):
+    submitting = args.action in ("stage", "resume-before-submit")
+    if not submitting and (args.capture or args.stop_after_submit):
         raise Refused("采集和中断参数仅用于stage")
     if args.action in ("plan", "prepare") and args.session:
         raise Refused("此动作不接受旧目录")
     if args.action == "plan":
         print(json.dumps(plan(), ensure_ascii=False, indent=2))
         return
-    if args.action in ("status", "stage", "recover"):
+    if args.action in ("status", "stage", "resume-before-submit", "recover"):
         if not args.session:
             raise Refused("缺少本次规则实验目录")
         profile(args.session)
-        if args.action == "stage" and not args.capture:
+        if submitting and not args.capture:
             raise Refused("需要刚完成的--capture目录")
     reference.command(["/usr/bin/sudo", "-v"])
     if args.action == "prepare":
@@ -349,17 +392,22 @@ def main():
         lab.inspect()
         print("独立入口可读；尚不证明实机规则恢复通过。")
         print(json.dumps({name: system.exists(name) for name in MARKERS}))
-    elif args.action == "stage":
+    elif submitting:
         if not args.capture:
             raise Refused("需要刚完成的--capture目录")
         print("只暂存到本次未挂接规则槽，不启用PF、不改根规则；确认另一终端status已通过且窗口独占。")
-        lab.stage(args.capture, lambda: input("请输入 STAGE-ONLY：") == "STAGE-ONLY", args.stop_after_submit)
+        resume = args.action == "resume-before-submit"
+        prompt = "RESUME-FIRST-SUBMIT" if resume else "STAGE-ONLY"
+        if resume:
+            print("只接续尚未发生的首次提交；不删除标记，不重放已提交或未知提交。")
+        lab.stage(args.capture, lambda: input("请输入 " + prompt + "：") == prompt,
+                  args.stop_after_submit, resume=resume)
         print("暂存后态已核对。保持PF停用，立即在另一终端执行recover。")
     else:
         print("人工接管本次槽：先确认原提交命令及其写入者已经结束、独占窗口未中断；不确定就停止。")
         result = lab.recover(lambda: input("请输入 TAKEOVER-EMPTY-RULES：") == "TAKEOVER-EMPTY-RULES")
         print(json.dumps(result, ensure_ascii=False))
-        print("本次filter为空，PF停用、引用0。空anchor元数据若仍存在则保留；未验证阻断恢复。")
+        print("本次载荷已移除：规则槽不存在或已直接读为空；PF停用、引用0。未验证阻断恢复。")
 
 
 if __name__ == "__main__":

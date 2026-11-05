@@ -61,6 +61,11 @@ class Fake:
             return b"Status: Disabled for 0 days\n" if self.pf_disabled else b"Status: Enabled for 0 days\n"
         if args == ("-s", "References"):
             return self.refs
+        if args == ("-s", "Anchors"):
+            names = {n for n in rule.inventory(self.root["inventory"]) | self.extra_names if "/" not in n}
+            if self.present or self.image:
+                names.add(self.anchor)
+            return ("\n".join(sorted(names)) + "\n").encode()
         for key, query in rule.ROOT_QUERIES:
             if args == query:
                 if key == "inventory":
@@ -81,6 +86,17 @@ class Fake:
         self.present = self.residue or not empty
         if self.fail_submit == "after":
             raise rule.Refused("lost reply after mutation")
+
+
+class MacFake(Fake):
+    """Missing native rulesets are not successful empty-rule reads."""
+    def query(self, *args):
+        if args[:2] == ("-a", self.anchor) and not self.present:
+            if args[3] in ("rules", "nat"):
+                raise rule.Refused(rule.reference.NOTICE + "pfctl: DIOCGETRULES: Invalid argument\n")
+            if args[3] == "Anchors":
+                raise rule.Refused("pfctl: DIOCGETRULESETS: Invalid argument\n")
+        return super().query(*args)
 
 
 class RulesTests(unittest.TestCase):
@@ -118,6 +134,20 @@ class RulesTests(unittest.TestCase):
         self.assertTrue(result["anchor_listed_in_inventory"])
         self.assertTrue(self.fake.pf_disabled)
 
+    def test_macos_missing_namespace_does_not_prevent_first_submission(self):
+        self.fake = MacFake()
+        self.stage()
+        self.assertEqual(self.fake.calls, [(self.fake.anchor, False)])
+
+    def test_macos_collected_empty_filter_may_remove_the_namespace(self):
+        self.fake = MacFake()
+        self.fake.residue = False
+        self.stage()
+        result = self.lab().recover(lambda: True)
+        self.assertTrue(result["payload_absent"])
+        self.assertIsNone(result["filter_empty"])
+        self.assertEqual(result["slot_state"], "absent")
+
     def test_lost_submit_reply_before_or_after_kernel_change_is_inspected_not_replayed(self):
         for failure in ("before", "after"):
             with self.subTest(failure=failure):
@@ -128,7 +158,8 @@ class RulesTests(unittest.TestCase):
                 self.assertIn("load-intent", self.fake.marks)
                 self.fake.fail_submit = None
                 result = self.lab().recover(lambda: True)
-                self.assertTrue(result["filter_empty"])
+                self.assertTrue(result["payload_absent"])
+                self.assertEqual(result["slot_state"], "absent" if failure == "before" else "empty")
                 self.assertEqual(len([c for c in self.fake.calls if not c[1]]), 1)
                 self.assertEqual(len([c for c in self.fake.calls if c[1]]), int(failure == "after"))
 
@@ -244,25 +275,78 @@ class RulesTests(unittest.TestCase):
         self.assertFalse(self.fake.calls)
         self.assertNotIn("load-intent", self.fake.marks)
 
-    def test_unlisted_slot_is_still_directly_read_before_declaring_filter_empty(self):
+    def test_recursive_omission_disagrees_with_parent_inventory_and_prevents_clear(self):
         self.stage()
         self.fake.present = False  # Directory omission does not imply no filter.
         self.assertEqual(self.fake.image, self.fake.rules)
-        self.lab().recover(lambda: True)
-        self.assertEqual(self.fake.image, b"")
-        self.assertEqual(self.fake.calls, [(self.fake.anchor, False), (self.fake.anchor, True)])
+        with self.assertRaisesRegex(rule.Refused, "列表不一致"):
+            self.lab().recover(lambda: True)
+        self.assertEqual(self.fake.image, self.fake.rules)
+        self.assertEqual(self.fake.calls, [(self.fake.anchor, False)])
 
     def test_direct_slot_read_error_cannot_be_replaced_by_an_empty_directory_result(self):
         self.stage()
-        self.fake.present = False
         original = self.fake.query
         def query(*args):
             if args[:2] == ("-a", self.fake.anchor):
                 raise rule.Refused("direct slot read failed")
             return original(*args)
-        with patch.object(self.fake, "query", side_effect=query), self.assertRaises(rule.Refused):
+        with patch.object(self.fake, "query", side_effect=query), self.assertRaisesRegex(rule.Refused, "direct slot read failed"):
             self.lab().recover(lambda: True)
         self.assertEqual(len(self.fake.calls), 1)
+
+    def prime_unsubmitted(self):
+        self.fake = MacFake()
+        self.fake.marks.update(("stage-once", "baseline-ready"))
+        for key, _ in rule.ROOT_QUERIES:
+            self.fake.files["before-" + key + ".txt"] = self.fake.root[key]
+
+    def test_resume_before_first_submit_preserves_records_then_submits_only_once(self):
+        self.prime_unsubmitted()
+        files = self.fake.files.copy()
+        with self.assertRaisesRegex(rule.Refused, "按计划"):
+            self.lab().stage(self.capture, lambda: True, stop_after_submit=True, resume=True)
+        for key, value in files.items():
+            self.assertEqual(self.fake.files[key], value)
+        self.assertEqual(self.fake.calls, [(self.fake.anchor, False)])
+        with self.assertRaises(rule.Refused):
+            self.lab().stage(self.capture, lambda: True, resume=True)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.lab().recover(lambda: True)
+        self.assertEqual(self.fake.calls[-1], (self.fake.anchor, True))
+
+    def test_resume_refuses_any_prior_submission_or_recovery_evidence(self):
+        for name in ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json"):
+            self.prime_unsubmitted()
+            if name.endswith((".txt", ".json")):
+                self.fake.files[name] = b"unknown"
+            else:
+                self.fake.marks.add(name)
+            with self.subTest(name=name), self.assertRaises(rule.Refused):
+                self.lab().stage(self.capture, lambda: True, resume=True)
+            self.assertFalse(self.fake.calls)
+
+    def test_resume_requires_original_baseline_to_match_fresh_capture(self):
+        self.prime_unsubmitted()
+        self.fake.files["before-root-rules.txt"] = b"different root rules\n"
+        with self.assertRaises(rule.Refused):
+            self.lab().stage(self.capture, lambda: True, resume=True)
+        self.assertFalse(self.fake.calls)
+
+    def test_parent_inventory_failure_or_omission_is_not_namespace_absence(self):
+        for failure in ("error", "omission"):
+            self.reset()
+            self.stage()
+            original = self.fake.query
+            def query(*args):
+                if args == ("-s", "Anchors"):
+                    if failure == "error":
+                        raise rule.Refused("parent query failed")
+                    return b"com.apple\n"
+                return original(*args)
+            with patch.object(self.fake, "query", side_effect=query), self.assertRaises(rule.Refused):
+                self.lab().recover(lambda: True)
+            self.assertEqual(len(self.fake.calls), 1)
 
     def test_incomplete_intent_cannot_authorize_recovery(self):
         for marker in ("stage-once", "baseline-ready", "load-intent"):
@@ -330,6 +414,11 @@ class RulesTests(unittest.TestCase):
                 with self.assertRaises(rule.Refused):
                     rule.main()
                 run.assert_not_called()
+
+    def test_native_query_error_names_selector_and_never_becomes_empty(self):
+        with patch.object(rule.reference, "root", side_effect=rule.Refused("DIOCGETRULES: Invalid argument")):
+            with self.assertRaisesRegex(rule.Refused, "-a tunlatch-lab-A1b2C3d4 -s nat"):
+                rule.System(SESSION).query("-a", self.fake.anchor, "-s", "nat")
 
     def test_default_plan_has_no_privileged_or_pf_kernel_calls(self):
         with patch.object(rule.sys, "argv", ["tool"]), patch.object(rule.reference, "command") as run:

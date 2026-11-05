@@ -40,7 +40,9 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 `--stop-after-submit`只在系统提交命令返回后退出普通控制程序，留下root保护意图；不声称在内核begin/commit内部中断。新进程的recover不依赖丢失的提交回执，须核对当前启动、保护数据、根filter/NAT、目录及本次规则/空态，并由操作者确认原写入者已结束、窗口连续后逐项接管。恢复只替换本次filter为空；未知内容、其他NAT/表/子目录、重复尝试或来源不明时保留现场。空anchor元数据可能保留，程序如实记录，不猜测删除或声称所有内核对象消失。
 
-首次写入前和恢复时均直接读取本次filter/NAT/表/子目录；目录未列出目标不能当作空filter，直接读取错误也不能被目录结果掩盖。结果只记录目录是否列出名称，不据此断言内核对象不存在。
+规则槽有“不存在”和“存在且为空/非空”之分。先核对根下非递归清单与完整递归清单一致，缺失的名字记录为namespace absent，不向不存在的槽读取内容，也不伪造为空规则输出；已有槽必须直接读取filter/NAT/表/子目录，任何查询错误仍失败。恢复结果`payload_absent`表示本次载荷已移除；`filter_empty`只在直接读为空时为true，namespace absent时为null，不宣称删除了所有内核对象。
+
+`resume-before-submit`仅接续有完整保护前态、`stage-once/baseline-ready`存在、但`load-intent`、提交/清空回执和恢复/关闭记录全部不存在的首次提交。它需要新鲜且与原保护前态相同的采集，不删除或重置标记；一旦记录过提交意图，便不能用它重放。它处理提交前预检适配故障，不是失败后的自动PF重试。
 
 这仍不是自动所有权、可信后台恢复或阻断恢复资格；没有硬期限、未知命令树回收或断电原子性保证。完整W05/W07及UID/出口测试仍需后续证据。完整本机步骤见本地`docs/development-plan-2026-11-02/experiments/unattached-rule.md`。
 
