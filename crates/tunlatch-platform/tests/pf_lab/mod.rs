@@ -8,6 +8,15 @@ use std::path::Path;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+// Only the inspection contracts are shared by the ordinary package tool. The staging/launch
+// sandbox remains independently tested; compiling it here does not add a privileged entry.
+#[allow(dead_code)]
+pub(crate) mod bootstrap;
+pub(crate) mod ledger;
+#[allow(dead_code)]
+pub(crate) mod native_files;
+pub(crate) mod package;
+
 pub(crate) const ANCHOR: &str = "com.apple/tunlatch-pf-lab-20261102";
 pub(crate) const LIVE_DIR: &str = "/var/root/tunlatch-pf-lab-20261102";
 pub(crate) const RULES: &str =
@@ -22,6 +31,8 @@ pub(crate) enum LabError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Files(#[from] bootstrap::Error),
     #[error("refused: {0}")]
     Refused(&'static str),
 }
@@ -56,7 +67,7 @@ pub(crate) fn live_rejection(live_pf: bool, approved_isolated_lab: bool) -> LabE
         return LabError::Refused("live PF is disabled; opt-in flags do not create authority");
     }
     LabError::Refused(
-        "live PF is disabled: approved-binary bootstrap, atomic ownership and bounded supervision are not implemented",
+        "live PF is disabled: privileged launch, PF adapters and qualified offline recovery are not integrated",
     )
 }
 
@@ -99,7 +110,7 @@ pub(crate) fn plan() -> Value {
         "recovery": {
             "status": "disabled_not_recovery_qualified",
             "candidate_steps": [Operation::LeafRules.json(), Operation::ClearLeafRules.json(), Operation::LeafRules.json()],
-            "blockers": ["protected approved binary bootstrap", "atomic kernel ownership/CAS", "bounded process and pipe reclamation"]
+            "blockers": ["protected approved binary launch", "exclusive-window native adapters and persistent writer supervision", "qualified offline recovery", "controlled external dual-stack endpoint"]
         },
         "candidate_block_probe": {
             "executable": PFCTL,
@@ -108,7 +119,14 @@ pub(crate) fn plan() -> Value {
             "implemented_live_entry": false,
             "requires": ["W07 approval", "kernel reachability and skip/quick preflight", "armed offline recovery"]
         },
-        "not_implemented": ["protected binary bootstrap", "atomic kernel ownership", "bounded process supervisor", "root hook insertion", "automatic apply", "utun creation/reuse", "state deletion", "enable references", "packet capture"],
+        "not_implemented": ["protected binary launch", "native exclusive-window adapters", "crash-persistent privileged writer supervision", "root hook insertion", "automatic apply", "native utun reuse integration", "qualified state deletion", "native enable reference integration", "actual packet capture"],
+        "ordinary_package": {
+            "native_acl": "path ACL reads associated with held descriptors; owner/root ABA not excluded; not privileged qualification",
+            "persistent_journal": "bounded real file journal; unresolved intent is retained; no adoption after reopen",
+            "audit": "closed files/modes/ACLs/hash inventory; integrity only, not administrative approval",
+            "live_recovery_qualified": false,
+            "component_sources": component_sources()
+        },
         "safety": "No live PF executor or privileged staging is implemented. Mock success never qualifies recovery or kernel ownership."
     })
 }
@@ -163,13 +181,40 @@ pub(crate) fn prepare_bundle(path: &Path) -> Result<()> {
     recovery.write_all(RECOVERY_TEXT.as_bytes())?;
     recovery.sync_all()?;
     File::open(path)?.sync_all()?;
+    package::seal(path)?;
     Ok(())
 }
 
-pub(crate) const RECOVERY_TEXT: &str = "TunLatch PF laboratory preparation v2\n\
+fn component_sources() -> Value {
+    use sha2::{Digest, Sha256};
+    let sources: [(&str, &[u8]); 11] = [
+        ("bootstrap", include_bytes!("bootstrap.rs")),
+        ("preflight", include_bytes!("preflight.rs")),
+        ("hook", include_bytes!("hook.rs")),
+        ("process", include_bytes!("process.rs")),
+        ("driver", include_bytes!("driver.rs")),
+        ("utun", include_bytes!("utun.rs")),
+        ("states", include_bytes!("states.rs")),
+        ("references", include_bytes!("references.rs")),
+        ("traffic", include_bytes!("traffic.rs")),
+        ("transaction", include_bytes!("transaction.rs")),
+        ("uid", include_bytes!("uid.rs")),
+    ];
+    Value::Array(sources.iter().map(|(name, source)| json!({
+        "component": name,
+        "sha256": Sha256::digest(source).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "role": "source_identity_only_not_a_live_adapter"
+    })).collect())
+}
+
+pub(crate) const RECOVERY_TEXT: &str = "TunLatch PF laboratory preparation\n\
 LIVE RECOVERY IS DISABLED. This bundle is not qualified to modify PF or restore networking.\n\
 It contains a standalone PREPARATION tool, a fixed command CANDIDATE and a mock model.\n\
-No live PF executor, root-private bootstrap, kernel ownership CAS or bounded process supervisor exists.\n\
+The integrated tool has no privileged PF executor or qualified offline recovery.\n\
+The ordinary package supports native path ACL inspection, durable intent records and an audit command.\n\
+Path ACL checks do not exclude owner/root ABA replacement or qualify privileged bootstrap.\n\
+Run pf-lab audit <bundle-directory> as the ordinary user; this verifies files, not PF or live ownership.\n\
+Unresolved/corrupt journals are retained. Do not reset, truncate, delete or adopt them to authorize cleanup.\n\
 The candidate leaf is com.apple/tunlatch-pf-lab-20261102; no claim of current ownership is made.\n\
 claim-recovery and live recover requests always refuse, even when both opt-in flags are supplied.\n\
 Do not apply the candidate rule or request W07 approval before real recovery and experiment drivers are implemented.\n\

@@ -22,6 +22,8 @@ enum Action {
     Plan,
     /// Copy this executable and recovery material into an existing empty private directory.
     Prepare { output: PathBuf },
+    /// Verify a prepared package's files, path ACL observations and journal without PF access.
+    Audit { directory: PathBuf },
     /// Unavailable: always refuses until safe bootstrap, ownership and supervision exist.
     ClaimRecovery {
         #[arg(long)]
@@ -46,6 +48,15 @@ fn run(arguments: Arguments) -> pf_lab::Result<()> {
         Action::Prepare { output } => {
             pf_lab::prepare_bundle(&output)?;
             println!("Bundle prepared without PF access: {}", output.display());
+        }
+        Action::Audit { directory } => {
+            let audit = pf_lab::package::audit(&directory)?;
+            println!("{}", serde_json::to_string_pretty(&audit)?);
+            if audit.result != "ordinary_bundle_verified" {
+                return Err(pf_lab::LabError::Refused(
+                    "unsettled package journal; no cleanup authority",
+                ));
+            }
         }
         Action::ClaimRecovery {
             live_pf,
