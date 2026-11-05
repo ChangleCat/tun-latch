@@ -7,14 +7,33 @@ use std::sync::Arc;
 
 use crate::events::{NetworkObserver, NetworkSnapshot};
 
+#[allow(unsafe_code)]
+mod native;
+mod process;
+pub use process::{
+    InspectionFailure, InspectionProblem, InspectionStage, ProcessIdentity, ProcessInspection,
+    RawControl, RawFd, RawInspection, RawObservation, inspect_process, inspect_selected_process,
+};
+
 /// A snapshot-scoped interface hint. Name and index are diagnostic, not identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct TunnelHint {
     generation: u64,
     token: Arc<()>,
     name: String,
     index: u32,
 }
+
+impl PartialEq for TunnelHint {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && Arc::ptr_eq(&self.token, &other.token)
+            && self.name == other.name
+            && self.index == other.index
+    }
+}
+
+impl Eq for TunnelHint {}
 
 /// Result of checking a hint against the current observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -34,6 +34,7 @@ tun-rs = { version = "=2.8.15", default-features = false }
 socket2 = "=0.6.5"
 rustix = { version = "=1.1.6", features = ["net"] }
 exacl = { version = "=0.13.0", default-features = false }
+libproc = "=0.15.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

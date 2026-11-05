@@ -15,6 +15,12 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+# libproc's SDK binding generation uses these build dependencies. Limit the extra
+# license approvals to the reviewed package versions rather than the whole graph.
+exceptions = [
+    { name = "bindgen", version = "=0.73.2", allow = ["BSD-3-Clause"] },
+    { name = "libloading", version = "=0.8.9", allow = ["ISC"] },
+]
 
 [bans]
 multiple-versions = "deny"

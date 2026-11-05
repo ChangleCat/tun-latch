@@ -1,10 +1,14 @@
-//! Bounded, polling-based network observations, not native event notifications or trust.
+//! Bounded network observations and native invalidation hints, not identity or trust.
 //!
 //! A scan is not atomic and can miss changes between polls, including sleep/wake and
 //! interface reuse. Bounds are checked after native enumeration returns; the underlying
 //! enumeration may allocate beyond them, so they are not a hard collection-time memory limit.
 //! Every successful scan gets a new generation; callers must not carry
-//! identity or authorization across generations. No background task is spawned.
+//! identity or authorization across generations.
+
+mod native;
+
+pub use native::{EventStatus, NetworkEventControl, NetworkEventMonitor, SubscriptionState};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,6 +53,9 @@ pub enum ScanError {
     /// The observer has been shut down.
     #[error("network observer is shut down")]
     Shutdown,
+    /// Notifications arrived during the scan or the subscription was unavailable.
+    #[error("network notification continuity unavailable or changed during scan")]
+    Interrupted,
 }
 
 /// A scan result that carries no authority over interface ownership or lifetime.
@@ -100,6 +107,45 @@ impl NetworkObserver {
     /// Perform a fresh, ordinary-user, read-only native scan.
     pub fn refresh(&mut self) -> Result<&NetworkSnapshot, ScanError> {
         self.refresh_with(crate::network::snapshot)
+    }
+
+    /// Scan while checking the subscription on both sides of enumeration.
+    /// A missing notification cannot prove a scan atomic or complete.
+    pub fn refresh_with_monitor<F>(
+        &mut self,
+        monitor: &mut NetworkEventMonitor,
+        scan: F,
+    ) -> Result<&NetworkSnapshot, ScanError>
+    where
+        F: FnOnce() -> Result<Vec<NetworkInterface>, nix::Error>,
+    {
+        self.refresh_with_control(&monitor.control(), scan)
+    }
+
+    /// Scan while a separately owned native worker is supervised by its caller.
+    pub fn refresh_with_control<F>(
+        &mut self,
+        control: &NetworkEventControl,
+        scan: F,
+    ) -> Result<&NetworkSnapshot, ScanError>
+    where
+        F: FnOnce() -> Result<Vec<NetworkInterface>, nix::Error>,
+    {
+        if self.shutdown {
+            return Err(ScanError::Shutdown);
+        }
+        let before = control.status();
+        if before.0 != SubscriptionState::Running {
+            self.invalidate(Invalidation::Interrupted);
+            return Err(ScanError::Interrupted);
+        }
+        self.refresh_with(scan)?;
+        let after = control.status();
+        if after.0 != SubscriptionState::Running || after.1 != before.1 {
+            self.invalidate(Invalidation::Interrupted);
+            return Err(ScanError::Interrupted);
+        }
+        self.current.as_ref().ok_or(ScanError::Interrupted)
     }
 
     /// Scan with an injected source. Supplied data is untrusted and cannot establish ownership.

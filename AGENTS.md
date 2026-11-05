@@ -29,7 +29,7 @@ Clippy rejects warnings. Create a private directory using `mktemp -d /tmp/tunlat
 
 ## Coding Style & Naming Conventions
 
-Rust 2024: four-space indentation, 100-column rustfmt width; YAML: two spaces. Use `snake_case` for modules/functions and `UpperCamelCase` for types. New crates inherit workspace metadata, dependencies, and lints. Use typed errors; avoid `unwrap`, `expect`, and explicit panics. Workspace code denies `unsafe`. Document public contracts; isolate native network/PF integration in `tunlatch-platform`.
+Rust 2024: four-space indentation, 100-column rustfmt width; YAML: two spaces. Use `snake_case` for modules/functions and `UpperCamelCase` for types. New crates inherit workspace metadata, dependencies, and lints. Use typed errors; avoid `unwrap`, `expect`, and explicit panics. Workspace code denies `unsafe`, with one user-approved exception: `tunlatch-platform/src/identity/native.rs` may contain the minimal, independently reviewed read-only `proc_pidinfo` / `proc_pidfdinfo` adapter and checked kernel-control union access. Keep all other code denied, expose only safe owned results, document every unsafe operation, and enforce exact lengths and fixed resource limits. This exception grants no PF writes, privilege escalation, or service installation. Document public contracts; isolate native network/PF integration in `tunlatch-platform`.
 
 ## Testing Guidelines
 

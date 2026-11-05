@@ -64,3 +64,25 @@ fn ordinary_user_can_take_read_only_native_scan() -> Result<(), ScanError> {
     assert!(snapshot.interfaces().iter().any(|item| item.loopback));
     Ok(())
 }
+
+#[test]
+fn native_subscription_starts_and_stops_without_network_changes() -> Result<(), std::io::Error> {
+    use std::thread;
+    use std::time::Instant;
+    use tunlatch_platform::events::{NetworkEventMonitor, SubscriptionState};
+
+    let mut monitor = NetworkEventMonitor::start()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while monitor.poll().state == SubscriptionState::Starting && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(monitor.poll().state, SubscriptionState::Running);
+    monitor.request_stop();
+    while !monitor.poll().reaped && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    let status = monitor.poll();
+    assert_eq!(status.state, SubscriptionState::Stopped);
+    assert!(status.reaped);
+    Ok(())
+}
