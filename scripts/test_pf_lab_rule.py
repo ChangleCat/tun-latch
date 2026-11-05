@@ -115,7 +115,7 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(self.fake.root, foreign)
         self.assertEqual(self.fake.calls, [(self.fake.anchor, False), (self.fake.anchor, True)])
         self.assertIn("closed.json", self.fake.files)
-        self.assertTrue(result["anchor_metadata_present"])
+        self.assertTrue(result["anchor_listed_in_inventory"])
         self.assertTrue(self.fake.pf_disabled)
 
     def test_lost_submit_reply_before_or_after_kernel_change_is_inspected_not_replayed(self):
@@ -234,7 +234,35 @@ class RulesTests(unittest.TestCase):
         self.fake.residue = False
         self.stage()
         result = self.lab().recover(lambda: True)
-        self.assertFalse(result["anchor_metadata_present"])
+        self.assertFalse(result["anchor_listed_in_inventory"])
+
+    def test_unlisted_nonempty_filter_before_first_submit_is_not_overwritten(self):
+        self.fake.image = b"foreign rules\n"
+        self.fake.present = False
+        with self.assertRaises(rule.Refused):
+            self.stage()
+        self.assertFalse(self.fake.calls)
+        self.assertNotIn("load-intent", self.fake.marks)
+
+    def test_unlisted_slot_is_still_directly_read_before_declaring_filter_empty(self):
+        self.stage()
+        self.fake.present = False  # Directory omission does not imply no filter.
+        self.assertEqual(self.fake.image, self.fake.rules)
+        self.lab().recover(lambda: True)
+        self.assertEqual(self.fake.image, b"")
+        self.assertEqual(self.fake.calls, [(self.fake.anchor, False), (self.fake.anchor, True)])
+
+    def test_direct_slot_read_error_cannot_be_replaced_by_an_empty_directory_result(self):
+        self.stage()
+        self.fake.present = False
+        original = self.fake.query
+        def query(*args):
+            if args[:2] == ("-a", self.fake.anchor):
+                raise rule.Refused("direct slot read failed")
+            return original(*args)
+        with patch.object(self.fake, "query", side_effect=query), self.assertRaises(rule.Refused):
+            self.lab().recover(lambda: True)
+        self.assertEqual(len(self.fake.calls), 1)
 
     def test_incomplete_intent_cannot_authorize_recovery(self):
         for marker in ("stage-once", "baseline-ready", "load-intent"):

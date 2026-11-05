@@ -219,12 +219,12 @@ class Rules:
         names = inventory(self.system.query("-v", "-s", "Anchors"))
         if names - {self.anchor} != inventory(before["inventory"]):
             raise Refused("出现外来目录或本次子目录，不能接管")
-        if self.anchor not in names:
-            return b"", False
         for kind in ("nat", "Tables", "Anchors"):
             if self.system.query("-a", self.anchor, "-s", kind):
                 raise Refused("规则槽含NAT、表或子目录，拒绝清理")
-        return self.system.query("-a", self.anchor, "-s", "rules"), True
+        # An inventory omission is never an empty-filter result. A failed
+        # direct read stays unknown, even if the name was not enumerated.
+        return self.system.query("-a", self.anchor, "-s", "rules"), self.anchor in names
 
     def stage(self, capture, confirm, stop_after_submit=False):
         self.inspect()
@@ -242,6 +242,8 @@ class Rules:
                 raise Refused("直接系统前态与刚完成采集不一致")
         self.baseline()  # Includes absence; baseline data is never cleanup permission.
         self.system.mark("baseline-ready")
+        if self.current()[0]:
+            raise Refused("首次提交前直接读取本次槽非空；不覆盖未认领规则")
         self.disabled()
         self.system.mark("load-intent")
         self.system.submit(self.anchor, False)
@@ -280,7 +282,7 @@ class Rules:
         after, remains = self.current()
         if after:
             raise Refused("本次filter未清空，结果未知；不重试")
-        result = {"filter_empty": True, "anchor_metadata_present": remains,
+        result = {"filter_empty": True, "anchor_listed_in_inventory": remains,
                   "empty_anchor_metadata": "preserved; not global or parent deletion",
                   "PF_disabled_zero_references_observed": True,
                   "blocking_or_failure_safety_qualified": False}

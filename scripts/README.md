@@ -40,6 +40,8 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 `--stop-after-submit`只在系统提交命令返回后退出普通控制程序，留下root保护意图；不声称在内核begin/commit内部中断。新进程的recover不依赖丢失的提交回执，须核对当前启动、保护数据、根filter/NAT、目录及本次规则/空态，并由操作者确认原写入者已结束、窗口连续后逐项接管。恢复只替换本次filter为空；未知内容、其他NAT/表/子目录、重复尝试或来源不明时保留现场。空anchor元数据可能保留，程序如实记录，不猜测删除或声称所有内核对象消失。
 
+首次写入前和恢复时均直接读取本次filter/NAT/表/子目录；目录未列出目标不能当作空filter，直接读取错误也不能被目录结果掩盖。结果只记录目录是否列出名称，不据此断言内核对象不存在。
+
 这仍不是自动所有权、可信后台恢复或阻断恢复资格；没有硬期限、未知命令树回收或断电原子性保证。完整W05/W07及UID/出口测试仍需后续证据。完整本机步骤见本地`docs/development-plan-2026-11-02/experiments/unattached-rule.md`。
 
 ```sh
