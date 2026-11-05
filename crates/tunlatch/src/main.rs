@@ -1,6 +1,7 @@
 //! Unprivileged CLI and terminal interface. Closing this program has no firewall side effects.
 
 mod config_command;
+mod identity_command;
 mod tui;
 
 use std::path::PathBuf;
@@ -51,6 +52,25 @@ enum Command {
         json: bool,
         #[command(subcommand)]
         command: SimulationCommand,
+    },
+    /// Inspect minimal process metadata without granting trust or changing the service.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// Read one PID twice; FD, loaded-image and TUN ownership remain unverified.
+    Inspect {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        json: bool,
+        /// Include bounded raw FD/control metadata; this still does not establish ownership.
+        #[arg(long)]
+        fd_details: bool,
     },
 }
 
@@ -172,6 +192,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Tui { runtime_dir } => tui::run(&runtime_dir).await?,
+        Command::Identity {
+            command:
+                IdentityCommand::Inspect {
+                    pid,
+                    json,
+                    fd_details,
+                },
+        } => {
+            identity_command::inspect(pid, json, fd_details).await?;
+        }
         Command::Simulate {
             runtime_dir,
             json,
