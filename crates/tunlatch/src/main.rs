@@ -1,13 +1,15 @@
 //! Unprivileged CLI and terminal interface. Closing this program has no firewall side effects.
 
+mod config_command;
 mod tui;
 
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tunlatch_core::config::DesiredProtection;
-use tunlatch_ipc::query_status;
+use tunlatch_core::control::{SimulationRequest, SimulationStatus};
+use tunlatch_ipc::{query_simulation, query_status, submit_simulation};
 
 #[derive(Parser)]
 #[command(
@@ -38,12 +40,83 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Exercise the opt-in in-memory controller. Actual protection remains unknown.
+    Simulate {
+        #[arg(long)]
+        runtime_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        command: SimulationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SimulationCommand {
+    /// Query the isolated simulation, without changing it.
+    Status,
+    /// Submit one simulated intent with an explicit retry ID and expected generation.
+    Set {
+        desired: SimulationIntent,
+        #[arg(long)]
+        operation_id: u64,
+        #[arg(long)]
+        expected_generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SimulationIntent {
+    Enabled,
+    Disabled,
+}
+
+impl From<SimulationIntent> for DesiredProtection {
+    fn from(value: SimulationIntent) -> Self {
+        match value {
+            SimulationIntent::Enabled => Self::Enabled,
+            SimulationIntent::Disabled => Self::Disabled,
+        }
+    }
+}
+
+fn print_simulation(status: SimulationStatus, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "actual_protection": "unknown", "simulation": status,
+            }))?
+        );
+    } else {
+        println!("Simulation only; actual protection remains UNKNOWN. No PF changes.");
+        println!(
+            "Generation: {}; desired: {:?}; committed: {:?}; observed: {:?}",
+            status.generation, status.desired, status.committed, status.observed
+        );
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
 enum ConfigCommand {
     /// Validate schema, version, size and fields in a TOML file.
     Check { path: PathBuf },
+    /// Preview a configuration draft without applying it or importing approval.
+    ImportPreview {
+        path: PathBuf,
+        /// Optional current draft to compare with the incoming draft.
+        #[arg(long)]
+        current: Option<PathBuf>,
+    },
+    /// Export a normalized draft without changing the service configuration.
+    Export {
+        source: PathBuf,
+        output: PathBuf,
+        /// Explicitly replace an existing regular output file.
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Print the documented initial configuration.
     Example,
 }
@@ -70,18 +143,53 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Tui { runtime_dir } => tui::run(&runtime_dir).await?,
+        Command::Simulate {
+            runtime_dir,
+            json,
+            command,
+        } => {
+            let status = match command {
+                SimulationCommand::Status => query_simulation(&runtime_dir).await?,
+                SimulationCommand::Set {
+                    desired,
+                    operation_id,
+                    expected_generation,
+                } => {
+                    submit_simulation(
+                        &runtime_dir,
+                        SimulationRequest {
+                            desired: desired.into(),
+                            operation_id,
+                            expected_generation,
+                        },
+                    )
+                    .await?
+                }
+            };
+            print_simulation(status, json)?;
+        }
         Command::Config {
             command: ConfigCommand::Check { path },
         } => {
-            let config =
-                tunlatch_platform::config::load(&path).context("configuration rejected")?;
+            println!("{}", config_command::check(&path)?);
+        }
+        Command::Config {
+            command: ConfigCommand::ImportPreview { path, current },
+        } => {
             println!(
-                "Configuration valid; desired = {:?}. No changes applied.",
-                config.desired()
+                "{}",
+                config_command::import_preview(&path, current.as_deref())?
             );
-            if config.desired() == DesiredProtection::Enabled {
-                println!("Protection remains UNKNOWN: PF enforcement is not implemented.");
-            }
+        }
+        Command::Config {
+            command:
+                ConfigCommand::Export {
+                    source,
+                    output,
+                    overwrite,
+                },
+        } => {
+            println!("{}", config_command::export(&source, &output, overwrite)?);
         }
         Command::Config {
             command: ConfigCommand::Example,

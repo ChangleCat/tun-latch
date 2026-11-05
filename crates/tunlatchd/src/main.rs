@@ -20,6 +20,9 @@ struct Args {
     /// Validate and read initial intent; never applied to PF or rewritten.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Enable a separate in-memory simulation controller. Never changes PF or configuration.
+    #[arg(long)]
+    simulation: bool,
 }
 
 #[tokio::main]
@@ -47,14 +50,22 @@ async fn main() -> anyhow::Result<()> {
     let socket = ServerSocket::bind(&args.runtime_dir)
         .context("cannot bind private endpoint; existing paths are preserved")?;
     tracing::info!(
-        mode = "observer",
+        mode = if args.simulation {
+            "simulation"
+        } else {
+            "observer"
+        },
         "service started; protection is unknown, PF backend is unavailable"
     );
-    tunlatchd::serve(socket, config, async move {
+    let shutdown = async move {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
             _signal = terminate.recv() => Ok(()),
         }
-    })
-    .await
+    };
+    if args.simulation {
+        tunlatchd::serve_simulation(socket, config, shutdown).await
+    } else {
+        tunlatchd::serve(socket, config, shutdown).await
+    }
 }

@@ -14,6 +14,7 @@ tunlatch-platform.workspace = true
 tunlatch-ipc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+nix.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 ratatui.workspace = true

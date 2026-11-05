@@ -1,21 +1,45 @@
-//! Single read-only service loop with bounded clients and observed task lifetimes.
+//! Observer and opt-in simulation service with bounded clients and observed task lifetimes.
+
+pub mod coordinator;
 
 use std::future::Future;
 use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::net::UnixStream;
 use tokio::task::{JoinError, JoinSet};
-use tunlatch_core::config::Config;
-use tunlatch_core::status::{CommittedPolicy, Status};
+use tunlatch_core::config::{Config, DesiredProtection};
+use tunlatch_core::status::{CommittedPolicy, NetworkCollection, NetworkObservation, Status};
 use tunlatch_ipc::endpoint::ServerSocket;
 use tunlatch_ipc::protocol::{
     ErrorCode, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, ResponseEnvelope,
 };
 use tunlatch_ipc::{IpcError, REQUEST_TIMEOUT, frame, verify_peer};
-use tunlatch_platform::{network, pf};
+use tunlatch_platform::events::NetworkObserver;
+use tunlatch_platform::pf;
+
+use crate::coordinator::Coordinator;
 
 /// Maximum simultaneous exchanges; excess connections are closed without spawning tasks.
 pub const MAX_CLIENTS: usize = 16;
+
+#[derive(Clone)]
+struct ServiceState {
+    desired: DesiredProtection,
+    network: Arc<Mutex<NetworkObserver>>,
+    simulation: Option<Arc<Coordinator>>,
+}
+
+impl ServiceState {
+    fn new(config: &Config, simulation: bool) -> Self {
+        Self {
+            desired: config.desired(),
+            network: Arc::new(Mutex::new(NetworkObserver::new(Duration::from_secs(3)))),
+            simulation: simulation.then(|| Arc::new(Coordinator::new(config.desired()))),
+        }
+    }
+}
 
 /// Run until shutdown, then stop accepting and drain in-flight status requests.
 ///
@@ -24,6 +48,26 @@ pub const MAX_CLIENTS: usize = 16;
 pub async fn serve(
     socket: ServerSocket,
     config: Config,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> anyhow::Result<()> {
+    serve_inner(socket, ServiceState::new(&config, false), shutdown).await
+}
+
+/// Run a separately selected, in-memory simulation alongside the ordinary observer.
+///
+/// Simulated commits never affect the actual status, configuration file, or PF.
+/// Authentication and bounded transport are the same as for the ordinary observer.
+pub async fn serve_simulation(
+    socket: ServerSocket,
+    config: Config,
+    shutdown: impl Future<Output = io::Result<()>>,
+) -> anyhow::Result<()> {
+    serve_inner(socket, ServiceState::new(&config, true), shutdown).await
+}
+
+async fn serve_inner(
+    socket: ServerSocket,
+    state: ServiceState,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> anyhow::Result<()> {
     let mut tasks = JoinSet::new();
@@ -42,8 +86,7 @@ pub async fn serve(
                     tracing::warn!("client limit reached; closing incoming connection");
                     continue;
                 }
-                let desired = config.desired();
-                tasks.spawn(handle(stream, desired));
+                tasks.spawn(handle(stream, state.clone()));
             }
         }
     };
@@ -66,10 +109,7 @@ fn observe_task(result: Option<Result<Result<(), IpcError>, JoinError>>) -> anyh
     }
 }
 
-async fn handle(
-    mut stream: UnixStream,
-    desired: tunlatch_core::config::DesiredProtection,
-) -> Result<(), IpcError> {
+async fn handle(mut stream: UnixStream, state: ServiceState) -> Result<(), IpcError> {
     let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
     let request: RequestEnvelope = tokio::time::timeout_at(deadline, frame::read(&mut stream))
         .await
@@ -83,13 +123,26 @@ async fn handle(
             Request::Status {} => {
                 // Native enumeration can block; keep it off the async I/O worker. Do not drop
                 // its JoinHandle on a deadline: a started native call cannot be cancelled.
-                match tokio::task::spawn_blocking(network::snapshot).await {
-                    Ok(Ok(interfaces)) => Reply::Status {
+                let observer = Arc::clone(&state.network);
+                match tokio::task::spawn_blocking(move || {
+                    let mut observer = observer
+                        .lock()
+                        .map_err(|_| io::Error::other("network observer is unavailable"))?;
+                    let snapshot = observer.refresh().map_err(io::Error::other)?;
+                    Ok::<_, io::Error>((snapshot.interfaces().to_vec(), snapshot.generation()))
+                })
+                .await
+                {
+                    Ok(Ok((interfaces, generation))) => Reply::Status {
                         status: Status {
-                            desired,
+                            desired: state.desired,
                             committed: CommittedPolicy::Unmanaged,
                             observed: pf::observe(),
                             interfaces,
+                            network_observation: Some(NetworkObservation {
+                                generation,
+                                collection: NetworkCollection::OnDemandRescan,
+                            }),
                         },
                     },
                     result => {
@@ -100,6 +153,23 @@ async fn handle(
                     }
                 }
             }
+            Request::Simulate { operation } => match &state.simulation {
+                Some(controller) => match controller.submit(operation).await {
+                    Ok(status) => Reply::Simulation { status },
+                    Err(error) => Reply::SimulationError { error },
+                },
+                None => Reply::Error {
+                    code: ErrorCode::SimulationUnavailable,
+                },
+            },
+            Request::SimulationStatus {} => match &state.simulation {
+                Some(controller) => Reply::Simulation {
+                    status: controller.status().await,
+                },
+                None => Reply::Error {
+                    code: ErrorCode::SimulationUnavailable,
+                },
+            },
         }
     };
     tokio::time::timeout_at(
@@ -119,7 +189,6 @@ async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunlatch_core::config::DesiredProtection;
 
     #[tokio::test(start_paused = true)]
     async fn partial_request_expires_instead_of_holding_a_worker() -> anyhow::Result<()> {
@@ -127,7 +196,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair()?;
         client.write_all(&[0, 0]).await?;
         assert!(matches!(
-            handle(server, DesiredProtection::Disabled).await,
+            handle(server, ServiceState::new(&Config::default(), false)).await,
             Err(IpcError::Timeout)
         ));
         Ok(())

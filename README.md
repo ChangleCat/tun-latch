@@ -4,7 +4,7 @@ macOS 上独立于代理客户端运行的 TUN 出口保护工具，使用 Rust�
 
 当前开发目标为 **代理 UID 兼容模式**：可信 TUN 承接普通流量，在批准物理链路上允许已批准 socket UID 的 TCP/UDP，以保留代理规则模式直连；其他未授权直连阻断。当前用户选择 UID 0，因此同条件的其他 root socket 也可直连，不能承诺仅代理程序或所有业务隐藏真实出口。该方向尚未实现；UID 不是 PID/签名身份，实际节点 IP/端口不会硬编码。
 
-**当前交付是可运行的只读工程框架，尚未提供防泄漏保护。** `tunlatchd` 仅提供网卡发现与状态查询，始终报告保护未知；不会访问 `/dev/pf`、调用 `pfctl`、更改路由或安装启动项。请使用普通用户运行。
+**当前交付是可运行的观察服务、离线配置工具和可选模拟控制，尚未提供防泄漏保护。** `tunlatchd` 始终报告实际保护未知；不会访问 `/dev/pf`、调用 `pfctl`、更改路由或安装启动项。请使用普通用户运行。
 
 ## 构建与试运行
 
@@ -34,6 +34,34 @@ TUI 优先展示候选 TUN，支持 `↑` / `↓`、`j` / `k` 和翻页键浏览
 
 服务不会覆盖已有 `control.sock`。若服务被 `SIGKILL` 导致路径残留，先确认原服务已结束，再手动移除该临时目录内的 socket；不要删除仍在运行的服务端点。当前目录只存放开发 socket，删除它不涉及 PF 恢复或停用。
 
+## 离线配置与模拟控制
+
+`config check` 同时支持旧版配置和配置草稿；草稿的导入预览和规范化导出不会改变后台配置或生成管理员批准：
+
+```sh
+cargo run -p tunlatch -- config import-preview draft.toml --current current.toml
+cargo run -p tunlatch -- config export draft.toml exported.toml
+```
+
+导出默认拒绝覆盖，明确指定 `--overwrite` 才替换已有普通文件。输入拒绝符号链接、非普通文件和超限内容。旧版配置需通过已有领域 API 显式迁移后才能导入或导出，工具不会悄悄迁移。
+
+要演练完整控制流程，在新的私有目录启动 `tunlatchd --simulation`：
+
+```sh
+TUNLATCH_SIM_DIR=$(mktemp -d /tmp/tunlatch-simulation.XXXXXX)
+printf '%s\n' "$TUNLATCH_SIM_DIR"
+cargo run -p tunlatchd -- --runtime-dir "$TUNLATCH_SIM_DIR" --simulation
+```
+
+在另一个终端使用打印出的目录：
+
+```sh
+cargo run -p tunlatch -- simulate --runtime-dir /tmp/tunlatch-simulation.XXXXXX status
+cargo run -p tunlatch -- simulate --runtime-dir /tmp/tunlatch-simulation.XXXXXX set enabled --operation-id 1 --expected-generation 0
+```
+
+这条路径实际经过 CLI、本地 socket、协调器、内存后端和独立读取核验。响应明确标为模拟；普通 `status` 仍显示实际保护未知、未托管。普通观察服务拒绝模拟请求。同一进程内相同操作 ID 和内容可重试，不同内容或过时代次被拒绝；最多保留 256 个受理操作，满后拒绝新操作。重启会丢失模拟历史，它不提供管理员授权、持久化或真实 PF 恢复。
+
 ## 结构与依赖方向
 
 ```text
@@ -45,7 +73,7 @@ crates/
   tunlatch/           普通用户 CLI、Ratatui TUI、离线配置校验
 ```
 
-`core` 不依赖系统、异步运行时和界面。`platform`、`ipc` 分别依赖 `core`；两个入口按职责组合它们。TUI 不执行特权操作；目前 IPC 只接受 `status`，未知操作和字段均被拒绝。PF 适配接口当前只返回 `backend_not_implemented`，避免用模拟成功填补系统能力。
+`core` 不依赖系统、异步运行时和界面。`platform`、`ipc` 分别依赖 `core`；两个入口按职责组合它们。TUI 不执行特权操作；IPC 接受状态查询及显式启用的隔离模拟请求，未知操作和字段均被拒绝。PF 适配接口当前只返回 `backend_not_implemented`。
 
 候选网卡的发现不授予信任：`utun` 名称只用于展示提示，网卡索引、地址和名称不能作为持久身份。当前没有可被反序列化伪造的“可信 TUN”对象，也没有默认直连例外。
 
@@ -56,12 +84,13 @@ crates/
 | 固定工具链、工作区、lint、锁文件、CI、依赖检查策略 | 已建立 |
 | 普通用户服务 → 有界 Unix Socket → CLI / TUI | 可运行，只读 |
 | 网卡快照 | 原生 `getifaddrs`，保留 IPv4、IPv6 和 IPv6 scope；不是路由或身份验证 |
-| 配置 | CLI 使用现有配置校验；`core::policy` 已实现有界配置草稿、显式迁移、规范化/摘要和条件规则判定；不持久化、不应用 |
+| 配置 | CLI 校验、草稿差异预览与规范化导出已接入；不导入批准、不应用后台策略 |
+| 模拟控制闭环 | 显式启用后经真实本地通信提交、去重、核验和查询；内存后端无系统副作用 |
 | PF、已有连接约束、必要直连例外 | 待原型与实机验证 |
 | 绑定领域模型 | 已实现候选/未受信报告/关联/确认分型，确认与刷新必须核对新采集序号及 FD 实例；没有实际可信 TUN 或 PF 资格 |
 | UID 出口领域模型 | 独立候选、规范摘要、一次性确认检查、撤销替换及当前范围/UID/协议/族判定；只检查报告一致性，不产生实际管理员或 PF 权限 |
 | 实验进程监督 | 固定无 PF 子程序的启动、限量输入/输出、超时/取消和直接子进程回收已通过普通用户测试；未回收任务保留记录，另有操作者只读系统查询入口；尚未接入特权写入和 PF 变更入口 |
-| 网络事件、平台身份采集、自动恢复 | 待实现 |
+| 网络观察 | 按状态请求重新扫描，带进程内代次及有界结果检查；旧候选在重扫、失败或过期后失效；原生事件、可信 FD 归属与自动恢复待实现 |
 | 特权授权、原子持久化、LaunchDaemon、安装卸载、离线解锁 | 待设计与实现 |
 
 下一步先补齐 PF 实验的安全准备，再验证 socket user 的双栈 TCP/UDP、unknown/其他 UID 对照及撤销后的旧连接，连同 anchor 实际执行顺序与共存、事务、启用引用和接口复用。确认这些机制后再接入保护启停，不以 UI 或模型测试替代内核与物理出口证据。`core::egress` 已提供独立 UID 候选和确认模型，实际受保护存储、管理员认证和应用仍待接入；文件导入不能生成批准。

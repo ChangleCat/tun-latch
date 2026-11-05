@@ -1,4 +1,4 @@
-//! Versioned local status protocol. No mutation operation is accepted by this development service.
+//! Versioned local status and isolated simulation protocol. No PF mutation is exposed.
 
 pub mod endpoint;
 pub mod frame;
@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::UnixStream;
+use tunlatch_core::control::{SimulationError, SimulationRequest, SimulationStatus};
 use tunlatch_core::status::Status;
 
 use crate::protocol::{
@@ -47,6 +48,12 @@ pub enum IpcError {
     /// Exchange did not complete before the deadline.
     #[error("service request timed out")]
     Timeout,
+    /// A valid response belonged to a different operation.
+    #[error("service returned an unexpected reply")]
+    UnexpectedReply,
+    /// The isolated simulation rejected the operation or could not verify its result.
+    #[error("simulation request failed: {0:?}")]
+    Simulation(SimulationError),
 }
 
 /// Check kernel peer credentials on both accepted and connected sockets.
@@ -61,6 +68,33 @@ pub fn verify_peer(stream: &UnixStream) -> Result<(), IpcError> {
 
 /// Fetch one fresh status snapshot, verifying directory, socket, credentials and protocol version.
 pub async fn query_status(runtime_dir: &Path) -> Result<Status, IpcError> {
+    match exchange(runtime_dir, Request::Status {}).await? {
+        Reply::Status { status } => Ok(status),
+        _ => Err(IpcError::UnexpectedReply),
+    }
+}
+
+/// Query only the explicitly enabled in-memory simulation.
+pub async fn query_simulation(runtime_dir: &Path) -> Result<SimulationStatus, IpcError> {
+    simulation_reply(exchange(runtime_dir, Request::SimulationStatus {}).await?)
+}
+
+/// Submit to the simulation; this never authorizes or executes actual protection changes.
+pub async fn submit_simulation(
+    runtime_dir: &Path,
+    operation: SimulationRequest,
+) -> Result<SimulationStatus, IpcError> {
+    simulation_reply(exchange(runtime_dir, Request::Simulate { operation }).await?)
+}
+
+fn simulation_reply(reply: Reply) -> Result<SimulationStatus, IpcError> {
+    match reply {
+        Reply::Simulation { status } => Ok(status),
+        _ => Err(IpcError::UnexpectedReply),
+    }
+}
+
+async fn exchange(runtime_dir: &Path, request: Request) -> Result<Reply, IpcError> {
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         endpoint::validate_runtime_dir(runtime_dir)?;
         let path = runtime_dir.join(endpoint::SOCKET_NAME);
@@ -71,7 +105,7 @@ pub async fn query_status(runtime_dir: &Path) -> Result<Status, IpcError> {
             &mut stream,
             &RequestEnvelope {
                 version: PROTOCOL_VERSION,
-                request: Request::Status {},
+                request,
             },
         )
         .await?;
@@ -80,8 +114,9 @@ pub async fn query_status(runtime_dir: &Path) -> Result<Status, IpcError> {
             return Err(IpcError::Version(response.version));
         }
         match response.reply {
-            Reply::Status { status } => Ok(status),
             Reply::Error { code } => Err(IpcError::Remote(code)),
+            Reply::SimulationError { error } => Err(IpcError::Simulation(error)),
+            reply => Ok(reply),
         }
     })
     .await
