@@ -4,5 +4,7 @@
 compile_error!("TunLatch currently supports macOS only; no fallback firewall is available");
 
 pub mod config;
+pub mod events;
+pub mod identity;
 pub mod network;
 pub mod pf;
