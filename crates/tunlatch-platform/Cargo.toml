@@ -10,7 +10,7 @@ publish.workspace = true
 
 [dependencies]
 tunlatch-core.workspace = true
-nix = { workspace = true, features = ["socket", "poll", "uio", "fs"] }
+nix = { workspace = true, features = ["socket", "poll", "uio", "fs", "signal"] }
 thiserror.workspace = true
 libproc.workspace = true
 security-framework.workspace = true

@@ -1,4 +1,4 @@
-# 本机只读诊断与PF预检
+# 本机诊断与受控实验
 
 ## 单次管理员身份只读采集
 
@@ -25,6 +25,35 @@
 ```sh
 /usr/bin/python3 -m unittest discover -s scripts -p 'test_identity_readonly.py' -v
 cargo test -p tunlatch-platform --test tunnel_identity --example identity_readonly --locked
+```
+
+## 受控 TUN 映射实验
+
+`utun-mapping.py` 默认只显示计划，不提权或创建接口：
+
+```sh
+/usr/bin/python3 scripts/utun-mapping.py plan
+```
+
+实机动作需另行明确批准：独立 helper 新建并持有一个由内核分配编号的测试 utun，从自持 FD 直接查询接口名和 control unit，对照自身原始采样，再关闭该 FD 并观察后态。连接时内核可能自动把接口置为 UP，清理可能异步，系统/其他网络管理程序的反应尚未实测。程序不主动设置地址、路由或接口 flags，不发包、不改 PF，也不操作现有代理或 TUN。
+
+在当前 Mac 旁保存工作、确认原联网正常，并批准上述一次动作后，才在自己的同一个终端运行一次：
+
+```sh
+/usr/bin/sudo -v && /usr/bin/python3 scripts/utun-mapping.py collect --ack CREATE-ONE-TEST-UTUN
+```
+
+操作器只暂存经独立审查且固定摘要的程序到新建 root 私有目录，绑定本次启动/实验模式和一次性执行标记；不要直接 sudo 构建目录中的 helper 或整个脚本。结果保存在普通用户私有目录并打印路径。原身份只读脚本的固定构建与行为不变。
+
+helper 创建前启动约6秒的自停线程，超时只请求终止它自身；不接受外部 PID、不停止代理，不承诺硬时限或资源已经回收。错误、中断或超时不自动重试。`complete` 只表示本次映射观察完整；close 成功或名称缺失不等于全局恢复，接口仍可见可能是异步清理或名称复用，不能按名字清理。
+
+仍在执行时可在原终端按 Ctrl-C。若网络异常持续，先在 v2rayN 自己的界面重启原来的 TUN/代理；仍无法联网时，保存工作后重启 Mac，再启动原代理。脚本不会自动重启服务或系统，不执行全局 PF 或路由恢复命令。该实验不认证 sing-box 的实际接口，也不验证防泄漏。
+
+普通用户检查不运行实机动作：
+
+```sh
+cargo test -p tunlatch-platform --example utun_mapping --locked
+/usr/bin/python3 -m unittest discover -s scripts -p 'test_utun_mapping.py' -v
 ```
 
 ## 本机PF只读预检
