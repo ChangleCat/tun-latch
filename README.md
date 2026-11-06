@@ -44,7 +44,7 @@ cargo run -p tunlatch -- identity inspect --pid 12345 --json
 cargo run -p tunlatch -- identity inspect --pid 12345 --fd-details --json
 ```
 
-将 PID 替换为实际选择的进程。采集前后核对 PID、UID、出生时间、FD 列表和 socket 元数据；不可读、截断、变化或不支持的结构布局均返回失败。`complete_raw` 仅表示两次有限的原始采样匹配，TUN 归属、已载入映像和实际保护仍为未知/未认证。CLI 省略内核 opaque 值和非 control socket 端点。当前已核对的采集布局限 Apple Silicon；root 代理的实机读取与独立特权入口尚未验证，当前观察器仍拒绝 root。
+将 PID 替换为实际选择的进程。采集前后核对 PID、UID、出生时间、FD 列表和 socket 元数据；不可读、截断、变化或不支持的结构布局均返回失败。`complete_raw` 仅表示两次有限的原始采样匹配，TUN 归属、已载入映像和实际保护仍为未知/未认证。CLI 省略内核 opaque 值和非 control socket 端点。当前已核对的采集布局限 Apple Silicon；普通观察入口仍拒绝 root。单次管理员只读诊断另有专用程序和受保护暂存流程，见 [操作者步骤](scripts/README.md#单次管理员身份只读采集)，不能直接 sudo 构建目录中的程序。
 
 服务不会覆盖已有 `control.sock`。若服务被 `SIGKILL` 导致路径残留，先确认原服务已结束，再手动移除该临时目录内的 socket；不要删除仍在运行的服务端点。当前目录只存放开发 socket，删除它不涉及 PF 恢复或停用。
 

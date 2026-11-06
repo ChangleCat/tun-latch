@@ -1,4 +1,33 @@
-# 本机PF只读预检
+# 本机只读诊断与PF预检
+
+## 单次管理员身份只读采集
+
+`identity-readonly.py` 用于当前机器上一项受审查的开发诊断：读取一个明确选择的进程的 PID、UID、出生时间、FD 类型及 kernel-control 注册信息。它不会更改 PF、网络、代理或启动项，也不会读取进程命令行、环境、配置、连接端点或输出内核 opaque 值。结果仍是原始采样，不能据此授信 TUN 或宣称已保护。
+
+先由开发者构建并独立审阅 `identity_readonly`，把该确切二进制的 SHA-256 固定到脚本；当前摘要对应本机已审阅构建。构建不同或字节变化时脚本会拒绝，须重新审阅，不能用命令行提供另一个摘要。不要直接 sudo `target` 中的程序，也不要 sudo 整个 Python 脚本。
+
+在本机 Terminal 的同一个终端中执行，PID 应为明确选择的目标：
+
+```sh
+/usr/bin/sudo -v && /usr/bin/python3 scripts/identity-readonly.py collect --pid 12345
+```
+
+认证必须由本机系统处理；sudo 缓存可能与终端关联，不能假设在另一个终端认证后本程序就能使用。脚本的后续命令固定使用非交互 sudo，不接收或转发密码。当前机器若只运行一个 sing-box，可用 `--pid "$(/usr/bin/pgrep -x sing-box)"`；空值或多个 PID 会在任何特权操作前被拒绝。
+
+脚本核对源字节、静态系统依赖、受保护父链后，在 `/private/var/root/tunlatch-identity.XXXXXXXX` 新建0700目录。只把已审查字节复制为 root 单链接0500副本并复核摘要；启动/PID记录0600，采样前一次性标记，不能在 run 时换目标。随后仅执行该私有副本的 `--pid` 读取。这里的暂存与固定摘要不构成生产安装或抗同UID篡改的授权机制；仅用于当前人工开发诊断。
+
+控制器在核查无ACL的系统临时目录下新建 `/private/tmp/tunlatch-identity-result.*` 私有目录，保存0600的 `result.json`，并打印路径。`complete_raw` 和退出码0必须同时成立；不完整结果也保存，但返回非零。普通用户路径绝不传入 root 命令。结束后可只回复完成，由开发者直接读取本机结果。
+
+中断、超时、超限或错误时保留结果文件与终端打印的本次 root 目录，不自动重试已标记采样，也不清理来源不明的进程或目录。只有本次临时程序与记录被创建，没有需要撤销的网络变更；停止操作即可，现有代理继续按原方式运行。结果阶段可能是 `started`、`prepared` 或具体采样诊断，均不得把缺失结果解释为成功。
+
+普通权限验证，不运行 sudo：
+
+```sh
+/usr/bin/python3 -m unittest discover -s scripts -p 'test_identity_readonly.py' -v
+cargo test -p tunlatch-platform --test tunnel_identity --example identity_readonly --locked
+```
+
+## 本机PF只读预检
 
 在Mac本机Terminal中，以普通用户从仓库根目录运行：
 
