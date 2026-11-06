@@ -26,6 +26,8 @@ pub enum ImageInspection {
     Matched {
         /// Matching process snapshot, subject to PID and exec races.
         process: ProcessIdentity,
+        /// Caller-provided 20-byte requirement that the OS accepted; not an extracted hash.
+        expected_cdhash: [u8; 20],
     },
     /// The OS explicitly reported that the requirement did not match.
     Mismatched {
@@ -161,7 +163,10 @@ fn inspect_with(
         return unavailable(ImageProblem::ProcessChanged, None);
     }
     match result {
-        Check::Matched => ImageInspection::Matched { process: after },
+        Check::Matched => ImageInspection::Matched {
+            process: after,
+            expected_cdhash: expected,
+        },
         Check::Mismatched => ImageInspection::Mismatched { process: after },
         Check::Unavailable(status) => unavailable(ImageProblem::SecurityUnavailable, Some(status)),
     }
@@ -198,6 +203,15 @@ mod tests {
             );
             assert_eq!(reads, 2);
             assert_eq!(matches!(result, ImageInspection::Matched { .. }), matched);
+            if matched {
+                assert_eq!(
+                    result,
+                    ImageInspection::Matched {
+                        process: process(42),
+                        expected_cdhash: [1; 20],
+                    }
+                );
+            }
         }
     }
 

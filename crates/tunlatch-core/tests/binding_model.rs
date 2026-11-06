@@ -1,7 +1,7 @@
 //! Pure consistency checks with synthetic platform facts, never real OS authentication.
 
 use tunlatch_core::binding::{
-    BindingError, BindingInvalidation, CandidateSnapshot, ControlSocketObservation,
+    BindingError, BindingInvalidation, CandidateSnapshot, CodeIdentity, ControlSocketObservation,
     CorrelatedBinding, InterfaceObservation, MAX_TUN_CANDIDATES, ObservationWindow, OwnershipMatch,
     OwnershipMethod, OwnershipSample, ProcessObservation, ProxyCore, ProxySelection,
     ReportCompleteness, SnapshotCompleteness, SnapshotStamp, UntrustedOwnershipReport,
@@ -48,7 +48,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         birth_microseconds: 123,
         uid: 0,
         core: ProxyCore::SingBox,
-        loaded_image_sha256: [9; 32],
+        code_identity: CodeIdentity::WholeImageSha256([9; 32]),
     };
     let sample = OwnershipSample {
         snapshot: stamp,
@@ -80,7 +80,10 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     };
     Ok(Fixture {
         snapshot,
-        selection: ProxySelection::new(ProxyCore::SingBox, [9; 32])?,
+        selection: ProxySelection::new(
+            ProxyCore::SingBox,
+            CodeIdentity::WholeImageSha256([9; 32]),
+        )?,
         process,
         report,
     })
@@ -139,6 +142,171 @@ fn complete_synthetic_ipv6_only_evidence_can_be_selected_without_pf_authority() 
         invalidated.reason(),
         &BindingInvalidation::ObserverInterrupted
     );
+    Ok(())
+}
+
+fn replace_code_identity(fixture: &mut Fixture, identity: CodeIdentity) -> TestResult {
+    fixture.selection = ProxySelection::new(ProxyCore::SingBox, identity)?;
+    fixture.process.code_identity = identity;
+    fixture.report.matches[0].before.process.code_identity = identity;
+    fixture.report.matches[0].after.process.code_identity = identity;
+    Ok(())
+}
+
+#[test]
+fn both_identity_kinds_can_be_selected_confirmed_and_refreshed_as_model_inputs() -> TestResult {
+    for identity in [
+        CodeIdentity::WholeImageSha256([9; 32]),
+        CodeIdentity::CodeDirectoryHash([9; 20]),
+    ] {
+        let mut fixture = fixture()?;
+        replace_code_identity(&mut fixture, identity)?;
+        let binding = confirm(&fixture)?;
+        assert_eq!(binding.process().code_identity, identity);
+        let refreshed = binding
+            .revalidate(current_correlation(&fixture, 3, 13)?, 13)
+            .map_err(|error| format!("unchanged code identity was rejected: {error:?}"))?;
+        assert_eq!(refreshed.process().code_identity, identity);
+    }
+    Ok(())
+}
+
+#[test]
+fn identical_prefixes_do_not_make_different_identity_kinds_interchangeable() -> TestResult {
+    let sha256 = CodeIdentity::WholeImageSha256([9; 32]);
+    let cdhash = CodeIdentity::CodeDirectoryHash([9; 20]);
+    for (selected, observed) in [(sha256, cdhash), (cdhash, sha256)] {
+        let mut fixture = fixture()?;
+        replace_code_identity(&mut fixture, selected)?;
+        fixture.report.matches[0].after.process.code_identity = observed;
+        assert_eq!(
+            correlate(&fixture).err(),
+            Some(BindingError::ProcessChanged)
+        );
+        fixture.report.matches[0].before.process.code_identity = observed;
+        assert_eq!(
+            correlate(&fixture).err(),
+            Some(BindingError::SoftwareNotSelected)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn identity_kind_or_value_changes_require_new_confirmation_and_binding() -> TestResult {
+    for (old_identity, identity) in [
+        (
+            CodeIdentity::WholeImageSha256([9; 32]),
+            CodeIdentity::WholeImageSha256([8; 32]),
+        ),
+        (
+            CodeIdentity::WholeImageSha256([9; 32]),
+            CodeIdentity::CodeDirectoryHash([9; 20]),
+        ),
+        (
+            CodeIdentity::CodeDirectoryHash([9; 20]),
+            CodeIdentity::CodeDirectoryHash([8; 20]),
+        ),
+        (
+            CodeIdentity::CodeDirectoryHash([9; 20]),
+            CodeIdentity::WholeImageSha256([9; 32]),
+        ),
+    ] {
+        let mut fixture = fixture()?;
+        replace_code_identity(&mut fixture, old_identity)?;
+        let prior = correlate(&fixture)?;
+        let intent = prior.confirmation_intent();
+        let binding = confirm(&fixture)?;
+        replace_code_identity(&mut fixture, identity)?;
+        assert_eq!(
+            prior
+                .confirm(intent, current_correlation(&fixture, 2, 13)?, 13)
+                .err(),
+            Some(BindingError::ProcessChanged)
+        );
+        let invalidated = binding
+            .revalidate(current_correlation(&fixture, 3, 13)?, 13)
+            .err()
+            .ok_or("changed code identity preserved an old binding")?;
+        assert_eq!(
+            invalidated.reason(),
+            &BindingInvalidation::CurrentCheckFailed(BindingError::ProcessChanged)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn every_identity_kind_rejects_zero_in_selections_and_process_reports() -> TestResult {
+    for identity in [
+        CodeIdentity::WholeImageSha256([0; 32]),
+        CodeIdentity::CodeDirectoryHash([0; 20]),
+    ] {
+        assert_eq!(
+            ProxySelection::new(ProxyCore::SingBox, identity).err(),
+            Some(BindingError::InvalidSoftwareSelection)
+        );
+        let mut fixture = fixture()?;
+        for before in [true, false] {
+            let pair = &mut fixture.report.matches[0];
+            pair.before.process.code_identity = fixture.process.code_identity;
+            pair.after.process.code_identity = fixture.process.code_identity;
+            if before {
+                pair.before.process.code_identity = identity;
+            } else {
+                pair.after.process.code_identity = identity;
+            }
+            assert_eq!(
+                correlate(&fixture).err(),
+                Some(BindingError::InvalidProcessObservation)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn code_identity_json_requires_explicit_algorithm_exact_length_and_no_extra_fields() -> TestResult {
+    for (identity, algorithm, length) in [
+        (
+            CodeIdentity::WholeImageSha256([9; 32]),
+            "whole_image_sha256",
+            32,
+        ),
+        (
+            CodeIdentity::CodeDirectoryHash([9; 20]),
+            "code_directory_hash",
+            20,
+        ),
+    ] {
+        let encoded = serde_json::to_value(identity)?;
+        assert_eq!(
+            encoded,
+            serde_json::json!({"algorithm": algorithm, "digest": vec![9; length]})
+        );
+        assert_eq!(
+            serde_json::from_value::<CodeIdentity>(encoded.clone())?,
+            identity
+        );
+        let mut extra = encoded.clone();
+        extra["trusted"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CodeIdentity>(extra).is_err());
+        let mut unknown = encoded.clone();
+        unknown["algorithm"] = serde_json::json!("sha256");
+        assert!(serde_json::from_value::<CodeIdentity>(unknown).is_err());
+        let mut wrong_length = encoded.clone();
+        wrong_length["digest"] = serde_json::json!(vec![9; length - 1]);
+        assert!(serde_json::from_value::<CodeIdentity>(wrong_length).is_err());
+        let mut wrong_length = encoded;
+        wrong_length["digest"] = serde_json::json!(vec![9; length + 1]);
+        assert!(serde_json::from_value::<CodeIdentity>(wrong_length).is_err());
+    }
+    assert!(serde_json::from_value::<CodeIdentity>(serde_json::json!(vec![9; 20])).is_err());
+    let fixture = fixture()?;
+    let mut forged = serde_json::to_value(&fixture.report)?;
+    forged["matches"][0]["after"]["process"]["code_identity"]["authorized"] =
+        serde_json::json!(true);
+    assert!(serde_json::from_value::<UntrustedOwnershipReport>(forged).is_err());
     Ok(())
 }
 
@@ -218,7 +386,7 @@ fn uid_or_core_or_image_change_during_collection_is_rejected() -> TestResult {
         match change {
             0 => process.uid = 501,
             1 => process.core = ProxyCore::Xray,
-            _ => process.loaded_image_sha256 = [8; 32],
+            _ => process.code_identity = CodeIdentity::WholeImageSha256([8; 32]),
         }
         assert_eq!(
             correlate(&fixture).err(),
@@ -237,7 +405,7 @@ fn unchanged_paths_cannot_authorize_new_core_or_loaded_image_content() -> TestRe
             if change == 0 {
                 sample.process.core = ProxyCore::Mihomo;
             } else {
-                sample.process.loaded_image_sha256 = [8; 32];
+                sample.process.code_identity = CodeIdentity::WholeImageSha256([8; 32]);
             }
         }
         assert_eq!(
@@ -257,7 +425,7 @@ fn malformed_process_facts_do_not_create_correlation() -> TestResult {
             0 => process.pid = 0,
             1 => process.birth_seconds = 0,
             2 => process.birth_microseconds = 1_000_000,
-            3 => process.loaded_image_sha256 = [0; 32],
+            3 => process.code_identity = CodeIdentity::WholeImageSha256([0; 32]),
             _ => process.core = ProxyCore::Unknown,
         }
         assert_eq!(
@@ -906,11 +1074,11 @@ fn zero_epoch_generation_or_unknown_software_cannot_be_selected() -> TestResult 
         );
     }
     assert_eq!(
-        ProxySelection::new(ProxyCore::Unknown, [9; 32]).err(),
+        ProxySelection::new(ProxyCore::Unknown, CodeIdentity::WholeImageSha256([9; 32])).err(),
         Some(BindingError::InvalidSoftwareSelection)
     );
     assert_eq!(
-        ProxySelection::new(ProxyCore::SingBox, [0; 32]).err(),
+        ProxySelection::new(ProxyCore::SingBox, CodeIdentity::WholeImageSha256([0; 32])).err(),
         Some(BindingError::InvalidSoftwareSelection)
     );
     Ok(())

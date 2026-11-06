@@ -974,9 +974,9 @@ fn synthetic_binding(
     sequence: u64,
 ) -> TestResult<tunlatch_core::binding::VerifiedCurrentBinding> {
     use tunlatch_core::binding::{
-        CandidateSnapshot, ControlSocketObservation, CorrelatedBinding, InterfaceObservation,
-        OwnershipMatch, OwnershipMethod, OwnershipSample, ProcessObservation, ProxyCore,
-        ProxySelection, ReportCompleteness, SnapshotCompleteness, SnapshotStamp,
+        CandidateSnapshot, CodeIdentity, ControlSocketObservation, CorrelatedBinding,
+        InterfaceObservation, OwnershipMatch, OwnershipMethod, OwnershipSample, ProcessObservation,
+        ProxyCore, ProxySelection, ReportCompleteness, SnapshotCompleteness, SnapshotStamp,
         UntrustedOwnershipReport,
     };
     use tunlatch_core::status::{InterfaceAddress, NetworkInterface};
@@ -1003,7 +1003,8 @@ fn synthetic_binding(
         SnapshotCompleteness::Complete,
         vec![interface.clone()],
     )?;
-    let selection = ProxySelection::new(ProxyCore::SingBox, [9; 32])?;
+    let selection =
+        ProxySelection::new(ProxyCore::SingBox, CodeIdentity::WholeImageSha256([9; 32]))?;
     let sample = OwnershipSample {
         snapshot: stamp,
         interface,
@@ -1013,7 +1014,7 @@ fn synthetic_binding(
             birth_microseconds: 123,
             uid: 0,
             core: ProxyCore::SingBox,
-            loaded_image_sha256: [9; 32],
+            code_identity: CodeIdentity::WholeImageSha256([9; 32]),
         },
         socket: ControlSocketObservation {
             fd,

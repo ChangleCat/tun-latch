@@ -1,6 +1,7 @@
 //! Explicit, ordinary-user process diagnostics, never TUN ownership or authorization.
 
 use anyhow::bail;
+use tunlatch_core::binding::CodeIdentity;
 use tunlatch_platform::identity::{
     ImageInspection, ProcessInspection, RawInspection, inspect_expected_cdhash, inspect_process,
     inspect_selected_process,
@@ -50,8 +51,15 @@ fn image_result(inspection: ImageInspection) -> (bool, serde_json::Value) {
         "authorization": "none", "continuous_image_identity": "unverified",
         "fingerprint_kind": "cdhash_20_bytes",
     });
+    if let ImageInspection::Matched {
+        expected_cdhash, ..
+    } = &inspection
+    {
+        result["matched_expected_code_identity"] =
+            serde_json::json!(CodeIdentity::CodeDirectoryHash(*expected_cdhash));
+    }
     let matched = match inspection {
-        ImageInspection::Matched { process } | ImageInspection::Mismatched { process } => {
+        ImageInspection::Matched { process, .. } | ImageInspection::Mismatched { process } => {
             result["result"] = if matched { "matched" } else { "mismatched" }.into();
             result["process"] = serde_json::json!({
                 "pid": process.pid, "effective_uid": process.uid,
@@ -234,6 +242,7 @@ mod image_tests {
             (
                 ImageInspection::Matched {
                     process: process.clone(),
+                    expected_cdhash: [1; 20],
                 },
                 true,
                 "matched",
@@ -256,6 +265,14 @@ mod image_tests {
             assert_eq!(result["authorization"], "none");
             assert!(result.get("loaded_image_sha256").is_none());
             assert!(result.get("path").is_none());
+            if expected_success {
+                assert_eq!(
+                    result["matched_expected_code_identity"],
+                    serde_json::json!(CodeIdentity::CodeDirectoryHash([1; 20])),
+                );
+            } else {
+                assert!(result.get("matched_expected_code_identity").is_none());
+            }
             if expected_result == "unavailable" {
                 assert!(result.get("process").is_none());
             }

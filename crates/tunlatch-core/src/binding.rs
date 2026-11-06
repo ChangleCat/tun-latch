@@ -74,6 +74,28 @@ pub enum ProxyCore {
     Unknown,
 }
 
+/// Explicit kind and bytes of a code-content identity, not an authorization credential.
+///
+/// The algorithms are separate identity domains: a CodeDirectory hash must never be padded,
+/// truncated or otherwise interpreted as a whole-image SHA-256. A trusted collector must
+/// establish whichever identity it reports. Content matching does not authenticate a publisher
+/// or exclude process `exec`/ABA races. The platform currently checks a caller-selected
+/// CodeDirectory requirement; it does not collect whole-image SHA-256 identities.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "algorithm",
+    content = "digest",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum CodeIdentity {
+    /// SHA-256 of a complete running image, requiring a separate trusted collection method.
+    WholeImageSha256([u8; 32]),
+    /// A 20-byte CodeDirectory identifier accepted by a dynamic code requirement check.
+    /// This may describe ad-hoc signed code and does not identify its publisher.
+    CodeDirectoryHash([u8; 20]),
+}
+
 /// User intent to select particular software content, not proof of consent or provenance.
 ///
 /// The caller must separately enforce the operation authorization policy and establish the
@@ -81,7 +103,7 @@ pub enum ProxyCore {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ProxySelection {
     core: ProxyCore,
-    image_sha256: [u8; 32],
+    code_identity: CodeIdentity,
 }
 
 /// Untrusted process facts reported by the platform collector.
@@ -98,8 +120,9 @@ pub struct ProcessObservation {
     pub uid: u32,
     /// Core role observed for this instance.
     pub core: ProxyCore,
-    /// SHA-256 of the running image established by the collector, not merely a path's file.
-    pub loaded_image_sha256: [u8; 32],
+    /// Explicit code-identity kind and value established by the trusted collector.
+    /// Client DTOs and a path's file digest cannot establish these platform facts.
+    pub code_identity: CodeIdentity,
 }
 
 /// How the report claims to associate a process instance with a utun control socket.
@@ -449,11 +472,14 @@ impl CandidateSnapshot {
 
 impl ProxySelection {
     /// Record a software-content choice. This does not prove provenance or authorization.
-    pub fn new(core: ProxyCore, image_sha256: [u8; 32]) -> Result<Self, BindingError> {
-        if core == ProxyCore::Unknown || image_sha256 == [0; 32] {
+    pub fn new(core: ProxyCore, code_identity: CodeIdentity) -> Result<Self, BindingError> {
+        if core == ProxyCore::Unknown || code_identity.is_zero() {
             return Err(BindingError::InvalidSoftwareSelection);
         }
-        Ok(Self { core, image_sha256 })
+        Ok(Self {
+            core,
+            code_identity,
+        })
     }
 }
 
@@ -517,7 +543,7 @@ impl CorrelatedBinding {
             return Err(BindingError::ProcessChanged);
         }
         if after.process.core != selection.core
-            || after.process.loaded_image_sha256 != selection.image_sha256
+            || after.process.code_identity != selection.code_identity
         {
             return Err(BindingError::SoftwareNotSelected);
         }
@@ -712,11 +738,20 @@ fn check_process(process: &ProcessObservation) -> Result<(), BindingError> {
         || process.birth_seconds == 0
         || process.birth_microseconds >= 1_000_000
         || process.core == ProxyCore::Unknown
-        || process.loaded_image_sha256 == [0; 32]
+        || process.code_identity.is_zero()
     {
         return Err(BindingError::InvalidProcessObservation);
     }
     Ok(())
+}
+
+impl CodeIdentity {
+    fn is_zero(self) -> bool {
+        match self {
+            Self::WholeImageSha256(digest) => digest == [0; 32],
+            Self::CodeDirectoryHash(digest) => digest == [0; 20],
+        }
+    }
 }
 
 fn check_socket(
