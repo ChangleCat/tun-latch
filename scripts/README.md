@@ -56,6 +56,8 @@ cargo test -p tunlatch-platform --example utun_mapping --locked
 /usr/bin/python3 -m unittest discover -s scripts -p 'test_utun_mapping.py' -v
 ```
 
+本机 Apple Silicon/macOS 26.6.2 的一次执行已完成：自持 FD 的接口名、peer unit 和原始 control 采样一致；close 正常返回后，后续 FD 与接口名点查询均为 absent，操作者确认联网正常。这只验证本次受控样本，不推广到现有代理、名称复用或 PF，也不授权自动重复执行。
+
 ## 本机PF只读预检
 
 在Mac本机Terminal中，以普通用户从仓库根目录运行：
