@@ -8,3 +8,4 @@ pub mod events;
 pub mod identity;
 pub mod network;
 pub mod pf;
+pub mod policy_compile;

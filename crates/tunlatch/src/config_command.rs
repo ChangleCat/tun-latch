@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, bail};
 use tunlatch_core::config::Config;
 use tunlatch_core::policy::{ConfigV2, MAX_POLICY_INPUT_BYTES, PolicyErrorCode};
+use tunlatch_platform::policy_compile::{PfCandidateStatus, compile_candidate};
 
 fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
@@ -33,6 +34,39 @@ fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
 
 fn draft(path: &Path) -> anyhow::Result<ConfigV2> {
     ConfigV2::parse_toml(&read(path)?).context("configuration rejected")
+}
+
+/// Compile only a blocking floor preview. No candidate is installed or given execution authority.
+pub fn compile_preview(path: &Path, json: bool) -> anyhow::Result<String> {
+    let config = draft(path)?;
+    let candidate = compile_candidate(&config).context("PF candidate rejected")?;
+    let status = match candidate.status() {
+        PfCandidateStatus::BlockedNotReady => "blocked_not_ready",
+        PfCandidateStatus::Unmanaged => "unmanaged",
+    };
+    if json {
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "candidate_status": status,
+            "source_policy_digest": candidate.source_digest().to_string(),
+            "candidate_digest": candidate.digest().to_string(),
+            "rule_count": candidate.rule_count(),
+            "rules_text": candidate.rules_text(),
+            "load_ready": false,
+            "authorization": "none",
+            "system_changes": false,
+            "actual_protection": "unknown",
+        }))?)
+    } else {
+        Ok(format!(
+            "PF candidate: {status}; {} rules. Preview only; not ready to load.\n\
+             Source policy: {}\nCandidate: {}\n\
+             No system changes or authorization. Actual protection remains UNKNOWN.\n{}",
+            candidate.rule_count(),
+            candidate.source_digest(),
+            candidate.digest(),
+            candidate.rules_text(),
+        ))
+    }
 }
 
 /// Validate a v2 draft or a legacy v1 configuration without changing it.
@@ -192,6 +226,39 @@ mod tests {
     }
     const VALID: &str =
         "schema_version = 2\ndesired = \"disabled\"\nrules = []\ndirect_exceptions = []\n";
+
+    #[test]
+    fn compile_preview_preserves_input_and_never_claims_execution_authority() -> anyhow::Result<()>
+    {
+        let dir = Dir(directory()?);
+        let input = dir.0.0.join("policy.toml");
+        let enabled = VALID.replace("disabled", "enabled");
+        fs::write(&input, &enabled)?;
+        let value: serde_json::Value = serde_json::from_str(&compile_preview(&input, true)?)?;
+        assert_eq!(value["candidate_status"], "blocked_not_ready");
+        assert_eq!(value["load_ready"], false);
+        assert_eq!(value["authorization"], "none");
+        assert_eq!(value["system_changes"], false);
+        assert_eq!(value["actual_protection"], "unknown");
+        assert_eq!(value["rule_count"], 4);
+        assert!(
+            value["rules_text"]
+                .as_str()
+                .is_some_and(|s| s.contains("block drop out quick inet6"))
+        );
+        assert_eq!(fs::read_to_string(&input)?, enabled);
+        assert!(compile_preview(&input, false)?.contains("not ready to load"));
+        fs::write(&input, VALID)?;
+        let disabled: serde_json::Value = serde_json::from_str(&compile_preview(&input, true)?)?;
+        assert_eq!(disabled["candidate_status"], "unmanaged");
+        assert_eq!(disabled["rules_text"], "");
+        let link = dir.0.0.join("link");
+        symlink(&input, &link)?;
+        assert!(compile_preview(&link, true).is_err());
+        fs::write(&input, "invalid")?;
+        assert!(compile_preview(&input, true).is_err());
+        Ok(())
+    }
 
     #[test]
     fn config_command_temporary_file_never_occupies_destination() -> anyhow::Result<()> {

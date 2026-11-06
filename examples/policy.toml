@@ -1,0 +1,5 @@
+# Offline policy draft for compile-preview. This file grants no egress permission.
+schema_version = 2
+desired = "enabled"
+rules = []
+direct_exceptions = []

@@ -135,6 +135,12 @@ fn print_simulation(status: SimulationStatus, json: bool) -> anyhow::Result<()> 
 enum ConfigCommand {
     /// Validate schema, version, size and fields in a TOML file.
     Check { path: PathBuf },
+    /// Preview a bounded PF blocking candidate. No rules are loaded or authorized.
+    CompilePreview {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Preview a configuration draft without applying it or importing approval.
     ImportPreview {
         path: PathBuf,
@@ -245,6 +251,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             println!("{}", config_command::check(&path)?);
         }
+        Command::Config {
+            command: ConfigCommand::CompilePreview { path, json },
+        } => println!("{}", config_command::compile_preview(&path, json)?),
         Command::Config {
             command: ConfigCommand::ImportPreview { path, current },
         } => {
