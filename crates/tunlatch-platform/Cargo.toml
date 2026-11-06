@@ -13,6 +13,7 @@ tunlatch-core.workspace = true
 nix = { workspace = true, features = ["socket", "poll", "uio", "fs"] }
 thiserror.workspace = true
 libproc.workspace = true
+security-framework.workspace = true
 
 [dev-dependencies]
 clap.workspace = true

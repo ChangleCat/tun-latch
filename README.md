@@ -46,6 +46,14 @@ cargo run -p tunlatch -- identity inspect --pid 12345 --fd-details --json
 
 将 PID 替换为实际选择的进程。采集前后核对 PID、UID、出生时间、FD 列表和 socket 元数据；不可读、截断、变化或不支持的结构布局均返回失败。`complete_raw` 仅表示两次有限的原始采样匹配，TUN 归属、已载入映像和实际保护仍为未知/未认证。CLI 省略内核 opaque 值和非 control socket 端点。当前已核对的采集布局限 Apple Silicon；普通观察入口仍拒绝 root。单次管理员只读诊断另有专用程序和受保护暂存流程，见 [操作者步骤](scripts/README.md#单次管理员身份只读采集)，不能直接 sudo 构建目录中的程序。
 
+也可将明确选定的进程与预期的 40 位十六进制 CDHash 作动态核验：
+
+```sh
+cargo run -p tunlatch -- identity check-image --pid 12345 --cdhash 00112233445566778899aabbccddeeff00112233 --json
+```
+
+示例 PID 和指纹均须替换。这条命令通过系统的运行代码对象检查固定 CodeDirectory 条件，不读取程序路径或将磁盘文件摘要当运行身份；匹配返回成功，不匹配或无法检查返回非零。指纹来自调用者，不代表发布者可信或管理员批准；ad-hoc 签名也没有发布者认证。检查禁止网络访问，因此不做在线撤销/公证检查。进程出生信息在前后复核，但不能排除中间 `exec` 或复用；3 秒预算在系统调用返回后检查，不能中断系统调用。结果不提供整镜像 SHA-256、TUN 归属、持续身份或放行资格，原管理员采集入口也未因此扩权。
+
 服务不会覆盖已有 `control.sock`。若服务被 `SIGKILL` 导致路径残留，先确认原服务已结束，再手动移除该临时目录内的 socket；不要删除仍在运行的服务端点。当前目录只存放开发 socket，删除它不涉及 PF 恢复或停用。
 
 ## 离线配置与模拟控制

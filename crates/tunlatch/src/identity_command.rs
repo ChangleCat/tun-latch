@@ -2,8 +2,73 @@
 
 use anyhow::bail;
 use tunlatch_platform::identity::{
-    ProcessInspection, RawInspection, inspect_process, inspect_selected_process,
+    ImageInspection, ProcessInspection, RawInspection, inspect_expected_cdhash, inspect_process,
+    inspect_selected_process,
 };
+
+pub(crate) fn parse_cdhash(text: &str) -> Result<[u8; 20], String> {
+    let invalid = || "CDHash must contain exactly 40 hexadecimal digits and be nonzero".to_owned();
+    if text.len() != 40 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0, // ASCII hexadecimal input was checked before decoding.
+    };
+    let mut expected = [0; 20];
+    for (out, pair) in expected.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+        *out = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    if expected == [0; 20] {
+        return Err(invalid());
+    }
+    Ok(expected)
+}
+
+pub(crate) async fn check_image(pid: u32, expected: [u8; 20], json: bool) -> anyhow::Result<()> {
+    let inspection =
+        tokio::task::spawn_blocking(move || inspect_expected_cdhash(pid, expected)).await?;
+    let (matched, result) = image_result(inspection);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("Running code requirement: {}", result["result"]);
+        println!("Diagnostic only. TUN ownership and actual protection remain UNKNOWN.");
+    }
+    if !matched {
+        bail!("running code requirement did not match or could not be checked; no trust granted");
+    }
+    Ok(())
+}
+
+fn image_result(inspection: ImageInspection) -> (bool, serde_json::Value) {
+    let matched = matches!(&inspection, ImageInspection::Matched { .. });
+    let mut result = serde_json::json!({
+        "actual_protection": "unknown", "tun_ownership": "unknown",
+        "authorization": "none", "continuous_image_identity": "unverified",
+        "fingerprint_kind": "cdhash_20_bytes",
+    });
+    let matched = match inspection {
+        ImageInspection::Matched { process } | ImageInspection::Mismatched { process } => {
+            result["result"] = if matched { "matched" } else { "mismatched" }.into();
+            result["process"] = serde_json::json!({
+                "pid": process.pid, "effective_uid": process.uid,
+                "birth_seconds": process.birth_seconds,
+                "birth_microseconds": process.birth_microseconds,
+            });
+            matched
+        }
+        ImageInspection::Unavailable { problem, status } => {
+            result["result"] = "unavailable".into();
+            result["problem"] = format!("{problem:?}").into();
+            result["security_status"] = status.into();
+            false
+        }
+    };
+    (matched, result)
+}
 
 pub(crate) async fn inspect(pid: u32, json: bool, fd_details: bool) -> anyhow::Result<()> {
     if fd_details {
@@ -120,6 +185,80 @@ async fn inspect_fds(pid: u32, json: bool) -> anyhow::Result<()> {
                 );
             }
             bail!("raw inspection incomplete: {failure}; no trusted identity established")
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use tunlatch_platform::identity::{ImageProblem, ProcessIdentity};
+
+    #[test]
+    fn rejects_unbounded_nonhex_zero_and_whole_file_digest_inputs() {
+        for invalid in [
+            "",
+            "01",
+            &"0".repeat(40),
+            &"1".repeat(64),
+            &"g".repeat(40),
+            &"é".repeat(20),
+            &"1".repeat(4096),
+            "00112233445566778899aabbccddeeff0011223 ",
+        ] {
+            assert!(parse_cdhash(invalid).is_err());
+        }
+        let expected = [
+            0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0, 0x11, 0x22, 0x33,
+        ];
+        assert_eq!(
+            parse_cdhash("00112233445566778899aabbccddeeff00112233"),
+            Ok(expected)
+        );
+        assert_eq!(
+            parse_cdhash("00112233445566778899AABBCCDDEEFF00112233"),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn only_a_match_succeeds_and_every_result_preserves_the_trust_boundary() {
+        let process = ProcessIdentity {
+            pid: 42,
+            uid: 501,
+            birth_seconds: 1,
+            birth_microseconds: 0,
+        };
+        for (inspection, expected_success, expected_result) in [
+            (
+                ImageInspection::Matched {
+                    process: process.clone(),
+                },
+                true,
+                "matched",
+            ),
+            (ImageInspection::Mismatched { process }, false, "mismatched"),
+            (
+                ImageInspection::Unavailable {
+                    problem: ImageProblem::SecurityUnavailable,
+                    status: Some(-1),
+                },
+                false,
+                "unavailable",
+            ),
+        ] {
+            let (success, result) = image_result(inspection);
+            assert_eq!(success, expected_success);
+            assert_eq!(result["result"], expected_result);
+            assert_eq!(result["actual_protection"], "unknown");
+            assert_eq!(result["tun_ownership"], "unknown");
+            assert_eq!(result["authorization"], "none");
+            assert!(result.get("loaded_image_sha256").is_none());
+            assert!(result.get("path").is_none());
+            if expected_result == "unavailable" {
+                assert!(result.get("process").is_none());
+            }
         }
     }
 }

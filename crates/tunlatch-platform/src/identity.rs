@@ -1,15 +1,18 @@
 //! Display-only tunnel candidates and conservative invalidation, never ownership evidence.
 //!
-//! No current collector can verify a process's loaded image or direct utun control FD.
-//! Therefore these diagnostics cannot create a correlated or trusted binding.
+//! Raw control metadata and dynamic CDHash checks do not establish a complete loaded-image
+//! identity or direct ownership of a specific interface. These diagnostics cannot create a
+//! correlated or trusted binding.
 
 use std::sync::Arc;
 
 use crate::events::{NetworkObserver, NetworkSnapshot};
 
+mod image;
 #[allow(unsafe_code)]
 mod native;
 mod process;
+pub use image::{ImageInspection, ImageProblem, inspect_expected_cdhash};
 pub use process::{
     InspectionFailure, InspectionProblem, InspectionStage, ProcessIdentity, ProcessInspection,
     RawControl, RawFd, RawInspection, RawObservation, inspect_process, inspect_selected_process,

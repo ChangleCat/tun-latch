@@ -72,6 +72,16 @@ enum IdentityCommand {
         #[arg(long)]
         fd_details: bool,
     },
+    /// Check a running process against an expected CodeDirectory fingerprint; never grants trust.
+    CheckImage {
+        #[arg(long)]
+        pid: u32,
+        /// Expected 20-byte CDHash (40 hex digits), not a whole-file SHA-256 or an approval.
+        #[arg(long, value_parser = identity_command::parse_cdhash)]
+        cdhash: [u8; 20],
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -202,6 +212,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             identity_command::inspect(pid, json, fd_details).await?;
         }
+        Command::Identity {
+            command: IdentityCommand::CheckImage { pid, cdhash, json },
+        } => identity_command::check_image(pid, cdhash, json).await?,
         Command::Simulate {
             runtime_dir,
             json,
