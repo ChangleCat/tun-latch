@@ -6,8 +6,22 @@ use tunlatch_core::status::NetworkInterface;
 use tunlatch_platform::events::{Invalidation, NetworkObserver, ScanError};
 use tunlatch_platform::identity::{
     HintStatus, InspectionFailure, InspectionProblem, ProcessInspection, RawInspection,
-    inspect_process, inspect_selected_process, tunnel_hints,
+    inspect_process, inspect_selected_process, inspect_selected_process_privileged, tunnel_hints,
 };
+
+#[test]
+fn privileged_inspection_rejects_ordinary_user_before_reading() {
+    assert!(!nix::unistd::Uid::effective().is_root());
+    for pid in [0, std::process::id()] {
+        assert!(matches!(
+            inspect_selected_process_privileged(pid),
+            RawInspection::Error(InspectionFailure {
+                problem: InspectionProblem::AdminRequired,
+                ..
+            })
+        ));
+    }
+}
 
 fn interface() -> NetworkInterface {
     NetworkInterface {

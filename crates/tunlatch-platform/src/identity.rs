@@ -13,6 +13,7 @@ mod process;
 pub use process::{
     InspectionFailure, InspectionProblem, InspectionStage, ProcessIdentity, ProcessInspection,
     RawControl, RawFd, RawInspection, RawObservation, inspect_process, inspect_selected_process,
+    inspect_selected_process_privileged,
 };
 
 /// A snapshot-scoped interface hint. Name and index are diagnostic, not identity.

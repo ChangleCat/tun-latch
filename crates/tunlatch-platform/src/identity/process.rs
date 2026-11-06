@@ -35,6 +35,8 @@ pub enum InspectionProblem {
     InvalidPid,
     /// This observer must not run with effective UID 0.
     RootObserver,
+    /// The dedicated privileged read requires the actual effective UID to be zero.
+    AdminRequired,
     /// The native wrapper did not report why the process could not be read.
     NotReadable,
     /// Reads differ, or contain invalid process identity fields.
@@ -216,7 +218,6 @@ pub enum RawInspection {
 /// Inspect one selected PID without running as root. No arbitrary process enumeration occurs.
 /// The one-second deadline bounds reuse by callers, not kernel lifetime or sampling duration.
 pub fn inspect_selected_process(pid: u32) -> RawInspection {
-    let started_at = Instant::now();
     if nix::unistd::Uid::effective().is_root() {
         return raw_failure(
             InspectionStage::Input,
@@ -224,6 +225,28 @@ pub fn inspect_selected_process(pid: u32) -> RawInspection {
             None,
         );
     }
+    collect_selected_process(pid)
+}
+
+/// Perform the same bounded read for a selected PID only with effective UID 0.
+///
+/// This check is not evidence of human authorization. The result is raw diagnostic
+/// data and cannot establish ownership, binding, or protection. Callers must use a
+/// separately protected executable and authorization procedure; never elevate the
+/// ordinary observer or execute a user-writable build artifact as root.
+pub fn inspect_selected_process_privileged(pid: u32) -> RawInspection {
+    if !nix::unistd::Uid::effective().is_root() {
+        return raw_failure(
+            InspectionStage::Input,
+            InspectionProblem::AdminRequired,
+            None,
+        );
+    }
+    collect_selected_process(pid)
+}
+
+fn collect_selected_process(pid: u32) -> RawInspection {
+    let started_at = Instant::now();
     let Ok(native_pid) = i32::try_from(pid) else {
         return raw_failure(InspectionStage::Input, InspectionProblem::InvalidPid, None);
     };
