@@ -153,6 +153,8 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Print the fixed deployment layout and launchd template as preview JSON.
+    DeploymentPreview,
     /// Store a local simulation intent and exercise modeled submission and readback.
     JournalPreview {
         path: PathBuf,
@@ -296,6 +298,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Config {
             command: ConfigCommand::CompilePreview { path, json },
         } => println!("{}", config_command::compile_preview(&path, json)?),
+        Command::Config {
+            command: ConfigCommand::DeploymentPreview,
+        } => println!(
+            "{}",
+            serde_json::to_string_pretty(&tunlatch_platform::launchd::deployment_preview())?
+        ),
         Command::Config {
             command:
                 ConfigCommand::JournalPreview {

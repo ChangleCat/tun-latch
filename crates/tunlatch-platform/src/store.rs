@@ -29,7 +29,7 @@ const MAGIC: &[u8; 8] = b"TNLREC\0\0";
 const VERSION: u16 = 1;
 const HEADER_BYTES: usize = 80;
 const MAX_RECORD_BYTES: usize = HEADER_BYTES + MAX_RECORD_PAYLOAD_BYTES;
-const LOCK_NAME: &str = "writer.lock";
+pub(crate) const LOCK_NAME: &str = "writer.lock";
 
 /// Separate fixed slots. A record copied between slots fails its envelope-kind check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -101,6 +101,12 @@ cargo run -p tunlatch -- config journal-status --state-dir "$TUNLATCH_JOURNAL_DI
 cargo run -p tunlatch -- config verify-capture examples/policy.toml --capture-dir /path/to/capture --anchor tunlatch --json
 ```
 
+`config deployment-preview` 输出固定的系统目录、文件权限和 LaunchDaemon 模板。私有记录位于 `/private/var/db/tunlatch`，查询与控制端点拟放在同级的 `/private/var/db/tunlatch-runtime`。权限在 JSON 中以十进制整数表示。模板中的 `--system` 是预留入口，当前发布版仍为普通用户观察器。输出仅供核对部署契约。
+
+```sh
+cargo run -p tunlatch -- config deployment-preview
+```
+
 要演练完整控制流程，在新的私有目录启动 `tunlatchd --simulation`：
 
 ```sh
@@ -151,7 +157,7 @@ crates/
 | 实验进程监督 | 固定无 PF 子程序的启动、限量输入/输出、超时/取消和直接子进程回收已通过普通用户测试；未回收任务保留记录，另有操作者只读系统查询入口；尚未接入特权写入和 PF 变更入口 |
 | 网络观察 | 原生路由通知触发及周期重扫已接入；仅提供失效提示，不证明事件完整或接口实例持续隔离 |
 | 原始身份采集 | 选定 PID 的出生/UID、固定上限 FD/control 双采样已实现；本机 root 代理的原始 control 样本已采得，已载入映像与具体 TUN 归属仍未验证 |
-| 特权授权、原子持久化、LaunchDaemon、安装卸载、离线解锁 | 待设计与实现 |
+| 系统部署 | 固定资源布局和 LaunchDaemon 模板可离线预览。特权授权、实际安装卸载与离线解锁待实现 |
 
 下一步先补齐 PF 实验的安全准备，再验证 socket user 的双栈 TCP/UDP、unknown/其他 UID 对照及撤销后的旧连接，连同 anchor 实际执行顺序与共存、事务、启用引用和接口复用。确认这些机制后再接入保护启停，不以 UI 或模型测试替代内核与物理出口证据。`core::egress` 已提供独立 UID 候选和确认模型，实际受保护存储、管理员认证和应用仍待接入；文件导入不能生成批准。
 
