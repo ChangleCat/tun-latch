@@ -10,8 +10,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, open, openat};
-use nix::sys::stat::{Mode, SFlag, fstatat};
-use tokio::net::UnixStream;
+use nix::sys::stat::{FchmodatFlags, Mode, SFlag, fchmodat, fstatat};
+use nix::unistd::{UnlinkatFlags, unlinkat};
+use tokio::net::{UnixListener, UnixStream};
 use tunlatch_platform::launchd::{
     CONTROL_DIRECTORY_NAME, CONTROL_SOCKET_NAME, QUERY_SOCKET_NAME, SYSTEM_RUNTIME_DIRECTORY,
 };
@@ -76,6 +77,119 @@ fn verify_uid(stream: &UnixStream, expected: u32) -> Result<(), IpcError> {
         return Err(IpcError::Peer { expected, actual });
     }
     Ok(())
+}
+
+/// The two fixed listeners for the future privileged service.
+///
+/// Directories must already exist and satisfy the system policy. Transport peer
+/// authentication does not establish human approval. Cleanup rechecks the entries
+/// created by this instance and assumes exclusive writes by the trusted directory owner.
+pub struct SystemListeners {
+    query: OwnedListener,
+    control: OwnedListener,
+    owner: NonZeroU32,
+}
+
+impl SystemListeners {
+    /// Bind both fixed sockets in a Tokio I/O runtime, requiring effective UID and GID zero.
+    /// An uncertain failure after bind can leave an entry for explicit operator inspection.
+    pub fn bind(owner: NonZeroU32) -> Result<Self, IpcError> {
+        if !nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() != 0 {
+            return Err(refused("system listeners require effective UID and GID 0"));
+        }
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| refused("system listeners require a Tokio runtime"))?;
+        Self::bind_at(
+            Path::new(SYSTEM_RUNTIME_DIRECTORY),
+            owner,
+            Policy::system(),
+            OwnedListener::bind,
+        )
+    }
+
+    fn bind_at(
+        runtime: &Path,
+        owner: NonZeroU32,
+        policy: Policy,
+        mut bind: impl FnMut(Chain, &'static str, bool) -> Result<OwnedListener, IpcError>,
+    ) -> Result<Self, IpcError> {
+        let query = Chain::open(runtime, policy, false)?;
+        let control = Chain::open(&runtime.join(CONTROL_DIRECTORY_NAME), policy, true)?;
+        query.absent(QUERY_SOCKET_NAME)?;
+        control.absent(CONTROL_SOCKET_NAME)?;
+        let query = bind(query, QUERY_SOCKET_NAME, false)?;
+        let control = bind(control, CONTROL_SOCKET_NAME, true)?;
+        Ok(Self {
+            query,
+            control,
+            owner,
+        })
+    }
+
+    /// Accept a connection only if its kernel-reported peer is the owner or root.
+    pub async fn accept_query(&self) -> Result<UnixStream, IpcError> {
+        let (stream, _) = self.query.listener.accept().await?;
+        verify_query_client(&stream, self.owner)?;
+        Ok(stream)
+    }
+
+    /// Accept a connection only if its kernel-reported peer is root.
+    pub async fn accept_control(&self) -> Result<UnixStream, IpcError> {
+        let (stream, _) = self.control.listener.accept().await?;
+        verify_control_client(&stream)?;
+        Ok(stream)
+    }
+}
+
+struct OwnedListener {
+    listener: UnixListener,
+    chain: Chain,
+    name: &'static str,
+    stamp: SocketStamp,
+}
+
+impl OwnedListener {
+    fn bind(chain: Chain, name: &'static str, control: bool) -> Result<Self, IpcError> {
+        chain.absent(name)?;
+        let listener = UnixListener::bind(chain.path().join(name))?;
+        // The bound descriptor's inode is not the filesystem entry's inode on Darwin.
+        // Infer ownership from bind in the protected directory and validate before changing
+        // permissions. Preserve the entry if this setup cannot establish a final stamp.
+        let before = chain.checked_socket(name, None)?;
+        fchmodat(
+            chain.last()?,
+            name,
+            Mode::from_bits_truncate(if control { 0o600 } else { 0o666 }),
+            FchmodatFlags::NoFollowSymlink,
+        )
+        .map_err(std::io::Error::from)?;
+        let after = chain.socket(name, control)?;
+        if (after.0, after.1) != (before.0, before.1) {
+            return Err(refused("created endpoint replaced"));
+        }
+        Ok(Self {
+            listener,
+            chain,
+            name,
+            stamp: after,
+        })
+    }
+}
+
+impl Drop for OwnedListener {
+    fn drop(&mut self) {
+        // A failure to prove identity or directory integrity leaves the entry intact.
+        if !self
+            .chain
+            .socket(self.name, self.chain.control)
+            .is_ok_and(|current| current == self.stamp)
+        {
+            return;
+        }
+        if let Ok(dir) = self.chain.last() {
+            let _ = unlinkat(dir, self.name, UnlinkatFlags::NoRemoveDir);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -209,13 +323,15 @@ impl Chain {
         Ok(())
     }
     fn socket(&self, name: &str, control: bool) -> Result<SocketStamp, IpcError> {
+        self.checked_socket(name, Some(if control { 0o600 } else { 0o666 }))
+    }
+    fn checked_socket(&self, name: &str, mode: Option<u16>) -> Result<SocketStamp, IpcError> {
         self.recheck(true)?;
         let before = self.socket_stat(name)?;
-        let expected_mode = if control { 0o600 } else { 0o666 };
         if SFlag::from_bits_truncate(before.st_mode & SFlag::S_IFMT.bits()) != SFlag::S_IFSOCK
             || before.st_uid != self.policy.owner
             || before.st_gid != self.policy.group
-            || before.st_mode & 0o7777 != expected_mode
+            || mode.is_some_and(|mode| before.st_mode & 0o7777 != mode)
             || before.st_nlink != 1
         {
             return Err(refused("endpoint socket attributes mismatch"));
@@ -230,6 +346,14 @@ impl Chain {
         }
         self.recheck(true)?;
         Ok(stamp)
+    }
+    fn absent(&self, name: &str) -> Result<(), IpcError> {
+        self.recheck(true)?;
+        match fstatat(self.last()?, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Err(nix::errno::Errno::ENOENT) => Ok(()),
+            Ok(_) => Err(refused("endpoint slot already exists")),
+            Err(error) => Err(std::io::Error::from(error).into()),
+        }
     }
     fn socket_stat(&self, name: &str) -> Result<nix::sys::stat::FileStat, IpcError> {
         fstatat(self.last()?, name, AtFlags::AT_SYMLINK_NOFOLLOW)
@@ -307,6 +431,84 @@ mod tests {
         std::fs::create_dir(&runtime)?;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))?;
         Ok((base, runtime))
+    }
+
+    #[tokio::test]
+    async fn listener_modes_and_replacement_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+        let (_base, runtime) = fixture()?;
+        let control = runtime.join(CONTROL_DIRECTORY_NAME);
+        std::fs::create_dir(&control)?;
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700))?;
+        let owner =
+            NonZeroU32::new(nix::unistd::geteuid().as_raw()).ok_or("requires non-root fixture")?;
+        let listeners =
+            SystemListeners::bind_at(&runtime, owner, policy(&runtime)?, OwnedListener::bind)?;
+        let query_path = runtime.join(QUERY_SOCKET_NAME);
+        let control_path = control.join(CONTROL_SOCKET_NAME);
+        assert_eq!(query_path.metadata()?.mode() & 0o7777, 0o666);
+        assert_eq!(control_path.metadata()?.mode() & 0o7777, 0o600);
+        std::fs::rename(&query_path, runtime.join("old.sock"))?;
+        let replacement = UnixListener::bind(&query_path)?;
+        drop(listeners);
+        assert!(query_path.exists());
+        assert!(!control_path.exists());
+        drop(replacement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn existing_control_slot_prevents_any_binding() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_base, runtime) = fixture()?;
+        let control = runtime.join(CONTROL_DIRECTORY_NAME);
+        std::fs::create_dir(&control)?;
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700))?;
+        let occupied = control.join(CONTROL_SOCKET_NAME);
+        std::fs::write(&occupied, b"preserve")?;
+        let owner =
+            NonZeroU32::new(nix::unistd::geteuid().as_raw()).ok_or("requires non-root fixture")?;
+        assert!(
+            SystemListeners::bind_at(&runtime, owner, policy(&runtime)?, OwnedListener::bind)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(occupied)?, b"preserve");
+        assert!(!runtime.join(QUERY_SOCKET_NAME).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_startup_removes_only_owned_socket() -> Result<(), Box<dyn std::error::Error>> {
+        let (_base, runtime) = fixture()?;
+        let control = runtime.join(CONTROL_DIRECTORY_NAME);
+        std::fs::create_dir(&control)?;
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700))?;
+        let occupied = control.join(CONTROL_SOCKET_NAME);
+        let owner =
+            NonZeroU32::new(nix::unistd::geteuid().as_raw()).ok_or("requires non-root fixture")?;
+        let result = SystemListeners::bind_at(
+            &runtime,
+            owner,
+            policy(&runtime)?,
+            |chain, name, control| {
+                if control {
+                    std::fs::write(&occupied, b"preserve")?;
+                }
+                OwnedListener::bind(chain, name, control)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!runtime.join(QUERY_SOCKET_NAME).exists());
+        assert_eq!(std::fs::read(occupied)?, b"preserve");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn system_binding_rejects_non_root() -> Result<(), Box<dyn std::error::Error>> {
+        if !nix::unistd::geteuid().is_root() {
+            let owner = NonZeroU32::new(nix::unistd::geteuid().as_raw()).ok_or("nonzero uid")?;
+            assert!(SystemListeners::bind(owner).is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]
