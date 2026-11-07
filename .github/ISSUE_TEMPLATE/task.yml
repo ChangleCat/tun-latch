@@ -1,0 +1,87 @@
+name: Task
+description: A focused, reviewable change with explicit scope and verification.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping. Keep one task per pull request. Chinese or English is both fine.
+
+        Do not run PF writes, root operations, service installation, reboot/sleep tests, or
+        network-changing experiments for a task or PR. Read `CONTRIBUTING.md` and `SAFETY.md`
+        before starting.
+  - type: textarea
+    id: background
+    attributes:
+      label: Background
+      description: What problem does this solve? Link the relevant code, issue, or documentation.
+      placeholder: Explain the current behavior and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Files, modules, and behavior that may change.
+      placeholder: |
+        - crates/...
+        - tests/...
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What must not change in this task?
+      placeholder: Explicitly list out-of-scope work to keep the PR focused.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, testable outcomes.
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Commands a reviewer can run.
+      value: |
+        ```sh
+        cargo fmt --all -- --check
+        cargo clippy --workspace --all-targets --locked -- -D warnings
+        cargo test --workspace --all-targets --locked
+        ```
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Estimated size
+      description: A rough guide, not a commitment.
+      options:
+        - Small (under 200 lines)
+        - Medium (200-600 lines)
+        - Large (over 600 lines, split if possible)
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checklist
+      options:
+        - label: No root, PF writes, routing, install, or network changes
+          required: true
+        - label: No new unsafe code, or a design issue is linked
+          required: true
+        - label: No local paths, PIDs, secrets, packet captures, or operator evidence
+          required: true
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link blocking issues or note that there are none.
+      placeholder: "Example: blocked on #12"

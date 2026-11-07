@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/ChangleCat/tun-latch/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue with exploit details.
+  - name: Contributing guide
+    url: https://github.com/ChangleCat/tun-latch/blob/main/CONTRIBUTING.md
+    about: Setup, checks, pull request rules, and safety boundaries.
+  - name: Read the docs first
+    url: https://github.com/ChangleCat/tun-latch/blob/main/README.md
+    about: Current capabilities and known limitations.

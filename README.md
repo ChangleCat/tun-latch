@@ -182,9 +182,9 @@ cargo run -p tunlatch-platform --example pf_lab --locked -- prepare "$TUNLATCH_L
 固定 anchor 名称、标签、收据或模拟测试均不证明内核资源归属；完整预检、可信程序部署、
 特权进程监督接入、接口复用、状态选择、引用和流量采集仍须补齐，实机操作另行审核。
 
-贡献约定见 [AGENTS.md](AGENTS.md)，完整工程检查见 [CI 配置](.github/workflows/ci.yml)，安全边界见 [SAFETY.md](SAFETY.md)。需求、技术调研和编码规范见 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)、[docs/TECH-STACK-RESEARCH.md](docs/TECH-STACK-RESEARCH.md) 和 [docs/CODING-GUIDELINES.md](docs/CODING-GUIDELINES.md)；本地开发计划、工作状态和证据按 `.gitignore` 保持未跟踪。本 README 记录可随代码交付的架构与能力边界。
+贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，仓库约定见 [AGENTS.md](AGENTS.md)，完整工程检查见 [CI 配置](.github/workflows/ci.yml)，安全边界见 [SAFETY.md](SAFETY.md)，漏洞报告见 [SECURITY.md](SECURITY.md)。需求、技术调研和编码规范见 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)、[docs/TECH-STACK-RESEARCH.md](docs/TECH-STACK-RESEARCH.md) 和 [docs/CODING-GUIDELINES.md](docs/CODING-GUIDELINES.md)；本地开发计划、工作状态和证据按 `.gitignore` 保持未跟踪。本 README 记录可随代码交付的架构与能力边界。
 
-许可证：[GPL-3.0](LICENSE)。
+许可证：[GPL-3.0-only](LICENSE)。
 
 操作者在本机可运行 `./scripts/pf-lab-preflight.sh`，通过固定系统工具采集只读 PF 前态。项目程序仍用普通用户运行，不调整网络或加载规则；步骤和数据边界见 [scripts/README.md](scripts/README.md)。
 

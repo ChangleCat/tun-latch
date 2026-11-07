@@ -1,0 +1,60 @@
+name: Design discussion
+description: Propose a design change before implementation.
+labels: ["needs-design"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A design issue is a discussion, not authorization to run privileged operations.
+        Chinese or English is both fine. PF writes, root actions, service installation, reboot
+        tests, and network changes remain maintainer/operator-only and require explicit approval
+        outside this issue.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is missing or wrong today?
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and safety boundaries
+      description: What must remain true? Include privilege, PF, compatibility, or recovery constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you consider, and why is it worse?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the behavior, types, failure modes, and test plan.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Could this change trust, authorization, PF behavior, recovery, or data exposure?
+    validations:
+      required: true
+  - type: textarea
+    id: open_questions
+    attributes:
+      label: Open questions
+      description: What should the maintainer decide before implementation?
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checklist
+      options:
+        - label: This proposal does not ask contributors to run real PF/root/install/reboot experiments
+          required: true
+        - label: No local paths, PIDs, secrets, packet captures, or operator evidence are included
+          required: true
