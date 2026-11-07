@@ -126,3 +126,16 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 /usr/bin/python3 scripts/pf-lab-rule.py plan
 /usr/bin/python3 -m unittest discover -s scripts -p 'test_pf_lab*.py' -v
 ```
+
+### 核对已关闭会话的保存回执
+
+`pf-lab-rule-evidence.py` 只读取一个已关闭规则槽会话中的固定记录。它检查文件属性与固定候选，输出摘要、回执分类和历史关闭记录。`consistent_with_matching_nonempty_pre_clear` 表示保存的回执与已审查的恢复流程一致。在回执确由该流程生成的前提下，这支持恢复前读取到匹配的非空规则。工具无法认证当时实际执行的源码，恢复前原始规则快照也没有保存。
+
+在同一 Terminal 认证后，用已关闭会话的实际目录替换示例路径。
+
+```sh
+/usr/bin/sudo -v && /usr/bin/python3 scripts/pf-lab-rule-evidence.py \
+  /var/root/tunlatch-pf-rule.XXXXXXXX --ack READ-SAVED-PF-RECEIPTS
+```
+
+这一步只检查保存的文件，无需断网。若读取失败，保留终端提示与原始会话即可。
