@@ -52,7 +52,7 @@ cargo run -p tunlatch -- identity inspect --pid 12345 --fd-details --json
 cargo run -p tunlatch -- identity correlate --pid 12345 --cdhash 00112233445566778899aabbccddeeff00112233 --json
 ```
 
-请替换示例 PID 和 CDHash。命令在两次接口扫描之间核对动态代码、采集 FD、再核对动态代码。仅当唯一的 utun control 按 `unit - 1` 推导出两次都一致的接口时才返回 `candidate`。两次扫描各自独立，采样期间的变化可能漏检。该推导是诊断线索，TUN 归属和实际保护仍为未知。不可读、不一致或超出采样时限均返回非零。管理员只读工具目前仍只提供原始采样。
+请替换示例 PID 和 CDHash。命令在两次接口扫描之间核对动态代码、采集 FD、再核对动态代码。仅当唯一的 utun control 按 `unit - 1` 推导出两次都一致的接口时才返回 `candidate`。两次扫描各自独立，采样期间的变化可能漏检。该推导是诊断线索，TUN 归属和实际保护仍为未知。不可读、不一致或超出采样时限均返回非零。root 代理可另用[单次管理员同窗诊断](scripts/README.md#单次管理员同窗诊断)。
 
 也可将明确选定的进程与预期的 40 位十六进制 CDHash 作动态核验：
 

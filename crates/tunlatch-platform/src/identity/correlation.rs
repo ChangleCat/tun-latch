@@ -6,8 +6,9 @@ use thiserror::Error;
 use tunlatch_core::status::NetworkInterface;
 
 use super::{
-    ImageInspection, ProcessIdentity, RawInspection, inspect_expected_cdhash,
-    inspect_selected_process,
+    ImageInspection, ImageProblem, ProcessIdentity, RawInspection,
+    image::inspect_root_target_cdhash, inspect_expected_cdhash, inspect_selected_process,
+    process::inspect_bound_process,
 };
 use crate::events::{NetworkObserver, ScanError, continuous_now};
 
@@ -44,6 +45,12 @@ pub enum TunnelCandidateError {
     /// This diagnostic entry point requires an ordinary user.
     #[error("the ordinary-user diagnostic refuses effective UID 0")]
     RootObserver,
+    /// The dedicated administrator entry point requires effective UID 0.
+    #[error("the administrator diagnostic requires effective UID 0")]
+    AdminRequired,
+    /// A selected process in the administrator path was not running as root.
+    #[error("the administrator diagnostic requires a target with effective UID 0")]
+    TargetUidMismatch,
     /// The OS could not check the running code.
     #[error("running code requirement unavailable")]
     ImageUnavailable,
@@ -85,6 +92,8 @@ impl TunnelCandidateError {
         match self {
             Self::InvalidInput => "invalid_input",
             Self::RootObserver => "root_observer",
+            Self::AdminRequired => "admin_required",
+            Self::TargetUidMismatch => "target_uid_mismatch",
             Self::ImageUnavailable => "image_unavailable",
             Self::ImageMismatch => "image_mismatch",
             Self::RawIncomplete => "raw_incomplete",
@@ -108,12 +117,44 @@ pub fn inspect_tunnel_candidate(
     pid: u32,
     expected: [u8; 20],
 ) -> Result<TunnelCandidate, TunnelCandidateError> {
-    if pid == 0 || i32::try_from(pid).is_err() || expected == [0; 20] {
-        return Err(TunnelCandidateError::InvalidInput);
-    }
+    validate_target(pid, expected)?;
     if nix::unistd::Uid::effective().is_root() {
         return Err(TunnelCandidateError::RootObserver);
     }
+    collect_candidate(
+        |_| inspect_expected_cdhash(pid, expected),
+        |_| inspect_selected_process(pid),
+    )
+}
+
+/// Read one selected effective-UID-zero process from a dedicated, protected admin executable.
+/// The ordinary CLI must use [`inspect_tunnel_candidate`]. Both paths produce a diagnostic
+/// candidate only. Snapshot equality can miss PID, exec, FD, and interface reuse between reads.
+pub fn inspect_tunnel_candidate_privileged(
+    pid: u32,
+    expected: [u8; 20],
+) -> Result<TunnelCandidate, TunnelCandidateError> {
+    validate_target(pid, expected)?;
+    if !nix::unistd::Uid::effective().is_root() {
+        return Err(TunnelCandidateError::AdminRequired);
+    }
+    collect_candidate(
+        |previous| inspect_root_target_cdhash(pid, expected, previous),
+        inspect_bound_process,
+    )
+}
+
+fn validate_target(pid: u32, expected: [u8; 20]) -> Result<(), TunnelCandidateError> {
+    if pid == 0 || i32::try_from(pid).is_err() || expected == [0; 20] {
+        return Err(TunnelCandidateError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn collect_candidate(
+    image: impl FnMut(Option<&ProcessIdentity>) -> ImageInspection,
+    raw: impl FnOnce(&ProcessIdentity) -> RawInspection,
+) -> Result<TunnelCandidate, TunnelCandidateError> {
     let mut observer = NetworkObserver::new(BUDGET);
     correlate(
         || {
@@ -121,16 +162,16 @@ pub fn inspect_tunnel_candidate(
                 .refresh()
                 .map(|snapshot| snapshot.interfaces().to_vec())
         },
-        || inspect_expected_cdhash(pid, expected),
-        || inspect_selected_process(pid),
+        image,
+        raw,
         continuous_now,
     )
 }
 
 fn correlate(
     mut network: impl FnMut() -> Result<Vec<NetworkInterface>, ScanError>,
-    mut image: impl FnMut() -> ImageInspection,
-    raw: impl FnOnce() -> RawInspection,
+    mut image: impl FnMut(Option<&ProcessIdentity>) -> ImageInspection,
+    raw: impl FnOnce(&ProcessIdentity) -> RawInspection,
     mut now: impl FnMut() -> Result<Duration, nix::Error>,
 ) -> Result<TunnelCandidate, TunnelCandidateError> {
     use TunnelCandidateError as Error;
@@ -152,10 +193,10 @@ fn correlate(
 
     let before = network().map_err(|_| Error::NetworkUnavailable)?;
     check_time()?;
-    let first_code = image();
+    let first_code = image(None);
     check_time()?;
     let first = matched_process(first_code)?;
-    let sample = raw();
+    let sample = raw(&first);
     check_time()?;
     let RawInspection::CompleteRaw(sample) = sample else {
         return Err(Error::RawIncomplete);
@@ -163,7 +204,7 @@ fn correlate(
     if first != sample.process {
         return Err(Error::ProcessChanged);
     }
-    let second_code = image();
+    let second_code = image(Some(&sample.process));
     check_time()?;
     if matched_process(second_code)? != sample.process {
         return Err(Error::ProcessChanged);
@@ -211,6 +252,14 @@ fn matched_process(result: ImageInspection) -> Result<ProcessIdentity, TunnelCan
     match result {
         ImageInspection::Matched { process, .. } => Ok(process),
         ImageInspection::Mismatched { .. } => Err(TunnelCandidateError::ImageMismatch),
+        ImageInspection::Unavailable {
+            problem: ImageProblem::TargetUidMismatch,
+            ..
+        } => Err(TunnelCandidateError::TargetUidMismatch),
+        ImageInspection::Unavailable {
+            problem: ImageProblem::ProcessChanged,
+            ..
+        } => Err(TunnelCandidateError::ProcessChanged),
         ImageInspection::Unavailable { .. } => Err(TunnelCandidateError::ImageUnavailable),
     }
 }
@@ -238,7 +287,7 @@ fn unique_interface<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{ImageProblem, RawControl, RawFd, RawObservation};
+    use crate::identity::{RawControl, RawFd, RawObservation};
     use std::{cell::RefCell, time::Instant};
     use tunlatch_core::status::InterfaceAddress;
 
@@ -295,13 +344,13 @@ mod tests {
         let mut images = [matched(raw.process.clone()), second].into_iter();
         correlate(
             || networks.next().ok_or(ScanError::Interrupted),
-            || {
+            |_| {
                 images.next().unwrap_or(ImageInspection::Unavailable {
                     problem: ImageProblem::ProcessUnavailable,
                     status: None,
                 })
             },
-            || RawInspection::CompleteRaw(raw),
+            |_| RawInspection::CompleteRaw(raw),
             || Ok(Duration::ZERO),
         )
     }
@@ -317,12 +366,16 @@ mod tests {
                 order.borrow_mut().push("network");
                 Ok(network())
             },
-            || {
+            |previous| {
                 order.borrow_mut().push("code");
+                if let Some(previous) = previous {
+                    assert_eq!(previous, &process);
+                }
                 matched(process.clone())
             },
-            || {
+            |expected| {
                 order.borrow_mut().push("fd");
+                assert_eq!(expected, &raw.process);
                 RawInspection::CompleteRaw(raw)
             },
             || Ok(Duration::ZERO),
@@ -408,11 +461,11 @@ mod tests {
             let raw = sample();
             let result = correlate(
                 || Ok(network()),
-                || {
+                |_| {
                     image_calls += 1;
                     matched(raw.process.clone())
                 },
-                || RawInspection::CompleteRaw(raw.clone()),
+                |_| RawInspection::CompleteRaw(raw.clone()),
                 || times.next().ok_or(nix::errno::Errno::EIO),
             );
             assert_eq!(result, Err(error));

@@ -27,6 +27,20 @@
 cargo test -p tunlatch-platform --test tunnel_identity --example identity_readonly --locked
 ```
 
+## 单次管理员同窗诊断
+
+`identity-correlate.py` 读取一个明确选择的 root 进程。它在 FD 采样前后对照预期 CDHash，再核对两次接口扫描。`candidate` 表示观察到一个与 control unit 推导相符的接口，归属和实际保护仍为未知。此工具使用独立的辅助程序与会话目录。它只读取进程和接口信息，无需断网，也不创建接口、修改 PF 或安装服务。
+
+先运行 `plan` 查看范围。执行时替换示例 PID 和 CDHash，使用准备时选定的目标。预期 CDHash 可取自所选磁盘文件的 `codesign -dv --verbose=4` 输出，实际运行映像由辅助程序核对。构建产物必须与控制器内经审查的摘要一致。
+
+```sh
+/usr/bin/python3 scripts/identity-correlate.py plan
+/usr/bin/sudo -v && /usr/bin/python3 scripts/identity-correlate.py collect \
+  --pid 12345 --cdhash 00112233445566778899aabbccddeeff00112233 --ack READ-ONE-PROXY
+```
+
+认证和采样在同一个 Terminal 完成。`collect` 将已核对的辅助程序暂存到 root 私有目录，绑定本次启动、模式、PID、预期 CDHash 和构建摘要，执行前写入一次性标记。控制器会打印普通用户可读的私有 `result.json` 路径。`unavailable` 会带固定原因并退出非零。遇到中断、超时、目标变化或摘要错误时，保留输出和会话路径，先核对结果再决定是否另开采样。
+
 ## 受控 TUN 映射实验
 
 `utun-mapping.py` 默认只显示计划，不提权或创建接口：

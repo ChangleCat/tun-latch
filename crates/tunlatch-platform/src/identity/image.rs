@@ -50,6 +50,8 @@ pub enum ImageProblem {
     InvalidInput,
     /// The ordinary-user observer is not an elevated diagnostic.
     RootObserver,
+    /// The administrator diagnostic only samples targets with effective UID 0.
+    TargetUidMismatch,
     /// A process snapshot could not be read or validated.
     ProcessUnavailable,
     /// The process snapshots were different.
@@ -67,6 +69,16 @@ enum Check {
     Unavailable(i32),
 }
 
+#[derive(Clone, Copy)]
+enum Observer<'a> {
+    Ordinary {
+        elevated: bool,
+    },
+    RootTarget {
+        previous: Option<&'a ProcessIdentity>,
+    },
+}
+
 /// Check one PID against an already selected 20-byte CDHash as an ordinary user.
 ///
 /// The result is a bounded diagnostic only. PID and birth-time checks do not
@@ -79,7 +91,26 @@ pub fn inspect_expected_cdhash(pid: u32, expected: [u8; 20]) -> ImageInspection 
     inspect_with(
         pid,
         expected,
-        nix::unistd::Uid::effective().is_root(),
+        Observer::Ordinary {
+            elevated: nix::unistd::Uid::effective().is_root(),
+        },
+        |native_pid| native::process(native_pid).ok(),
+        check_expected,
+        Instant::now,
+        BUDGET,
+    )
+}
+
+// Only the dedicated correlation entry point calls this after checking its own effective UID.
+pub(super) fn inspect_root_target_cdhash(
+    pid: u32,
+    expected: [u8; 20],
+    previous: Option<&ProcessIdentity>,
+) -> ImageInspection {
+    inspect_with(
+        pid,
+        expected,
+        Observer::RootTarget { previous },
         |native_pid| native::process(native_pid).ok(),
         check_expected,
         Instant::now,
@@ -119,7 +150,7 @@ fn check_expected(pid: i32, expected: &[u8; 20]) -> Check {
 fn inspect_with(
     pid: u32,
     expected: [u8; 20],
-    root: bool,
+    observer: Observer<'_>,
     mut read: impl FnMut(i32) -> Option<ProcessIdentity>,
     mut check: impl FnMut(i32, &[u8; 20]) -> Check,
     mut now: impl FnMut() -> Instant,
@@ -132,7 +163,7 @@ fn inspect_with(
     if pid == 0 || expected == [0; 20] {
         return unavailable(ImageProblem::InvalidInput, None);
     }
-    if root {
+    if matches!(observer, Observer::Ordinary { elevated: true }) {
         return unavailable(ImageProblem::RootObserver, None);
     }
     let start = now();
@@ -148,6 +179,14 @@ fn inspect_with(
     };
     if expired(now()) {
         return unavailable(ImageProblem::TimedOut, None);
+    }
+    if let Observer::RootTarget { previous } = observer {
+        if before.uid != 0 {
+            return unavailable(ImageProblem::TargetUidMismatch, None);
+        }
+        if previous.is_some_and(|previous| previous != &before) {
+            return unavailable(ImageProblem::ProcessChanged, None);
+        }
     }
     let result = check(native_pid, &expected);
     if expired(now()) {
@@ -186,13 +225,53 @@ mod tests {
     }
 
     #[test]
+    fn administrator_scope_rejects_wrong_uid_or_changed_instance_before_security_check() {
+        let mut root = process(42);
+        root.uid = 0;
+        for (observed, problem) in [
+            (process(42), ImageProblem::TargetUidMismatch),
+            (
+                ProcessIdentity {
+                    birth_seconds: 99,
+                    ..root.clone()
+                },
+                ImageProblem::ProcessChanged,
+            ),
+        ] {
+            let mut security_calls = 0;
+            let result = inspect_with(
+                42,
+                [1; 20],
+                Observer::RootTarget {
+                    previous: Some(&root),
+                },
+                |_| Some(observed.clone()),
+                |_, _| {
+                    security_calls += 1;
+                    Check::Matched
+                },
+                Instant::now,
+                BUDGET,
+            );
+            assert_eq!(
+                result,
+                ImageInspection::Unavailable {
+                    problem,
+                    status: None
+                }
+            );
+            assert_eq!(security_calls, 0);
+        }
+    }
+
+    #[test]
     fn matches_and_mismatches_are_explicit_and_rechecked() {
         for (check, matched) in [(Check::Matched, true), (Check::Mismatched, false)] {
             let mut reads = 0;
             let result = inspect_with(
                 42,
                 [1; 20],
-                false,
+                Observer::Ordinary { elevated: false },
                 |_| {
                     reads += 1;
                     Some(process(42))
@@ -221,7 +300,7 @@ mod tests {
         let result = inspect_with(
             42,
             [1; 20],
-            false,
+            Observer::Ordinary { elevated: false },
             |_| {
                 count += 1;
                 let mut p = process(42);
@@ -243,7 +322,7 @@ mod tests {
         let result = inspect_with(
             42,
             [1; 20],
-            false,
+            Observer::Ordinary { elevated: false },
             |_| {
                 count += 1;
                 (count == 1).then(|| process(42))
@@ -262,7 +341,7 @@ mod tests {
         let result = inspect_with(
             42,
             [1; 20],
-            false,
+            Observer::Ordinary { elevated: false },
             |_| Some(process(42)),
             |_, _| Check::Unavailable(-1),
             Instant::now,
@@ -285,7 +364,7 @@ mod tests {
             let result = inspect_with(
                 42,
                 [1; 20],
-                false,
+                Observer::Ordinary { elevated: false },
                 |_| Some(process(42)),
                 |_, _| Check::Matched,
                 || {
@@ -313,21 +392,45 @@ mod tests {
         let read = |_| Some(process(42));
         let check = |_, _: &[u8; 20]| Check::Matched;
         assert!(matches!(
-            inspect_with(0, [1; 20], false, read, check, Instant::now, BUDGET),
+            inspect_with(
+                0,
+                [1; 20],
+                Observer::Ordinary { elevated: false },
+                read,
+                check,
+                Instant::now,
+                BUDGET
+            ),
             ImageInspection::Unavailable {
                 problem: ImageProblem::InvalidInput,
                 ..
             }
         ));
         assert!(matches!(
-            inspect_with(42, [0; 20], false, read, check, Instant::now, BUDGET),
+            inspect_with(
+                42,
+                [0; 20],
+                Observer::Ordinary { elevated: false },
+                read,
+                check,
+                Instant::now,
+                BUDGET
+            ),
             ImageInspection::Unavailable {
                 problem: ImageProblem::InvalidInput,
                 ..
             }
         ));
         assert!(matches!(
-            inspect_with(42, [1; 20], true, read, check, Instant::now, BUDGET),
+            inspect_with(
+                42,
+                [1; 20],
+                Observer::Ordinary { elevated: true },
+                read,
+                check,
+                Instant::now,
+                BUDGET
+            ),
             ImageInspection::Unavailable {
                 problem: ImageProblem::RootObserver,
                 ..
@@ -338,7 +441,7 @@ mod tests {
         let result = inspect_with(
             42,
             [1; 20],
-            false,
+            Observer::Ordinary { elevated: false },
             read,
             check,
             || {

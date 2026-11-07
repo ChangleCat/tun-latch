@@ -225,7 +225,7 @@ pub fn inspect_selected_process(pid: u32) -> RawInspection {
             None,
         );
     }
-    collect_selected_process(pid)
+    collect_selected_process(pid, None)
 }
 
 /// Perform the same bounded read for a selected PID only with effective UID 0.
@@ -242,10 +242,15 @@ pub fn inspect_selected_process_privileged(pid: u32) -> RawInspection {
             None,
         );
     }
-    collect_selected_process(pid)
+    collect_selected_process(pid, None)
 }
 
-fn collect_selected_process(pid: u32) -> RawInspection {
+// Called after the dedicated correlation entry point checks its own effective UID.
+pub(super) fn inspect_bound_process(expected: &ProcessIdentity) -> RawInspection {
+    collect_selected_process(expected.pid, Some(expected))
+}
+
+fn collect_selected_process(pid: u32, expected: Option<&ProcessIdentity>) -> RawInspection {
     let started_at = Instant::now();
     let Ok(native_pid) = i32::try_from(pid) else {
         return raw_failure(InspectionStage::Input, InspectionProblem::InvalidPid, None);
@@ -254,7 +259,7 @@ fn collect_selected_process(pid: u32) -> RawInspection {
         return raw_failure(InspectionStage::Input, InspectionProblem::InvalidPid, None);
     }
     let before = match native::process(native_pid) {
-        Ok(p) if valid(pid, &p) => p,
+        Ok(p) if valid(pid, &p) && expected.is_none_or(|expected| expected == &p) => p,
         Ok(_) => {
             return raw_failure(
                 InspectionStage::Before,

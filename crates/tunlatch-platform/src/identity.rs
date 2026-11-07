@@ -13,7 +13,10 @@ mod image;
 #[allow(unsafe_code)]
 mod native;
 mod process;
-pub use correlation::{TunnelCandidate, TunnelCandidateError, inspect_tunnel_candidate};
+pub use correlation::{
+    TunnelCandidate, TunnelCandidateError, inspect_tunnel_candidate,
+    inspect_tunnel_candidate_privileged,
+};
 pub use image::{ImageInspection, ImageProblem, inspect_expected_cdhash};
 pub use process::{
     InspectionFailure, InspectionProblem, InspectionStage, ProcessIdentity, ProcessInspection,
