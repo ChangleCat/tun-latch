@@ -139,3 +139,16 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 ```
 
 这一步只检查保存的文件，无需断网。若读取失败，保留终端提示与原始会话即可。
+
+## TCP 与 UDP 对端预检
+
+`pf_lab_peer` 是普通用户实验辅助程序。两端使用同一组数字地址、端口、协议和一次性 nonce。接收端报告 `ready` 后可启动发送端。发送端的 `completed` 表示收到了匹配的回显。超时或不一致均失败，保护状态始终为 `not_evaluated`。实机外部地址须来自已确认的受控实验环境。
+
+可先在本机用回环脚本检查 IPv4 与 IPv6 各自的 TCP 和 UDP 收发。脚本默认只打印计划，带确认参数时才绑定回环端口并交换 nonce。
+
+```sh
+cargo build -p tunlatch-platform --example pf_lab_peer --release --locked
+/usr/bin/python3 scripts/pf-lab-peer-loopback.py --ack RUN-LOOPBACK-PROBE
+```
+
+四项均成功时输出 `loopback_checked`。回环结果只验证对端程序的收发和记录，物理出口、跨 UID、抓包和 PF 匹配需要独立验证。

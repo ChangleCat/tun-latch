@@ -30,6 +30,9 @@ impl Flow {
             || self.destination.ip().is_unspecified()
             || self.source.ip().is_multicast()
             || self.destination.ip().is_multicast()
+            || [self.source, self.destination].iter().any(|address| {
+                matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
+            })
             || self.source == self.destination
         {
             return Err(Error("invalid controlled flow"));
@@ -40,19 +43,30 @@ impl Flow {
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
     pub(crate) interface: String,
-    pub(crate) control: Flow,
+    pub(crate) before_control: Flow,
     pub(crate) negative: Flow,
+    pub(crate) after_control: Flow,
     pub(crate) application: Application,
 }
 impl Plan {
     pub(crate) fn validate(&self) -> Result<()> {
-        self.control.validate()?;
         self.negative.validate()?;
-        if self.control == self.negative
+        for control in [self.before_control, self.after_control] {
+            control.validate()?;
+            if control == self.negative
+                || control.protocol != self.negative.protocol
+                || control.source.ip() != self.negative.source.ip()
+                || control.destination != self.negative.destination
+            {
+                return Err(Error(
+                    "positive control does not qualify the negative probe",
+                ));
+            }
+        }
+        if self.before_control == self.after_control
             || self.interface.is_empty()
             || self.interface.len() > 15
             || !self.interface.bytes().all(|b| b.is_ascii_alphanumeric())
-            || self.control.source.is_ipv6() != self.negative.source.is_ipv6()
         {
             return Err(Error("ambiguous capture scope"));
         }
@@ -85,9 +99,10 @@ impl Plan {
             "-w".into(),
             "-".into(),
             format!(
-                "{} or {}",
-                expression(self.control),
-                expression(self.negative)
+                "{} or {} or {}",
+                expression(self.before_control),
+                expression(self.negative),
+                expression(self.after_control)
             ),
         ])
     }
@@ -287,141 +302,24 @@ pub(crate) enum Role {
     Sender,
     Receiver,
 }
-fn remaining(deadline: std::time::Instant) -> std::io::Result<std::time::Duration> {
-    deadline
-        .checked_duration_since(std::time::Instant::now())
-        .filter(|n| !n.is_zero())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe deadline"))
-}
-fn read_stream(
-    stream: &mut std::net::TcpStream,
-    buffer: &mut [u8],
-    deadline: std::time::Instant,
-) -> std::io::Result<()> {
-    use std::io::Read;
-    let mut offset = 0;
-    while offset < buffer.len() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
-        let count = stream.read(&mut buffer[offset..])?;
-        if count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "short probe",
-            ));
-        }
-        offset += count;
-    }
-    Ok(())
-}
-fn write_stream(
-    stream: &mut std::net::TcpStream,
-    buffer: &[u8],
-    deadline: std::time::Instant,
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut offset = 0;
-    while offset < buffer.len() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        let count = stream.write(&buffer[offset..])?;
-        if count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short probe write",
-            ));
-        }
-        offset += count;
-    }
-    Ok(())
-}
+#[path = "peer_transport.rs"]
+mod peer_transport;
 pub(crate) fn native_exchange(
     _: &NetworkPermit,
     role: Role,
     flow: Flow,
     payload: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    use std::io;
-    use std::time::{Duration, Instant};
-    flow.validate().map_err(io::Error::other)?;
-    if payload.is_empty() || payload.len() > 512 {
-        return Err(io::Error::other("bounded probe payload required"));
-    }
-    let budget = Duration::from_millis(500);
-    let began = Instant::now();
-    let deadline = began + budget;
-    let domain = if flow.source.is_ipv6() {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let (kind, proto) = match flow.protocol {
-        Protocol::Tcp => (socket2::Type::STREAM, socket2::Protocol::TCP),
-        Protocol::Udp => (socket2::Type::DGRAM, socket2::Protocol::UDP),
-    };
-    let socket = socket2::Socket::new(domain, kind, Some(proto))?;
-    if flow.source.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
-    socket.bind(
-        &match role {
-            Role::Sender => flow.source,
-            Role::Receiver => flow.destination,
-        }
-        .into(),
-    )?;
-    let mut buffer = [0; 513];
-    match (flow.protocol, role) {
-        (Protocol::Tcp, Role::Sender) => {
-            socket.connect_timeout(&flow.destination.into(), remaining(deadline)?)?;
-            let mut stream: std::net::TcpStream = socket.into();
-            write_stream(&mut stream, payload, deadline)?;
-            read_stream(&mut stream, &mut buffer[..payload.len()], deadline)?;
-            Ok(buffer[..payload.len()].to_vec())
-        }
-        (Protocol::Tcp, Role::Receiver) => {
-            socket.listen(1)?;
-            socket.set_nonblocking(true)?;
-            let (accepted, peer) = loop {
-                match socket.accept() {
-                    Ok(pair) => break pair,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && began.elapsed() < budget => {
-                        std::thread::park_timeout(Duration::from_millis(1))
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
-            if peer.as_socket() != Some(flow.source) {
-                return Err(io::Error::other("foreign probe peer"));
-            }
-            let mut stream: std::net::TcpStream = accepted.into();
-            read_stream(&mut stream, &mut buffer[..payload.len()], deadline)?;
-            if &buffer[..payload.len()] != payload {
-                return Err(io::Error::other("probe nonce mismatch"));
-            }
-            write_stream(&mut stream, payload, deadline)?;
-            Ok(payload.to_vec())
-        }
-        (Protocol::Udp, role) => {
-            let socket: std::net::UdpSocket = socket.into();
-            socket.set_write_timeout(Some(remaining(deadline)?))?;
-            if matches!(role, Role::Sender) {
-                socket.send_to(payload, flow.destination)?;
-            }
-            socket.set_read_timeout(Some(remaining(deadline)?))?;
-            let (size, peer) = socket.recv_from(&mut buffer)?;
-            let expected = match role {
-                Role::Sender => flow.destination,
-                Role::Receiver => flow.source,
-            };
-            if peer != expected || &buffer[..size] != payload {
-                return Err(io::Error::other("foreign or mismatched UDP probe"));
-            }
-            if matches!(role, Role::Receiver) {
-                socket.set_write_timeout(Some(remaining(deadline)?))?;
-                socket.send_to(payload, peer)?;
-            }
-            Ok(buffer[..size].to_vec())
-        }
-    }
+    flow.validate().map_err(std::io::Error::other)?;
+    peer_transport::exchange(
+        matches!(role, Role::Sender),
+        matches!(flow.protocol, Protocol::Tcp),
+        flow.source,
+        flow.destination,
+        payload,
+        std::time::Duration::from_millis(500),
+        || Ok(()),
+    )
 }
 pub(crate) fn dns_query(nonce: u16, tcp: bool) -> Vec<u8> {
     let mut query = vec![
@@ -548,10 +446,11 @@ impl Experiment {
         let pre = nonce(self.guard.identity(), 1);
         let negative = nonce(self.guard.identity(), 2);
         let post = nonce(self.guard.identity(), 3);
+        let mut negative_acknowledged = false;
         for (flow, nonce, positive) in [
-            (plan.control, pre, true),
+            (plan.before_control, pre, true),
             (plan.negative, negative, false),
-            (plan.control, post, true),
+            (plan.after_control, post, true),
         ] {
             let sent = b.exchange(flow, nonce)?;
             if sent.flow != flow
@@ -561,6 +460,7 @@ impl Experiment {
             {
                 return Err(Error("probe not sent or positive receiver unavailable"));
             }
+            negative_acknowledged |= !positive && sent.receiver_ack;
         }
         b.stop_probes()?;
         let capture = b.finish_capture(handle)?;
@@ -582,11 +482,11 @@ impl Experiment {
         }
         let before = packets
             .iter()
-            .position(|p| p.flow == plan.control && p.payload.windows(16).any(|w| w == pre))
+            .position(|p| p.flow == plan.before_control && p.payload.windows(16).any(|w| w == pre))
             .ok_or(Error("missing initial positive capture control"))?;
         let after = packets
             .iter()
-            .rposition(|p| p.flow == plan.control && p.payload.windows(16).any(|w| w == post))
+            .rposition(|p| p.flow == plan.after_control && p.payload.windows(16).any(|w| w == post))
             .ok_or(Error("missing final positive capture control"))?;
         if after <= before {
             return Err(Error("capture positive controls reversed"));
@@ -594,6 +494,10 @@ impl Experiment {
         let leaked = packets.iter().filter(|p| p.flow == plan.negative).count();
         if leaked > 0 {
             Ok(Verdict::Leak { packets: leaked })
+        } else if negative_acknowledged {
+            Err(Error(
+                "negative receiver acknowledged without matching capture",
+            ))
         } else {
             Ok(Verdict::NoObservedLeak {
                 session: self.guard.identity().session,

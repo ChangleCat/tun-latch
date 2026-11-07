@@ -36,8 +36,9 @@ fn flow(ipv6: bool, protocol: Protocol, port: u16) -> Flow {
 fn plan(ipv6: bool, protocol: Protocol) -> Plan {
     Plan {
         interface: "lab0".into(),
-        control: flow(ipv6, protocol, 45001),
+        before_control: flow(ipv6, protocol, 45001),
         negative: flow(ipv6, protocol, 45002),
+        after_control: flow(ipv6, protocol, 45003),
         application: Application::Probe,
     }
 }
@@ -177,7 +178,8 @@ impl Boundary for Fake {
     }
     fn exchange(&mut self, flow: Flow, nonce: [u8; 16]) -> Result<Sent> {
         self.calls += 1;
-        if (nonce != traffic::nonce(id(), 2) || self.leak)
+        let negative = nonce == traffic::nonce(id(), 2);
+        if (!negative || self.leak)
             && !(self.fault == Some("missing-post") && nonce == traffic::nonce(id(), 3))
         {
             let payload = if self.fault == Some("old-session") {
@@ -202,7 +204,8 @@ impl Boundary for Fake {
             flow,
             nonce,
             sent: self.fault != Some("not-sent"),
-            receiver_ack: self.fault != Some("disconnected"),
+            receiver_ack: self.fault != Some("disconnected")
+                && (!negative || self.leak || self.fault == Some("unseen-negative-ack")),
         })
     }
     fn stop_probes(&mut self) -> Result<()> {
@@ -277,6 +280,43 @@ fn any_negative_tuple_packet_is_a_leak_even_without_payload_nonce() -> Result<()
     Ok(())
 }
 #[test]
+fn positive_controls_must_use_the_same_protocol_and_destination_with_distinct_flows() {
+    let p = plan(false, Protocol::Tcp);
+    for negative in [
+        Flow {
+            protocol: Protocol::Udp,
+            ..p.negative
+        },
+        Flow {
+            destination: std::net::SocketAddr::new(p.negative.destination.ip(), 45010),
+            ..p.negative
+        },
+        Flow {
+            source: std::net::SocketAddr::from(([192, 0, 2, 3], 45002)),
+            ..p.negative
+        },
+    ] {
+        let changed = Plan {
+            negative,
+            ..p.clone()
+        };
+        assert!(changed.capture_argv().is_err());
+    }
+    for after_control in [p.before_control, p.negative] {
+        let reused = Plan {
+            after_control,
+            ..p.clone()
+        };
+        assert!(reused.capture_argv().is_err());
+    }
+    let mut scoped = plan(true, Protocol::Tcp);
+    if let std::net::SocketAddr::V6(mut source) = scoped.negative.source {
+        source.set_scope_id(1);
+        scoped.negative.source = source.into();
+    }
+    assert!(scoped.capture_argv().is_err());
+}
+#[test]
 fn wrong_interface_drops_partial_capture_disconnection_or_unsent_probe_never_pass() -> Result<()> {
     for fault in [
         "wrong-interface",
@@ -285,6 +325,7 @@ fn wrong_interface_drops_partial_capture_disconnection_or_unsent_probe_never_pas
         "disconnected",
         "not-sent",
         "missing-post",
+        "unseen-negative-ack",
         "old-session",
         "stop",
     ] {
@@ -381,7 +422,11 @@ fn fixed_capture_scope_and_native_sender_receiver_compile_without_network_execut
     let p = plan(false, Protocol::Udp);
     let args = p.capture_argv()?;
     assert_eq!(&args[..4], ["-i", "lab0", "-n", "-U"]);
-    assert!(args.last().is_some_and(|s| s.contains("src port 45002")));
+    assert!(args.last().is_some_and(|s| {
+        [45001, 45002, 45003]
+            .iter()
+            .all(|port| s.contains(&format!("src port {port}")))
+    }));
     let _sender = traffic::Role::Sender;
     let _receiver = traffic::Role::Receiver;
     let _entry = traffic::native_exchange;
