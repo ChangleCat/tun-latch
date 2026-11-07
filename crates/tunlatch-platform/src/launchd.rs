@@ -12,7 +12,14 @@ const PROGRAM_DIRECTORY: &str = "/Library/PrivilegedHelperTools/io.github.changl
 const DAEMON: &str = "/Library/PrivilegedHelperTools/io.github.changlecat.tunlatch/tunlatchd";
 const ADMIN: &str = "/Library/PrivilegedHelperTools/io.github.changlecat.tunlatch/tunlatch-admin";
 const PLIST: &str = "/Library/LaunchDaemons/io.github.changlecat.tunlatch.plist";
-const RUNTIME: &str = "/private/var/db/tunlatch-runtime";
+/// Fixed parent of the separate system query and administrator sockets.
+pub const SYSTEM_RUNTIME_DIRECTORY: &str = "/private/var/db/tunlatch-runtime";
+/// Query socket leaf within the system runtime directory.
+pub const QUERY_SOCKET_NAME: &str = "query.sock";
+/// Private administrator directory leaf within the system runtime directory.
+pub const CONTROL_DIRECTORY_NAME: &str = "control";
+/// Control socket leaf within the administrator directory.
+pub const CONTROL_SOCKET_NAME: &str = "control.sock";
 const LOG_DIRECTORY: &str = "/private/var/log/tunlatch";
 
 /// Intended type of a fixed resource; no resource is created by this module.
@@ -92,10 +99,22 @@ pub fn deployment_preview() -> DeploymentPreview {
             0o600,
         ),
         resource(format!("{SYSTEM_STORE_DIRECTORY}/{LOCK_NAME}"), File, 0o600),
-        resource(RUNTIME, Directory, 0o755),
-        resource(format!("{RUNTIME}/query.sock"), Socket, 0o666),
-        resource(format!("{RUNTIME}/control"), Directory, 0o700),
-        resource(format!("{RUNTIME}/control/control.sock"), Socket, 0o600),
+        resource(SYSTEM_RUNTIME_DIRECTORY, Directory, 0o755),
+        resource(
+            format!("{SYSTEM_RUNTIME_DIRECTORY}/{QUERY_SOCKET_NAME}"),
+            Socket,
+            0o666,
+        ),
+        resource(
+            format!("{SYSTEM_RUNTIME_DIRECTORY}/{CONTROL_DIRECTORY_NAME}"),
+            Directory,
+            0o700,
+        ),
+        resource(
+            format!("{SYSTEM_RUNTIME_DIRECTORY}/{CONTROL_DIRECTORY_NAME}/{CONTROL_SOCKET_NAME}"),
+            Socket,
+            0o600,
+        ),
         resource(LOG_DIRECTORY, Directory, 0o700),
         resource(format!("{LOG_DIRECTORY}/daemon.stdout.log"), File, 0o600),
         resource(format!("{LOG_DIRECTORY}/daemon.stderr.log"), File, 0o600),

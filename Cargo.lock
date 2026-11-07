@@ -1682,6 +1682,7 @@ dependencies = [
 name = "tunlatch-ipc"
 version = "0.1.0"
 dependencies = [
+ "exacl",
  "nix",
  "serde",
  "serde_json",
@@ -1690,6 +1691,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tunlatch-core",
+ "tunlatch-platform",
 ]
 
 [[package]]

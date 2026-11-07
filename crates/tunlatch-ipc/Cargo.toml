@@ -1,6 +1,6 @@
 [package]
 name = "tunlatch-ipc"
-description = "Bounded, versioned, same-user local status protocol"
+description = "Bounded, versioned local status protocol and Unix peer verification"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,9 @@ publish.workspace = true
 
 [dependencies]
 tunlatch-core.workspace = true
-nix.workspace = true
+tunlatch-platform.workspace = true
+exacl.workspace = true
+nix = { workspace = true, features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

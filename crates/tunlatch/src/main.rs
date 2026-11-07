@@ -12,7 +12,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use tunlatch_core::config::DesiredProtection;
 use tunlatch_core::control::{SimulationRequest, SimulationStatus};
-use tunlatch_ipc::{query_network_status, query_simulation, query_status, submit_simulation};
+use tunlatch_ipc::{
+    query_network_status, query_simulation, query_status, query_system_network_status,
+    query_system_status, submit_simulation,
+};
 
 #[derive(Parser)]
 #[command(
@@ -28,8 +31,11 @@ struct Args {
 enum Command {
     /// Query a fresh service snapshot. Failure returns a nonzero exit code.
     Status {
+        #[arg(long, required_unless_present = "system", conflicts_with = "system")]
+        runtime_dir: Option<PathBuf>,
+        /// Query the fixed root-owned system endpoint if a system service is available.
         #[arg(long)]
-        runtime_dir: PathBuf,
+        system: bool,
         #[arg(long)]
         json: bool,
         /// Request extended scan diagnostics from a supporting service.
@@ -206,22 +212,22 @@ async fn main() -> anyhow::Result<()> {
     match Args::parse().command {
         Command::Status {
             runtime_dir,
+            system: _,
             json,
             network_details,
         } => {
-            let (status, observation) = if network_details {
-                let (status, observation) = query_network_status(&runtime_dir)
+            let status = match (runtime_dir.as_deref(), network_details) {
+                (Some(dir), false) => query_status(dir).await.map(|status| (status, None)),
+                (None, false) => query_system_status().await.map(|status| (status, None)),
+                (Some(dir), true) => query_network_status(dir)
                     .await
-                    .context("cannot obtain network details; protection is unknown")?;
-                (status, Some(observation))
-            } else {
-                (
-                    query_status(&runtime_dir)
-                        .await
-                        .context("cannot obtain current status; protection is unknown")?,
-                    None,
-                )
+                    .map(|(status, observation)| (status, Some(observation))),
+                (None, true) => query_system_network_status()
+                    .await
+                    .map(|(status, observation)| (status, Some(observation))),
             };
+            let (status, observation) =
+                status.context("cannot obtain current status; protection is unknown")?;
             if json {
                 let output = match observation {
                     Some(observation) => {
