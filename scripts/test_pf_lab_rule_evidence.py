@@ -1,5 +1,6 @@
 """Ordinary-user receipt checks. No fake command reaches sudo or PF."""
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -93,6 +94,53 @@ class RuleEvidenceTests(unittest.TestCase):
             self.summarize(records)
         with self.assertRaises(tool.Refused):
             tool.closed_record(b'{"payload_absent":true}\n')
+
+    def test_optional_observations_report_only_state_and_file_digest(self):
+        records = SavedRecords()
+        rules = tool.rule.profile(SESSION)[1]
+        raw = tool.rule.observation_bytes(
+            SESSION, "before-clear.json", tool.rule.Slot(tool.rule.SlotState.RULES, rules),
+            b"Status: Disabled test\n", tool.rule.NO_REFERENCES,
+        )
+        path = records.directory + "/before-clear.json"
+        records.files[path] = raw
+        result = self.summarize(records)
+        self.assertEqual(result["pre_clear_raw_snapshot"], "recorded")
+        self.assertEqual(result["recovery_branch_inference"], "unknown")
+        self.assertEqual(result["phase_observations"]["before-clear.json"], {
+            "state": "rules", "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+        self.assertEqual(result["phase_observations"]["after-clear.json"], {"state": "not_recorded"})
+        self.assertNotIn(rules.decode(), json.dumps(result))
+
+    def test_after_clear_absent_and_empty_must_match_closed_record(self):
+        records = SavedRecords()
+        for state in (tool.rule.SlotState.EMPTY, tool.rule.SlotState.ABSENT):
+            with self.subTest(state=state):
+                rules = b"" if state == tool.rule.SlotState.EMPTY else None
+                records.files[records.directory + "/after-clear.json"] = tool.rule.observation_bytes(
+                    SESSION, "after-clear.json", tool.rule.Slot(state, rules),
+                    b"Status: Disabled test\n", tool.rule.NO_REFERENCES,
+                )
+                if state == tool.rule.SlotState.EMPTY:
+                    phase = self.summarize(records)["phase_observations"]["after-clear.json"]
+                    self.assertEqual(phase["state"], "empty")
+                else:
+                    with self.assertRaises(tool.Refused):
+                        self.summarize(records)
+                    closed_absent = dict(CLOSED, slot_state="absent", filter_empty=None,
+                                         anchor_listed_in_inventory=False)
+                    records.files[records.directory + "/closed.json"] = (
+                        json.dumps(closed_absent, sort_keys=True) + "\n"
+                    ).encode()
+                    phase = self.summarize(records)["phase_observations"]["after-clear.json"]
+                    self.assertEqual(phase["state"], "absent")
+
+    def test_malformed_optional_observation_is_not_silently_ignored(self):
+        records = SavedRecords()
+        records.files[records.directory + "/before-submit.json"] = b""
+        with self.assertRaises(tool.rule.Refused):
+            self.summarize(records)
 
 
 if __name__ == "__main__":

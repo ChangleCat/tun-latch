@@ -133,6 +133,12 @@ class RulesTests(unittest.TestCase):
         self.assertIn("closed.json", self.fake.files)
         self.assertTrue(result["anchor_listed_in_inventory"])
         self.assertTrue(self.fake.pf_disabled)
+        expected = (rule.Slot(rule.SlotState.ABSENT, None),
+                    rule.Slot(rule.SlotState.RULES, self.fake.rules),
+                    rule.Slot(rule.SlotState.RULES, self.fake.rules),
+                    rule.Slot(rule.SlotState.EMPTY, b""))
+        for name, slot in zip(rule.OBSERVATION_FILES, expected):
+            self.assertEqual(rule.parse_observation(SESSION, name, self.fake.files[name]), slot)
 
     def test_macos_missing_namespace_does_not_prevent_first_submission(self):
         self.fake = MacFake()
@@ -167,8 +173,47 @@ class RulesTests(unittest.TestCase):
         with self.assertRaisesRegex(rule.Refused, "不是内核阶段"):
             self.stage(stop_after_submit=True)
         self.assertEqual(self.fake.image, self.fake.rules)
+        self.assertIn("before-submit.json", self.fake.files)
+        self.assertNotIn("after-submit.json", self.fake.files)
         self.lab().recover(lambda: True)
         self.assertEqual(self.fake.image, b"")
+        self.assertEqual(rule.parse_observation(SESSION, "before-clear.json",
+                                               self.fake.files["before-clear.json"]).rules,
+                         self.fake.rules)
+
+    def test_failed_observation_keeps_intent_without_replaying_native_write(self):
+        for failing_name, initial_load, clear_called, marker in (
+            ("before-submit.json", False, False, "load-intent"),
+            ("before-clear.json", True, False, "recovery-once"),
+            ("after-clear.json", True, True, "recovery-once"),
+        ):
+            with self.subTest(name=failing_name):
+                self.reset()
+                if initial_load:
+                    self.stage()
+                save = self.fake.write
+
+                def fail_selected(name, data):
+                    if name == failing_name:
+                        raise rule.Refused("incomplete write")
+                    save(name, data)
+
+                def attempt():
+                    if initial_load:
+                        self.lab().recover(lambda: True)
+                    else:
+                        self.stage()
+
+                with patch.object(self.fake, "write", side_effect=fail_selected):
+                    with self.assertRaisesRegex(rule.Refused, "incomplete write"):
+                        attempt()
+                self.assertIn(marker, self.fake.marks)
+                self.assertNotIn("closed.json", self.fake.files)
+                self.assertEqual([empty for _, empty in self.fake.calls],
+                                 [False] * initial_load + [True] * clear_called)
+                with self.assertRaises(rule.Refused):
+                    attempt()
+                self.assertEqual(len(self.fake.calls), initial_load + clear_called)
 
     def test_existing_slot_is_not_adopted_or_overwritten(self):
         self.fake.root["inventory"] += self.fake.anchor.encode() + b"\n"
@@ -234,6 +279,22 @@ class RulesTests(unittest.TestCase):
         with self.assertRaises(rule.Refused):
             self.lab().recover(changed)
         self.assertEqual(len(self.fake.calls), 1)
+
+    def test_mutation_while_saving_observation_stops_before_clear(self):
+        self.stage()
+        save = self.fake.write
+
+        def change_after_save(name, data):
+            save(name, data)
+            if name == "before-clear.json":
+                self.fake.image = b"different rules\n"
+
+        with patch.object(self.fake, "write", side_effect=change_after_save):
+            with self.assertRaisesRegex(rule.Refused, "记录之后规则槽已变化"):
+                self.lab().recover(lambda: True)
+        self.assertEqual(self.fake.calls, [(self.fake.anchor, False)])
+        self.assertIn("recovery-once", self.fake.marks)
+        self.assertNotIn("closed.json", self.fake.files)
 
     def test_unknown_clear_preserves_attempt_and_never_retries(self):
         self.stage()
@@ -316,7 +377,7 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(self.fake.calls[-1], (self.fake.anchor, True))
 
     def test_resume_refuses_any_prior_submission_or_recovery_evidence(self):
-        for name in ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json"):
+        for name in ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json") + rule.OBSERVATION_FILES:
             self.prime_unsubmitted()
             if name.endswith((".txt", ".json")):
                 self.fake.files[name] = b"unknown"

@@ -58,7 +58,7 @@ def exists(runner, path):
 
 
 def read_record(runner, session, name):
-    if name not in RECORDS:
+    if name not in RECORDS and name not in rule.OBSERVATION_FILES:
         raise Refused("不允许读取该记录")
     path = session + "/" + name
     before, _, size = inspect(runner, path, directory=False)
@@ -116,16 +116,42 @@ def summarize(runner, requested):
     has_clear = exists(runner, clear_path)
     cleared = receipt(read_record(runner, session, "clear.txt") if has_clear else None)
     closed = closed_record(read_record(runner, session, "closed.json"))
-    if exists(runner, clear_path) != has_clear or inspect(runner, session, directory=True)[0] != before:
+    observations = {}
+    observed_presence = {}
+    for name in rule.OBSERVATION_FILES:
+        path = session + "/" + name
+        present = exists(runner, path)
+        observed_presence[name] = present
+        if present:
+            data = read_record(runner, session, name)
+            slot = rule.parse_observation(requested, name, data)
+            observations[name] = {"state": slot.state.value, "size": len(data),
+                                  "sha256": hashlib.sha256(data).hexdigest()}
+        else:
+            observations[name] = {"state": "not_recorded"}
+    after_clear = observations["after-clear.json"]["state"]
+    if after_clear != "not_recorded" and after_clear != closed["slot_state"]:
+        raise Refused("清理后快照与关闭记录不一致")
+    if (exists(runner, clear_path) != has_clear
+            or any(exists(runner, session + "/" + name) != present
+                   for name, present in observed_presence.items())
+            or inspect(runner, session, directory=True)[0] != before):
         raise Refused("会话目录读取期间变化")
     stage.protected_parents(runner)
     branch = ("consistent_with_matching_nonempty_pre_clear"
               if staged["state"] == cleared["state"] == "load_notice_only" else "unknown")
+    # A saved snapshot establishes its state, not that its rules matched the
+    # canonical candidate used by the original recover invocation.
+    if observed_presence["before-clear.json"]:
+        branch = "unknown"
     return {
         "purpose": "historical_rule_receipts", "session": requested, "anchor": anchor,
         "current_boot_matches_receipt": boot.decode().strip() == stage.boot(runner),
         "stage_receipt": staged, "clear_receipt": cleared, "recorded_close": closed,
-        "recovery_branch_inference": branch, "pre_clear_raw_snapshot": "not_recorded",
+        "recovery_branch_inference": branch,
+        "pre_clear_raw_snapshot": ("recorded" if observed_presence["before-clear.json"]
+                                   else "not_recorded"),
+        "phase_observations": observations,
         "executed_source_verified": False,
         "inference_requires": "receipts created by the audited recover flow without substitution",
         "recorded_close_is_historical": True,

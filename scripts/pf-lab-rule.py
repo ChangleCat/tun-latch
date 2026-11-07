@@ -6,6 +6,7 @@ operator-present exclusive window. This is not a privileged service, automatic
 crash recovery, kernel object authentication, or a leak protection mechanism.
 """
 import argparse
+import base64
 from enum import Enum
 import importlib.util
 import json
@@ -28,9 +29,11 @@ LOAD_NOTICE = (b"pfctl: Use of -f option, could result in flushing of rules\n"
 ROOT_QUERIES = (("root-rules", ("-s", "rules")), ("root-nat", ("-s", "nat")),
                 ("inventory", ("-v", "-s", "Anchors")))
 BASE_FILES = tuple("before-" + key + ".txt" for key, _ in ROOT_QUERIES)
+OBSERVATION_FILES = ("before-submit.json", "after-submit.json", "before-clear.json", "after-clear.json")
 FILES = ("boot.txt", "candidate.pf", "empty.pf", "stage.txt", "clear.txt",
-         "closed.json") + BASE_FILES
+         "closed.json") + BASE_FILES + OBSERVATION_FILES
 MARKERS = ("stage-once", "baseline-ready", "load-intent", "recovery-once")
+NO_REFERENCES = b"No pf starter references held\n"
 
 
 class SlotState(Enum):
@@ -57,6 +60,47 @@ def profile(session):
         for proto in ("tcp", "udp")
     ).encode("ascii")
     return anchor, rules
+
+
+def observation_bytes(session, name, slot, info, references):
+    if (name not in OBSERVATION_FILES or not info.startswith(b"Status: Disabled ")
+            or references != NO_REFERENCES):
+        raise Refused("记录阶段、PF状态或引用数无效")
+    anchor, _ = profile(session)
+    expected_state = (SlotState.ABSENT if slot.rules is None
+                      else SlotState.RULES if slot.rules else SlotState.EMPTY)
+    if slot.state != expected_state or (name == "before-submit.json" and slot.state != SlotState.ABSENT):
+        raise Refused("记录中的规则槽状态不一致")
+    for output in (info, slot.rules):
+        if output and (not output.endswith(b"\n") or any(c < 32 and c not in (9, 10) for c in output)):
+            raise Refused("规则槽观察输出含不完整行或控制字符")
+
+    def encode(value):
+        return base64.b64encode(value).decode("ascii") if value is not None else None
+
+    data = (json.dumps({"anchor": anchor, "stage": name.removesuffix(".json"),
+                        "slot_state": slot.state.value, "rules": encode(slot.rules),
+                        "pf_info": encode(info), "references": encode(references)}, sort_keys=True) + "\n").encode()
+    if len(data) > MAX_FILE:
+        raise Refused("规则槽观察记录超限")
+    return data
+
+
+def parse_observation(session, name, data):
+    """Validate the exact saved observation format without querying or altering PF."""
+    if not 0 < len(data) <= MAX_FILE:
+        raise Refused("规则槽观察记录长度无效")
+    try:
+        obj = json.loads(data)
+        rules = None if obj["rules"] is None else base64.b64decode(obj["rules"], validate=True)
+        slot = Slot(SlotState(obj["slot_state"]), rules)
+        info = base64.b64decode(obj["pf_info"], validate=True)
+        references = base64.b64decode(obj["references"], validate=True)
+    except (KeyError, TypeError, ValueError, RecursionError) as error:
+        raise Refused("规则槽观察记录不完整或格式错误") from error
+    if observation_bytes(session, name, slot, info, references) != data:
+        raise Refused("规则槽观察记录的会话、阶段或字段不匹配")
+    return slot
 
 
 def normalize_record(data, load=False):
@@ -151,8 +195,10 @@ class System:
         reference.root("/bin/mkdir", self.path(name))  # No -p, no replacement/retry.
 
     def write(self, name, data):
-        if name not in ("candidate.pf", "empty.pf", "closed.json") or len(data) > MAX_FILE:
+        if name not in ("candidate.pf", "empty.pf", "closed.json") + OBSERVATION_FILES or len(data) > MAX_FILE:
             raise Refused("未知或超限数据写入")
+        if name in OBSERVATION_FILES:
+            parse_observation(self.session, name, data)
         if ((name == "candidate.pf" and data != profile(self.session)[1])
                 or (name == "empty.pf" and data)):
             raise Refused("只允许生成的固定候选和空恢复数据")
@@ -216,9 +262,22 @@ class Rules:
             raise Refused("root保护候选不是固定回环规则或恢复文件不为空")
 
     def disabled(self):
-        if (not self.system.query("-s", "info").startswith(b"Status: Disabled ")
-                or self.system.query("-s", "References") != b"No pf starter references held\n"):
+        info = self.system.query("-s", "info")
+        if not info.startswith(b"Status: Disabled "):
             raise Refused("本阶段要求PF停用、引用0；不改变他人引用或全局状态")
+        references = self.system.query("-s", "References")
+        if references != NO_REFERENCES:
+            raise Refused("本阶段要求PF停用、引用0；不改变他人引用或全局状态")
+        return info, references
+
+    def save_observation(self, name, slot, disabled):
+        self.system.write(name, observation_bytes(self.system.session, name, slot, *disabled))
+
+    def recheck_before_write(self, observed):
+        self.inspect()
+        if self.current() != observed:
+            raise Refused("记录之后规则槽已变化；停止写入")
+        self.disabled()
 
     def baseline(self):
         result = {key: normalize_record(self.system.read("before-" + key + ".txt"))
@@ -253,7 +312,7 @@ class Rules:
     def unsubmitted(self):
         if (not all(self.system.exists(n) for n in ("stage-once", "baseline-ready"))
                 or any(self.system.exists(n) for n in
-                       ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json"))):
+                       ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json") + OBSERVATION_FILES)):
             raise Refused("仅可接续有完整前态且从未记录提交意图/结果的首次提交；不重放或重置标记")
 
     def stage(self, capture, confirm, stop_after_submit=False, resume=False):
@@ -277,24 +336,30 @@ class Rules:
         self.baseline()  # Includes absence; baseline data is never cleanup permission.
         if not resume:
             self.system.mark("baseline-ready")
-        if self.current().state != SlotState.ABSENT:
+        slot = self.current()
+        if slot.state != SlotState.ABSENT:
             raise Refused("首次提交前规则槽已经存在；不覆盖或认领现有对象")
-        self.disabled()
+        disabled = self.disabled()
         if resume:
             self.unsubmitted()
         self.system.mark("load-intent")
+        self.save_observation("before-submit.json", slot, disabled)
+        self.recheck_before_write(slot)
         self.system.submit(self.anchor, False)
         if stop_after_submit:
             raise Refused("按计划在系统提交命令返回后退出：尚未查询后态，请由另一入口核对恢复；不是内核阶段故障注入")
         self.inspect()
-        self.disabled()
-        if self.current().rules != expected:
+        disabled = self.disabled()
+        after = self.current()
+        self.save_observation("after-submit.json", after, disabled)
+        if after.rules != expected:
             raise Refused("规则后态与解析器输出不同；保留现场供独立接管")
 
     def recover(self, confirm):
         self.inspect()
         if (not all(self.system.exists(n) for n in ("stage-once", "baseline-ready", "load-intent"))
-                or self.system.exists("recovery-once")):
+                or any(self.system.exists(n) for n in ("recovery-once", "clear.txt", "closed.json",
+                                                        "before-clear.json", "after-clear.json"))):
             raise Refused("提交意图不完整或已有恢复尝试，不自动接管/重试")
         expected = self.canonicalizer(self.anchor, self.rules)
         self.disabled()
@@ -307,16 +372,19 @@ class Rules:
         if not confirm():
             raise Refused("已取消，不恢复规则")
         self.inspect()
-        self.disabled()
+        disabled = self.disabled()
         rechecked = self.current()
         if rechecked != current:
             raise Refused("确认期间规则变化，停止")
         self.system.mark("recovery-once")
-        if current.rules:
+        self.save_observation("before-clear.json", rechecked, disabled)
+        self.recheck_before_write(rechecked)
+        if rechecked.rules:
             self.system.submit(self.anchor, True)
         self.inspect()
-        self.disabled()
+        disabled = self.disabled()
         after = self.current()
+        self.save_observation("after-clear.json", after, disabled)
         if after.rules:
             raise Refused("本次filter未清空，结果未知；不重试")
         result = {"payload_absent": True, "slot_state": after.state.value,
@@ -337,6 +405,7 @@ def plan():
             "submit": ["/sbin/pfctl", "-a", "<own literal>", "-R", "-o", "none", "-f", "<root candidate.pf>"],
             "recover": ["/sbin/pfctl", "-a", "<same own literal>", "-R", "-o", "none", "-f", "<root empty.pf>"],
             "slot_observations": "absent via consistent recursive/root-child inventories; existing slots require direct content reads; query errors stay errors",
+            "saved_phase_observations": OBSERVATION_FILES,
             "resume_before_submit": "existing complete baseline and no load-intent/result/recovery evidence; fresh matching capture; no marker reset or replay",
             "recover_result": "payload_absent; filter_empty is true only after a direct empty read, null if the named namespace is absent",
             "fault": "optional ordinary controller exit after system submit returns; no claim of internal kernel phase",
