@@ -10,7 +10,7 @@ Workspace crates under `crates/` (macOS only):
 - `tunlatchd`: service orchestration, client limits, and shutdown.
 - `tunlatch`: CLI and Ratatui dashboard.
 
-Unit tests sit beside implementations; socket integration tests occupy `crates/tunlatchd/tests/`. Sample configuration: `examples/config.toml`. `docs/` is ignored local planning material; shared guidance belongs in tracked Markdown. Build output: ignored `target/`.
+Unit tests sit beside implementations; socket integration tests occupy `crates/tunlatchd/tests/`. Sample configuration: `examples/config.toml`. Shared guidance is tracked in `docs/REQUIREMENTS.md`, `docs/CODING-GUIDELINES.md`, and `docs/TECH-STACK-RESEARCH.md`; `docs/development-plan-*/`, `docs/WORK-STATUS.md`, and local evidence remain ignored. Build output: ignored `target/`.
 
 ## Build, Test, and Development Commands
 

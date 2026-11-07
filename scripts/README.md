@@ -100,7 +100,7 @@ cargo test -p tunlatch-platform --example utun_mapping --locked
 
 这是前台人工流程，不提供十秒硬期限或命令树自动回收。中断、未知、缺回执、跨启动和已有释放尝试均停止，不猜测或重试；它只覆盖完整回执时的人工恢复。完整恢复/实际阻断仍未通过，也不开放W07。恢复只用已经存在的本地Python标准库和系统工具，不需要网络或编译。
 
-本地规划中的完整步骤：`docs/development-plan-2026-11-02/experiments/reference-only.md`。发布给其他环境前仍需重新审阅本机前态和操作窗口，不能照搬历史快照。
+本地规划中的完整步骤保存在未跟踪的 `docs/development-plan-2026-11-02/experiments/reference-only.md`。发布给其他环境前仍需重新审阅本机前态和操作窗口，不能照搬历史快照。
 
 普通权限检查（不运行sudo或PF内核操作）：
 
@@ -120,7 +120,7 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 `resume-before-submit`仅接续有完整保护前态、`stage-once/baseline-ready`存在、但`load-intent`、提交/清空回执和恢复/关闭记录全部不存在的首次提交。它需要新鲜且与原保护前态相同的采集，不删除或重置标记；一旦记录过提交意图，便不能用它重放。它处理提交前预检适配故障，不是失败后的自动PF重试。
 
-这仍不是自动所有权、可信后台恢复或阻断恢复资格；没有硬期限、未知命令树回收或断电原子性保证。完整W05/W07及UID/出口测试仍需后续证据。完整本机步骤见本地`docs/development-plan-2026-11-02/experiments/unattached-rule.md`。
+这仍不是自动所有权、可信后台恢复或阻断恢复资格；没有硬期限、未知命令树回收或断电原子性保证。完整W05/W07及UID/出口测试仍需后续证据。完整本机步骤保存在未跟踪的 `docs/development-plan-2026-11-02/experiments/unattached-rule.md`。
 
 ```sh
 /usr/bin/python3 scripts/pf-lab-rule.py plan

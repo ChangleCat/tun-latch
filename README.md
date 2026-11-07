@@ -182,7 +182,7 @@ cargo run -p tunlatch-platform --example pf_lab --locked -- prepare "$TUNLATCH_L
 固定 anchor 名称、标签、收据或模拟测试均不证明内核资源归属；完整预检、可信程序部署、
 特权进程监督接入、接口复用、状态选择、引用和流量采集仍须补齐，实机操作另行审核。
 
-贡献约定见 [AGENTS.md](AGENTS.md)，完整工程检查见 [CI 配置](.github/workflows/ci.yml)，安全边界见 [SAFETY.md](SAFETY.md)。本地 `docs/` 保存需求、调研和编码指导，按已有 `.gitignore` 设置保留为本地资料；本 README 记录可随代码交付的架构与能力边界。
+贡献约定见 [AGENTS.md](AGENTS.md)，完整工程检查见 [CI 配置](.github/workflows/ci.yml)，安全边界见 [SAFETY.md](SAFETY.md)。需求、技术调研和编码规范见 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)、[docs/TECH-STACK-RESEARCH.md](docs/TECH-STACK-RESEARCH.md) 和 [docs/CODING-GUIDELINES.md](docs/CODING-GUIDELINES.md)；本地开发计划、工作状态和证据按 `.gitignore` 保持未跟踪。本 README 记录可随代码交付的架构与能力边界。
 
 许可证：[GPL-3.0](LICENSE)。
 

@@ -1,5 +1,10 @@
-# Local planning and project documents
-/docs/
+# Local planning, work status, and evidence stay untracked.
+/docs/*
+!/docs/REQUIREMENTS.md
+!/docs/CODING-GUIDELINES.md
+!/docs/TECH-STACK-RESEARCH.md
+# Reserved for promoted, sanitized design documents.
+!/docs/design/
 
 # Rust build output
 /target/
