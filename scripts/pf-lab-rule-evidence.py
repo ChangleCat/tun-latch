@@ -22,7 +22,7 @@ stage = load_sibling("_receipt_transport", "identity-readonly.py")
 rule = load_sibling("_receipt_rule_profile", "pf-lab-rule.py")
 Refused = stage.Refused
 ACK = "READ-SAVED-PF-RECEIPTS"
-RECORDS = ("boot.txt", "candidate.pf", "empty.pf", "stage.txt", "clear.txt", "closed.json")
+RECORDS = ("boot.txt", "candidate.pf", "empty.pf", "stage.txt", "clear.txt", "closed.json", rule.STAGE_RETURN)
 STAT = "%u:%Lp:%HT:%l:%z:%d:%i:%m:%c"
 
 
@@ -111,7 +111,14 @@ def summarize(runner, requested):
         raise Refused("启动记录格式错误")
     if read_record(runner, session, "candidate.pf") != candidate or read_record(runner, session, "empty.pf"):
         raise Refused("归档候选或空恢复文件与固定范围不一致")
-    staged = receipt(read_record(runner, session, "stage.txt"))
+    stage_transcript = read_record(runner, session, "stage.txt")
+    staged = receipt(stage_transcript)
+    return_path = session + "/" + rule.STAGE_RETURN
+    has_return = exists(runner, return_path)
+    if has_return and read_record(runner, session, rule.STAGE_RETURN) != rule.stage_return_digest(
+        requested, boot, stage_transcript
+    ):
+        raise Refused("提交返回记录与归档回执不一致")
     clear_path = session + "/clear.txt"
     has_clear = exists(runner, clear_path)
     cleared = receipt(read_record(runner, session, "clear.txt") if has_clear else None)
@@ -132,7 +139,7 @@ def summarize(runner, requested):
     after_clear = observations["after-clear.json"]["state"]
     if after_clear != "not_recorded" and after_clear != closed["slot_state"]:
         raise Refused("清理后快照与关闭记录不一致")
-    if (exists(runner, clear_path) != has_clear
+    if (exists(runner, clear_path) != has_clear or exists(runner, return_path) != has_return
             or any(exists(runner, session + "/" + name) != present
                    for name, present in observed_presence.items())
             or inspect(runner, session, directory=True)[0] != before):
@@ -148,6 +155,7 @@ def summarize(runner, requested):
         "purpose": "historical_rule_receipts", "session": requested, "anchor": anchor,
         "current_boot_matches_receipt": boot.decode().strip() == stage.boot(runner),
         "stage_receipt": staged, "clear_receipt": cleared, "recorded_close": closed,
+        "stage_return_record": "matches_saved_transcript" if has_return else "not_recorded",
         "recovery_branch_inference": branch,
         "pre_clear_raw_snapshot": ("recorded" if observed_presence["before-clear.json"]
                                    else "not_recorded"),

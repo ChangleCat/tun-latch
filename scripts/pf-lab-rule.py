@@ -8,6 +8,7 @@ crash recovery, kernel object authentication, or a leak protection mechanism.
 import argparse
 import base64
 from enum import Enum
+import hashlib
 import importlib.util
 import json
 import os
@@ -30,8 +31,9 @@ ROOT_QUERIES = (("root-rules", ("-s", "rules")), ("root-nat", ("-s", "nat")),
                 ("inventory", ("-v", "-s", "Anchors")))
 BASE_FILES = tuple("before-" + key + ".txt" for key, _ in ROOT_QUERIES)
 OBSERVATION_FILES = ("before-submit.json", "after-submit.json", "before-clear.json", "after-clear.json")
+STAGE_RETURN = "stage-returned.sha256"
 FILES = ("boot.txt", "candidate.pf", "empty.pf", "stage.txt", "clear.txt",
-         "closed.json") + BASE_FILES + OBSERVATION_FILES
+         "closed.json", STAGE_RETURN) + BASE_FILES + OBSERVATION_FILES
 MARKERS = ("stage-once", "baseline-ready", "load-intent", "recovery-once")
 NO_REFERENCES = b"No pf starter references held\n"
 
@@ -124,6 +126,16 @@ def normalize_record(data, load=False):
     return data
 
 
+def stage_return_digest(session, boot, transcript):
+    """Bind the normal-return record to this session, boot and exact saved transcript."""
+    profile(session)
+    boot = reference.transcript(boot).lower()
+    if not reference.UUID.fullmatch(boot) or normalize_record(transcript, load=True):
+        raise Refused("提交返回记录的启动身份或回执无效")
+    data = b"pf-lab-stage-returned\n" + session.encode("ascii") + b"\n" + boot + transcript
+    return hashlib.sha256(data).hexdigest().encode("ascii") + b"\n"
+
+
 def inventory(data):
     try:
         names = [line.strip() for line in data.decode("ascii").splitlines()]
@@ -195,7 +207,7 @@ class System:
         reference.root("/bin/mkdir", self.path(name))  # No -p, no replacement/retry.
 
     def write(self, name, data):
-        if name not in ("candidate.pf", "empty.pf", "closed.json") + OBSERVATION_FILES or len(data) > MAX_FILE:
+        if name not in ("candidate.pf", "empty.pf", "closed.json", STAGE_RETURN) + OBSERVATION_FILES or len(data) > MAX_FILE:
             raise Refused("未知或超限数据写入")
         if name in OBSERVATION_FILES:
             parse_observation(self.session, name, data)
@@ -204,6 +216,10 @@ class System:
             raise Refused("只允许生成的固定候选和空恢复数据")
         if self.exists(name):
             raise Refused("记录已存在，不覆盖")
+        if name == STAGE_RETURN and data != stage_return_digest(
+            self.session, self.read("boot.txt"), self.read("stage.txt")
+        ):
+            raise Refused("提交返回记录与保护回执不一致")
         argv = reference.PREFIX + ["/usr/bin/tee", self.path(name)]
         result = subprocess.run(argv, input=data, capture_output=True, env=reference.ENV,
                                 cwd="/", check=False)
@@ -248,6 +264,9 @@ class System:
                                  "-R", "-o", "none", "-f", self.path(name))
         if normalize_record(reply, load=True):
             raise Refused("提交回执含未知内容；独立核对，不自动回滚")
+        if self.read(log) != reply:
+            raise Refused("提交命令输出与保护回执不一致；保留现场")
+        return reply
 
 
 class Rules:
@@ -278,6 +297,15 @@ class Rules:
         if self.current() != observed:
             raise Refused("记录之后规则槽已变化；停止写入")
         self.disabled()
+
+    def verify_stage_return(self):
+        if not self.system.exists(STAGE_RETURN) or not self.system.exists("stage.txt"):
+            raise Refused("缺少提交命令正常返回记录；原写入者状态未知，保留现场")
+        expected = stage_return_digest(self.system.session, self.system.read("boot.txt"),
+                                       self.system.read("stage.txt"))
+        if self.system.read(STAGE_RETURN) != expected:
+            raise Refused("提交返回记录与保护回执不一致；保留现场")
+        return expected
 
     def baseline(self):
         result = {key: normalize_record(self.system.read("before-" + key + ".txt"))
@@ -312,7 +340,8 @@ class Rules:
     def unsubmitted(self):
         if (not all(self.system.exists(n) for n in ("stage-once", "baseline-ready"))
                 or any(self.system.exists(n) for n in
-                       ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json") + OBSERVATION_FILES)):
+                       ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json",
+                        STAGE_RETURN) + OBSERVATION_FILES)):
             raise Refused("仅可接续有完整前态且从未记录提交意图/结果的首次提交；不重放或重置标记")
 
     def stage(self, capture, confirm, stop_after_submit=False, resume=False):
@@ -345,7 +374,9 @@ class Rules:
         self.system.mark("load-intent")
         self.save_observation("before-submit.json", slot, disabled)
         self.recheck_before_write(slot)
-        self.system.submit(self.anchor, False)
+        reply = self.system.submit(self.anchor, False)
+        self.system.write(STAGE_RETURN, stage_return_digest(self.system.session,
+                                                            self.system.read("boot.txt"), reply))
         if stop_after_submit:
             raise Refused("按计划在系统提交命令返回后退出：尚未查询后态，请由另一入口核对恢复；不是内核阶段故障注入")
         self.inspect()
@@ -361,6 +392,7 @@ class Rules:
                 or any(self.system.exists(n) for n in ("recovery-once", "clear.txt", "closed.json",
                                                         "before-clear.json", "after-clear.json"))):
             raise Refused("提交意图不完整或已有恢复尝试，不自动接管/重试")
+        returned = self.verify_stage_return()
         expected = self.canonicalizer(self.anchor, self.rules)
         self.disabled()
         current = self.current()
@@ -378,6 +410,8 @@ class Rules:
             raise Refused("确认期间规则变化，停止")
         self.system.mark("recovery-once")
         self.save_observation("before-clear.json", rechecked, disabled)
+        if self.verify_stage_return() != returned:
+            raise Refused("接管期间提交返回记录发生变化；保留现场")
         self.recheck_before_write(rechecked)
         if rechecked.rules:
             self.system.submit(self.anchor, True)
@@ -408,7 +442,8 @@ def plan():
             "saved_phase_observations": OBSERVATION_FILES,
             "resume_before_submit": "existing complete baseline and no load-intent/result/recovery evidence; fresh matching capture; no marker reset or replay",
             "recover_result": "payload_absent; filter_empty is true only after a direct empty read, null if the named namespace is absent",
-            "fault": "optional ordinary controller exit after system submit returns; no claim of internal kernel phase",
+            "fault": "optional ordinary controller exit after saving the normal submit return and before PF post-reads",
+            "recover_requires": "matching protected submit return record plus operator-confirmed end of original writers and continuous exclusivity",
             "limits": ["Exclusive, operator-present manual takeover; no automatic ownership from a receipt.",
                        "No privileged descendant deadline/reclamation or power-loss atomicity.",
                        "No traffic evaluation, active block/unblock, UID or leak-protection proof.",
@@ -460,7 +495,7 @@ def main():
     if args.action == "status":
         lab.inspect()
         print("独立入口可读；尚不证明实机规则恢复通过。")
-        print(json.dumps({name: system.exists(name) for name in MARKERS}))
+        print(json.dumps({name: system.exists(name) for name in MARKERS + (STAGE_RETURN,)}))
     elif submitting:
         if not args.capture:
             raise Refused("需要刚完成的--capture目录")

@@ -114,7 +114,9 @@ cargo test -p tunlatch-platform --example utun_mapping --locked
 
 root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkdir及pfctl；项目Python始终普通用户。候选/空恢复文件冻结于本次root私有目录，固定`-a 本次literal -R -o none -f 本次保护文件`只替换本次filter，不使用全局或父级flush/reload，不取放引用、不清state、不改接口/路由。普通`-n -v`解析器提供规范输出供后态完整比较。
 
-`--stop-after-submit`只在系统提交命令返回后退出普通控制程序，留下root保护意图；不声称在内核begin/commit内部中断。新进程的recover不依赖丢失的提交回执，须核对当前启动、保护数据、根filter/NAT、目录及本次规则/空态，并由操作者确认原写入者已结束、窗口连续后逐项接管。恢复只替换本次filter为空；未知内容、其他NAT/表/子目录、重复尝试或来源不明时保留现场。空anchor元数据可能保留，程序如实记录，不猜测删除或声称所有内核对象消失。
+提交包装命令正常返回后，脚本核对输出与 root 私有的 `stage.txt` 逐字节相同，再保存 `stage-returned.sha256`。摘要绑定会话、启动身份和原始回执。`--stop-after-submit` 在保存该记录后、首次查询 PF 后态前退出。`recover` 在提示接管前和实际清空前都核对正常返回记录，缺少记录、内容不匹配或中途变化时保留现场。保存的 `stage.txt` 可能在提交运行中已经出现，不能单独用于接管。
+
+正常返回记录只反映固定包装命令的结果。操作者仍须确认原写入者已结束且独占窗口连续，并核对当前启动、保护数据、根 filter/NAT、目录及本次规则或空态。恢复只替换本次 filter 为空。未知内容、其他 NAT/表/子目录、重复尝试或来源不明时保留现场。空 anchor 元数据可能保留。
 
 规则槽有“不存在”和“存在且为空/非空”之分。先核对根下非递归清单与完整递归清单一致，缺失的名字记录为namespace absent，不向不存在的槽读取内容，也不伪造为空规则输出；已有槽必须直接读取filter/NAT/表/子目录，任何查询错误仍失败。恢复结果`payload_absent`表示本次载荷已移除；`filter_empty`只在直接读为空时为true，namespace absent时为null，不宣称删除了所有内核对象。
 
@@ -131,7 +133,7 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 ### 核对已关闭会话的保存回执
 
-`pf-lab-rule-evidence.py` 只读取一个已关闭规则槽会话中的固定记录。它检查文件属性与固定候选，输出摘要、回执分类和历史关闭记录。阶段观察只输出状态、文件长度和摘要，实际读取的规则、PF 状态和引用输出留在 root 私有目录。`absent` 是当时根据两份目录清单作出的判断，阶段观察未保存这两份清单。旧会话缺少清空前观察时，`consistent_with_matching_nonempty_pre_clear` 仅表示保存的回执与已审查的恢复流程一致。这个推断依赖回执确由该流程生成。工具无法认证当时实际执行的源码，也无法用阶段记录独立证明规则与当时解析器的输出一致。
+`pf-lab-rule-evidence.py` 只读取一个已关闭规则槽会话中的固定记录。它检查文件属性与固定候选，输出摘要、回执分类和历史关闭记录。旧会话的正常返回记录可以缺席，摘要会显示 `not_recorded`。阶段观察只输出状态、文件长度和摘要，实际读取的规则、PF 状态和引用输出留在 root 私有目录。`absent` 是当时根据两份目录清单作出的判断，阶段观察未保存这两份清单。旧会话缺少清空前观察时，`consistent_with_matching_nonempty_pre_clear` 仅表示保存的回执与已审查的恢复流程一致。这个推断依赖回执确由该流程生成。工具无法认证当时实际执行的源码，也无法用阶段记录独立证明规则与当时解析器的输出一致。
 
 在同一 Terminal 认证后，用已关闭会话的实际目录替换示例路径。
 

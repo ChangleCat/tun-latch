@@ -10,13 +10,14 @@ SPEC = importlib.util.spec_from_file_location("rule", Path(__file__).with_name("
 rule = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rule)
 SESSION = "/var/root/tunlatch-pf-rule.A1b2C3d4"
+BOOT = b"01234567-89ab-cdef-0123-456789abcdef\n"
 
 
 class Fake:
     def __init__(self):
         self.session = SESSION
         self.anchor, self.rules = rule.profile(SESSION)
-        self.files = {"candidate.pf": self.rules, "empty.pf": b""}
+        self.files = {"boot.txt": BOOT, "candidate.pf": self.rules, "empty.pf": b""}
         self.marks = set()
         self.root = {"root-rules": b'anchor "com.apple/*" all\n', "root-nat": b"",
                      "inventory": b"com.apple\n"}
@@ -84,8 +85,10 @@ class Fake:
             raise rule.Refused("unknown submit, before mutation")
         self.image = b"" if empty else self.rules
         self.present = self.residue or not empty
+        self.files["clear.txt" if empty else "stage.txt"] = rule.LOAD_NOTICE
         if self.fail_submit == "after":
             raise rule.Refused("lost reply after mutation")
+        return rule.LOAD_NOTICE
 
 
 class MacFake(Fake):
@@ -154,7 +157,7 @@ class RulesTests(unittest.TestCase):
         self.assertIsNone(result["filter_empty"])
         self.assertEqual(result["slot_state"], "absent")
 
-    def test_lost_submit_reply_before_or_after_kernel_change_is_inspected_not_replayed(self):
+    def test_lost_submit_reply_quarantines_even_when_rules_and_transcript_are_present(self):
         for failure in ("before", "after"):
             with self.subTest(failure=failure):
                 self.reset()
@@ -163,29 +166,52 @@ class RulesTests(unittest.TestCase):
                     self.stage()
                 self.assertIn("load-intent", self.fake.marks)
                 self.fake.fail_submit = None
-                result = self.lab().recover(lambda: True)
-                self.assertTrue(result["payload_absent"])
-                self.assertEqual(result["slot_state"], "absent" if failure == "before" else "empty")
-                self.assertEqual(len([c for c in self.fake.calls if not c[1]]), 1)
-                self.assertEqual(len([c for c in self.fake.calls if c[1]]), int(failure == "after"))
+                self.assertEqual("stage.txt" in self.fake.files, failure == "after")
+                with self.assertRaisesRegex(rule.Refused, "原写入者状态未知"):
+                    self.lab().recover(lambda: self.fail("prompted for unknown writer"))
+                self.assertEqual(self.fake.calls, [(self.fake.anchor, False)])
+                self.assertNotIn("closed.json", self.fake.files)
 
-    def test_controlled_stop_after_system_return_needs_no_submit_ack_to_recover(self):
-        with self.assertRaisesRegex(rule.Refused, "不是内核阶段"):
+    def test_controlled_stop_has_normal_return_evidence_without_pf_postreads(self):
+        query = self.fake.query
+
+        def refuse_postread(*args):
+            self.assertFalse(self.fake.calls, "PF queried after planned submit return")
+            return query(*args)
+
+        with patch.object(self.fake, "query", side_effect=refuse_postread), self.assertRaisesRegex(
+            rule.Refused, "不是内核阶段"
+        ):
             self.stage(stop_after_submit=True)
         self.assertEqual(self.fake.image, self.fake.rules)
         self.assertIn("before-submit.json", self.fake.files)
         self.assertNotIn("after-submit.json", self.fake.files)
+        self.assertEqual(self.fake.files[rule.STAGE_RETURN],
+                         rule.stage_return_digest(SESSION, BOOT, self.fake.files["stage.txt"]))
         self.lab().recover(lambda: True)
         self.assertEqual(self.fake.image, b"")
         self.assertEqual(rule.parse_observation(SESSION, "before-clear.json",
                                                self.fake.files["before-clear.json"]).rules,
                          self.fake.rules)
 
+    def test_changed_protected_submit_receipt_after_prompt_prevents_clear(self):
+        self.stage()
+
+        def replace_receipt():
+            self.fake.files["stage.txt"] += rule.reference.NOTICE.encode()
+            return True
+
+        with self.assertRaisesRegex(rule.Refused, "提交返回记录与保护回执不一致"):
+            self.lab().recover(replace_receipt)
+        self.assertEqual(self.fake.calls, [(self.fake.anchor, False)])
+        self.assertNotIn("closed.json", self.fake.files)
+
     def test_failed_observation_keeps_intent_without_replaying_native_write(self):
-        for failing_name, initial_load, clear_called, marker in (
-            ("before-submit.json", False, False, "load-intent"),
-            ("before-clear.json", True, False, "recovery-once"),
-            ("after-clear.json", True, True, "recovery-once"),
+        for failing_name, initial_load, expected_writes, marker in (
+            ("before-submit.json", False, [], "load-intent"),
+            (rule.STAGE_RETURN, False, [False], "load-intent"),
+            ("before-clear.json", True, [False], "recovery-once"),
+            ("after-clear.json", True, [False, True], "recovery-once"),
         ):
             with self.subTest(name=failing_name):
                 self.reset()
@@ -210,10 +236,13 @@ class RulesTests(unittest.TestCase):
                 self.assertIn(marker, self.fake.marks)
                 self.assertNotIn("closed.json", self.fake.files)
                 self.assertEqual([empty for _, empty in self.fake.calls],
-                                 [False] * initial_load + [True] * clear_called)
+                                 expected_writes)
                 with self.assertRaises(rule.Refused):
                     attempt()
-                self.assertEqual(len(self.fake.calls), initial_load + clear_called)
+                if failing_name == rule.STAGE_RETURN:
+                    with self.assertRaisesRegex(rule.Refused, "原写入者状态未知"):
+                        self.lab().recover(lambda: self.fail("prompted for unknown writer"))
+                self.assertEqual(len(self.fake.calls), len(expected_writes))
 
     def test_existing_slot_is_not_adopted_or_overwritten(self):
         self.fake.root["inventory"] += self.fake.anchor.encode() + b"\n"
@@ -377,9 +406,10 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(self.fake.calls[-1], (self.fake.anchor, True))
 
     def test_resume_refuses_any_prior_submission_or_recovery_evidence(self):
-        for name in ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json") + rule.OBSERVATION_FILES:
+        for name in ("load-intent", "stage.txt", "clear.txt", "recovery-once", "closed.json",
+                     rule.STAGE_RETURN) + rule.OBSERVATION_FILES:
             self.prime_unsubmitted()
-            if name.endswith((".txt", ".json")):
+            if name.endswith((".txt", ".json", ".sha256")):
                 self.fake.files[name] = b"unknown"
             else:
                 self.fake.marks.add(name)
@@ -449,7 +479,7 @@ class RulesTests(unittest.TestCase):
 
     def test_system_submit_uses_filter_only_exact_slot_and_preserves_kernel_errors(self):
         system = rule.System(SESSION)
-        with patch.object(system, "exists", return_value=False):
+        with patch.object(system, "exists", return_value=False), patch.object(system, "read", return_value=rule.LOAD_NOTICE):
             for empty in (False, True):
                 log, name = ("clear.txt", "empty.pf") if empty else ("stage.txt", "candidate.pf")
                 with patch.object(rule.reference, "record", return_value=rule.LOAD_NOTICE) as record:
@@ -459,6 +489,10 @@ class RulesTests(unittest.TestCase):
             with patch.object(rule.reference, "record", return_value=rule.LOAD_NOTICE+b"pfctl: kernel error\n"):
                 with self.assertRaises(rule.Refused):
                     system.submit(self.fake.anchor, True)
+            with patch.object(rule.reference, "record", return_value=b""), self.assertRaisesRegex(
+                rule.Refused, "提交命令输出与保护回执不一致"
+            ):
+                system.submit(self.fake.anchor, False)
         with self.assertRaises(rule.Refused):
             system.submit("com.apple", True)
 

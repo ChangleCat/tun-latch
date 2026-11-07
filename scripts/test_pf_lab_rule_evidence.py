@@ -57,6 +57,7 @@ class RuleEvidenceTests(unittest.TestCase):
         records = SavedRecords()
         result = self.summarize(records)
         self.assertEqual(result["recorded_close"], CLOSED)
+        self.assertEqual(result["stage_return_record"], "not_recorded")
         self.assertEqual(result["recovery_branch_inference"], "consistent_with_matching_nonempty_pre_clear")
         self.assertEqual(result["pre_clear_raw_snapshot"], "not_recorded")
         self.assertFalse(result["executed_source_verified"])
@@ -66,6 +67,24 @@ class RuleEvidenceTests(unittest.TestCase):
         self.assertEqual(result["pf_writes"], 0)
         self.assertNotIn(BOOT, json.dumps(result))
         self.assertTrue(all(call[0] in {"/usr/bin/stat", "/bin/ls", "/bin/cat", "/bin/test"} for call in records.calls))
+
+    def test_stage_return_record_matches_only_original_transcript_session_and_boot(self):
+        records = SavedRecords()
+        path = records.directory + "/" + tool.rule.STAGE_RETURN
+        transcript = records.files[records.directory + "/stage.txt"]
+        boot = (BOOT + "\n").encode()
+        expected = tool.rule.stage_return_digest(SESSION, boot, transcript)
+        records.files[path] = expected
+        self.assertEqual(self.summarize(records)["stage_return_record"], "matches_saved_transcript")
+        for value in (
+            expected[:16],
+            tool.rule.stage_return_digest(SESSION[:-1] + "9", boot, transcript),
+            tool.rule.stage_return_digest(SESSION, b"9" + boot[1:], transcript),
+            tool.rule.stage_return_digest(SESSION, boot, b"^D\x08\x08" + transcript),
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(tool.Refused, "与归档回执不一致"):
+                records.files[path] = value
+                self.summarize(records)
 
     def test_missing_or_unrecognized_clear_receipt_leaves_branch_unknown(self):
         records = SavedRecords()
