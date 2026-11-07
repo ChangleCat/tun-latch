@@ -46,6 +46,14 @@ cargo run -p tunlatch -- identity inspect --pid 12345 --fd-details --json
 
 将 PID 替换为实际选择的进程。采集前后核对 PID、UID、出生时间、FD 列表和 socket 元数据；不可读、截断、变化或不支持的结构布局均返回失败。`complete_raw` 仅表示两次有限的原始采样匹配，TUN 归属、已载入映像和实际保护仍为未知/未认证。CLI 省略内核 opaque 值和非 control socket 端点。当前已核对的采集布局限 Apple Silicon；普通观察入口仍拒绝 root。单次管理员只读诊断另有专用程序和受保护暂存流程，见 [操作者步骤](scripts/README.md#单次管理员身份只读采集)，不能直接 sudo 构建目录中的程序。
 
+对于普通用户可读取的进程，可在一次采样中核对预先取得的 CDHash、FD 和接口候选。
+
+```sh
+cargo run -p tunlatch -- identity correlate --pid 12345 --cdhash 00112233445566778899aabbccddeeff00112233 --json
+```
+
+请替换示例 PID 和 CDHash。命令在两次接口扫描之间核对动态代码、采集 FD、再核对动态代码。仅当唯一的 utun control 按 `unit - 1` 推导出两次都一致的接口时才返回 `candidate`。两次扫描各自独立，采样期间的变化可能漏检。该推导是诊断线索，TUN 归属和实际保护仍为未知。不可读、不一致或超出采样时限均返回非零。管理员只读工具目前仍只提供原始采样。
+
 也可将明确选定的进程与预期的 40 位十六进制 CDHash 作动态核验：
 
 ```sh

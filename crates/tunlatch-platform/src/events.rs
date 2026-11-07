@@ -276,7 +276,7 @@ impl NetworkObserver {
 
 // Darwin CLOCK_MONOTONIC keeps advancing during system sleep. Measure from scan start
 // because early entries may already be old by the time native enumeration returns.
-fn continuous_now() -> Result<Duration, nix::Error> {
+pub(crate) fn continuous_now() -> Result<Duration, nix::Error> {
     let time = clock_gettime(ClockId::CLOCK_MONOTONIC)?;
     let seconds = u64::try_from(time.tv_sec()).map_err(|_| nix::errno::Errno::EIO)?;
     let nanos = u32::try_from(time.tv_nsec())

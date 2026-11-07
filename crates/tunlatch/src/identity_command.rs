@@ -3,8 +3,8 @@
 use anyhow::bail;
 use tunlatch_core::binding::CodeIdentity;
 use tunlatch_platform::identity::{
-    ImageInspection, ProcessInspection, RawInspection, inspect_expected_cdhash, inspect_process,
-    inspect_selected_process,
+    ImageInspection, ProcessInspection, RawInspection, TunnelCandidate, inspect_expected_cdhash,
+    inspect_process, inspect_selected_process, inspect_tunnel_candidate,
 };
 
 pub(crate) fn parse_cdhash(text: &str) -> Result<[u8; 20], String> {
@@ -26,6 +26,72 @@ pub(crate) fn parse_cdhash(text: &str) -> Result<[u8; 20], String> {
         return Err(invalid());
     }
     Ok(expected)
+}
+
+pub(crate) async fn correlate(pid: u32, expected: [u8; 20], json: bool) -> anyhow::Result<()> {
+    let candidate =
+        match tokio::task::spawn_blocking(move || inspect_tunnel_candidate(pid, expected)).await {
+            Ok(result) => result.map_err(|error| error.kind()),
+            Err(_) => Err("worker_unavailable"),
+        };
+    let (success, result) = correlation_result(candidate, expected);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if success {
+        println!(
+            "Candidate: process {}; FD {}; interface {} (index {}); control ID {}; unit {}",
+            result["process"]["pid"],
+            result["fd"],
+            result["ifname"].as_str().unwrap_or(""),
+            result["ifindex"],
+            result["control_id"],
+            result["unit"]
+        );
+        println!("Basis: utun control unit minus one; expected CDHash matched.");
+        println!("TUN ownership and actual protection remain UNKNOWN; authorization: none.");
+    } else {
+        println!(
+            "Candidate unavailable: {}",
+            result["reason"].as_str().unwrap_or("unknown")
+        );
+        println!("TUN ownership and actual protection remain UNKNOWN; authorization: none.");
+    }
+    if !success {
+        bail!("candidate correlation unavailable; no trust granted");
+    }
+    Ok(())
+}
+
+fn correlation_result(
+    candidate: Result<TunnelCandidate, &'static str>,
+    expected: [u8; 20],
+) -> (bool, serde_json::Value) {
+    let candidate = match candidate {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            return (
+                false,
+                serde_json::json!({
+                    "result": "unavailable", "reason": reason,
+                    "tun_ownership": "unknown", "actual_protection": "unknown", "authorization": "none",
+                }),
+            );
+        }
+    };
+    (
+        true,
+        serde_json::json!({
+            "result": "candidate", "basis": "utun_control_unit_minus_one",
+            "process": {"pid": candidate.process.pid, "effective_uid": candidate.process.uid,
+                "birth_seconds": candidate.process.birth_seconds,
+                "birth_microseconds": candidate.process.birth_microseconds},
+            "fd": candidate.fd, "control_id": candidate.control_id, "unit": candidate.unit,
+            "ifname": candidate.ifname, "ifindex": candidate.ifindex,
+            "sampling_milliseconds": candidate.elapsed.as_millis(),
+            "matched_expected_code_identity": CodeIdentity::CodeDirectoryHash(expected),
+            "tun_ownership": "unknown", "actual_protection": "unknown", "authorization": "none",
+        }),
+    )
 }
 
 pub(crate) async fn check_image(pid: u32, expected: [u8; 20], json: bool) -> anyhow::Result<()> {
@@ -201,6 +267,45 @@ async fn inspect_fds(pid: u32, json: bool) -> anyhow::Result<()> {
 mod image_tests {
     use super::*;
     use tunlatch_platform::identity::{ImageProblem, ProcessIdentity};
+
+    #[test]
+    fn correlation_output_preserves_candidate_and_unavailable_boundaries() {
+        let candidate = TunnelCandidate {
+            process: ProcessIdentity {
+                pid: 42,
+                uid: 501,
+                birth_seconds: 1,
+                birth_microseconds: 2,
+            },
+            fd: 3,
+            control_id: 4,
+            unit: 5,
+            ifname: "utun4".into(),
+            ifindex: 6,
+            elapsed: std::time::Duration::from_millis(7),
+        };
+        let (success, result) = correlation_result(Ok(candidate), [1; 20]);
+        assert!(success);
+        assert_eq!(result["result"], "candidate");
+        assert_eq!(result["basis"], "utun_control_unit_minus_one");
+        assert_eq!(
+            result["matched_expected_code_identity"],
+            serde_json::json!(CodeIdentity::CodeDirectoryHash([1; 20]))
+        );
+        assert_eq!(result["ifname"], "utun4");
+        let (success, unavailable) = correlation_result(Err("image_mismatch"), [1; 20]);
+        assert!(!success);
+        assert_eq!(unavailable["result"], "unavailable");
+        assert_eq!(unavailable["reason"], "image_mismatch");
+        for output in [result, unavailable] {
+            assert_eq!(output["tun_ownership"], "unknown");
+            assert_eq!(output["actual_protection"], "unknown");
+            assert_eq!(output["authorization"], "none");
+            assert!(output.get("path").is_none());
+            assert!(output.get("addresses").is_none());
+            assert!(output.get("controls").is_none());
+        }
+    }
 
     #[test]
     fn rejects_unbounded_nonhex_zero_and_whole_file_digest_inputs() {

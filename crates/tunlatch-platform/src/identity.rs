@@ -8,10 +8,12 @@ use std::sync::Arc;
 
 use crate::events::{NetworkObserver, NetworkSnapshot};
 
+mod correlation;
 mod image;
 #[allow(unsafe_code)]
 mod native;
 mod process;
+pub use correlation::{TunnelCandidate, TunnelCandidateError, inspect_tunnel_candidate};
 pub use image::{ImageInspection, ImageProblem, inspect_expected_cdhash};
 pub use process::{
     InspectionFailure, InspectionProblem, InspectionStage, ProcessIdentity, ProcessInspection,

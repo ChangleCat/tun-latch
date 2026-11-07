@@ -84,6 +84,16 @@ enum IdentityCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Correlate a running process and utun interface as an untrusted candidate.
+    Correlate {
+        #[arg(long)]
+        pid: u32,
+        /// Expected 20-byte CDHash (40 hex digits), not an approval.
+        #[arg(long, value_parser = identity_command::parse_cdhash)]
+        cdhash: [u8; 20],
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -250,6 +260,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Identity {
             command: IdentityCommand::CheckImage { pid, cdhash, json },
         } => identity_command::check_image(pid, cdhash, json).await?,
+        Command::Identity {
+            command: IdentityCommand::Correlate { pid, cdhash, json },
+        } => identity_command::correlate(pid, cdhash, json).await?,
         Command::Simulate {
             runtime_dir,
             json,
