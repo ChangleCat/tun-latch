@@ -9,16 +9,18 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+getrandom.workspace = true
 tunlatch-core.workspace = true
 tunlatch-platform.workspace = true
 tunlatch-ipc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["fs"] }
 crossterm.workspace = true
 futures-util.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tokio.workspace = true
 
 [lints]

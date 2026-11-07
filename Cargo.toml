@@ -36,6 +36,7 @@ rustix = { version = "=1.1.6", features = ["net"] }
 exacl = { version = "=0.13.0", default-features = false }
 libproc = "=0.15.0"
 security-framework = { version = "=3.7.0", default-features = false }
+getrandom = "=0.4.3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -1,7 +1,9 @@
 //! Unprivileged CLI and terminal interface. Closing this program has no firewall side effects.
 
+mod capture_command;
 mod config_command;
 mod identity_command;
+mod journal_command;
 mod tui;
 
 use std::path::PathBuf;
@@ -39,7 +41,7 @@ enum Command {
         #[arg(long)]
         runtime_dir: PathBuf,
     },
-    /// Offline configuration tools. These never change protection or stored configuration.
+    /// Offline configuration and user-private simulation tools.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -138,6 +140,33 @@ enum ConfigCommand {
     /// Preview a bounded PF blocking candidate. No rules are loaded or authorized.
     CompilePreview {
         path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Store a local simulation intent and exercise modeled submission and readback.
+    JournalPreview {
+        path: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a local simulation intent as a recovery hint.
+    JournalStatus {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare existing PF capture files with an offline candidate.
+    VerifyCapture {
+        path: PathBuf,
+        #[arg(long)]
+        capture_dir: PathBuf,
+        #[arg(long)]
+        anchor: String,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=300))]
+        max_age_secs: u64,
         #[arg(long)]
         json: bool,
     },
@@ -254,6 +283,38 @@ async fn main() -> anyhow::Result<()> {
         Command::Config {
             command: ConfigCommand::CompilePreview { path, json },
         } => println!("{}", config_command::compile_preview(&path, json)?),
+        Command::Config {
+            command:
+                ConfigCommand::JournalPreview {
+                    path,
+                    state_dir,
+                    json,
+                },
+        } => {
+            tokio::task::spawn_blocking(move || journal_command::preview(&path, &state_dir, json))
+                .await??;
+        }
+        Command::Config {
+            command: ConfigCommand::JournalStatus { state_dir, json },
+        } => {
+            tokio::task::spawn_blocking(move || journal_command::inspect(&state_dir, json))
+                .await??;
+        }
+        Command::Config {
+            command:
+                ConfigCommand::VerifyCapture {
+                    path,
+                    capture_dir,
+                    anchor,
+                    max_age_secs,
+                    json,
+                },
+        } => {
+            tokio::task::spawn_blocking(move || {
+                capture_command::verify(&path, &capture_dir, &anchor, max_age_secs, json)
+            })
+            .await??;
+        }
         Command::Config {
             command: ConfigCommand::ImportPreview { path, current },
         } => {

@@ -77,6 +77,22 @@ cargo run -p tunlatch -- config compile-preview examples/policy.toml --json
 
 当前编译范围是出口资格尚未就绪时的阻断候选：双栈默认出口阻断、固定回环出站放行，普通规则按既定优先级保留选择条件，普通 allow 在此阶段也只生成阻断候选。未经独立授权的直连例外和不能精确表示的条件会被拒绝。输出分开显示源策略摘要与候选摘要，始终标记不可加载、无授权和实际保护未知；命令不调用 PF，也不处理已有连接状态。停用意图只产生空的 unmanaged 候选，不执行全局停用或清空。
 
+普通用户可在私有目录运行持久化模拟，再从新的进程检查恢复线索。
+
+```sh
+TUNLATCH_JOURNAL_DIR=$(mktemp -d /tmp/tunlatch-journal.XXXXXX)
+cargo run -p tunlatch -- config journal-preview examples/policy.toml --state-dir "$TUNLATCH_JOURNAL_DIR" --json
+cargo run -p tunlatch -- config journal-status --state-dir "$TUNLATCH_JOURNAL_DIR" --json
+```
+
+日志通过一次原子替换保存草稿与意图，记录有效载荷上限为 64 KiB。写入完成后，提交和独立读回在内存模型中进行。重新打开时会复核草稿和摘要，从未知状态开始核查。损坏或未完成的记录会保留以供检查。
+
+`config verify-capture` 读取已有的 PF 采集文件，报告捕获时的启用状态、根规则调用和可用计数，并与候选规则文本对照。结果为 `unknown` 或 `mismatch`，退出码为非零。
+
+```sh
+cargo run -p tunlatch -- config verify-capture examples/policy.toml --capture-dir /path/to/capture --anchor tunlatch --json
+```
+
 要演练完整控制流程，在新的私有目录启动 `tunlatchd --simulation`：
 
 ```sh
@@ -118,8 +134,9 @@ crates/
 | 网卡快照 | 原生 `getifaddrs`，保留 IPv4、IPv6 和 IPv6 scope；不是路由或身份验证 |
 | 配置 | CLI 校验、草稿差异预览与规范化导出已接入；不导入批准、不应用后台策略 |
 | 模拟控制闭环 | 显式启用后经真实本地通信提交、去重、核验和查询；内存后端无系统副作用 |
-| PF 候选编译 | 已接离线 CLI，生成未就绪时的双栈阻断候选与独立摘要；核验、授权放行与提交后端尚未实现 |
-| 提交与恢复生命周期 | 纯状态机已实现阶段、完整操作身份、迟到结果、失效和恢复线索处理；尚未接入真实存储或 PF 执行 |
+| PF 候选编译 | 离线 CLI 生成未就绪时的双栈阻断候选与独立摘要。授权放行与真实提交后端待完成 |
+| 提交与恢复生命周期 | 状态机已接入普通用户私有记录、模拟提交与独立读回。系统存储部署和 PF 执行待验证 |
+| PF 采集核对 | 可读取已有采集文件并报告捕获差异、缺项与过期。实机读回与执行位置验证待完成 |
 | PF、已有连接约束、必要直连例外 | 待原型与实机验证 |
 | 绑定领域模型 | 已实现候选/关联/确认分型，明确区分 CDHash 与完整镜像摘要，确认与刷新核对类别、内容、新采集序号及 FD 实例；没有实际可信 TUN 或 PF 资格 |
 | UID 出口领域模型 | 独立候选、规范摘要、一次性确认检查、撤销替换及当前范围/UID/协议/族判定；只检查报告一致性，不产生实际管理员或 PF 权限 |

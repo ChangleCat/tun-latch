@@ -32,7 +32,7 @@ fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn draft(path: &Path) -> anyhow::Result<ConfigV2> {
+pub(crate) fn draft(path: &Path) -> anyhow::Result<ConfigV2> {
     ConfigV2::parse_toml(&read(path)?).context("configuration rejected")
 }
 
