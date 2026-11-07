@@ -221,6 +221,42 @@ mod tests {
         ));
     }
     #[test]
+    fn reads_eof_after_both_halves_close_and_still_rejects_trailing_bytes() -> std::io::Result<()> {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        for trailing in [false, true] {
+            let (reader, mut peer) = UnixStream::pair()?;
+            reader.shutdown(Shutdown::Write)?;
+            if trailing {
+                peer.write_all(&[1])?;
+            }
+            peer.shutdown(Shutdown::Write)?;
+            let outcome =
+                peer_transport::end_of_stream(&reader, Instant::now() + Duration::from_secs(1));
+            if trailing {
+                assert!(outcome.is_err_and(|error| error.to_string() == "extra probe bytes"));
+            } else {
+                outcome?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn eof_wait_has_a_deadline_when_the_peer_stays_open() -> std::io::Result<()> {
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        let (reader, _peer) = UnixStream::pair()?;
+        let outcome =
+            peer_transport::end_of_stream(&reader, Instant::now() + Duration::from_millis(10));
+        assert!(outcome.is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut));
+        Ok(())
+    }
+
+    #[test]
     fn requires_explicit_ack_and_ordinary_user() {
         let a = args();
         assert!(parse(&a, false).is_ok());

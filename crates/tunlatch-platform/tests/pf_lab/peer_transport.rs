@@ -1,6 +1,10 @@
 //! Shared bounded transport for the offline driver and separately gated operator example.
-use std::io::{self, Read, Write};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::socket::{MsgFlags, recv};
+use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, UdpSocket};
+use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -40,11 +44,32 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .filter(|v| !v.is_zero())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "probe deadline"))
 }
-fn read_exact(stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+fn read_before(stream: &impl AsFd, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
+    let fd = stream.as_fd();
+    loop {
+        remaining(deadline)?;
+        // Darwin rejects socket option changes after both halves close. Keep reading
+        // without changing SO_RCVTIMEO, including when the final bytes and FIN arrive together.
+        match recv(fd.as_raw_fd(), buffer, MsgFlags::MSG_DONTWAIT) {
+            Ok(count) => return Ok(count),
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let millis = remaining(deadline)?.as_millis().saturating_add(1);
+        let timeout = PollTimeout::try_from(millis).unwrap_or(PollTimeout::MAX);
+        let mut waiting = [PollFd::new(fd, PollFlags::POLLIN)];
+        match poll(&mut waiting, timeout) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn read_exact(stream: &TcpStream, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
-        let count = stream.read(&mut buffer[offset..])?;
+        let count = read_before(stream, &mut buffer[offset..], deadline)?;
         if count == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short probe"));
         }
@@ -67,9 +92,8 @@ fn write_all(stream: &mut TcpStream, buffer: &[u8], deadline: Instant) -> io::Re
     }
     Ok(())
 }
-fn end_of_stream(stream: &mut TcpStream, deadline: Instant) -> io::Result<()> {
-    stream.set_read_timeout(Some(remaining(deadline)?))?;
-    if stream.read(&mut [0; 1])? != 0 {
+pub(super) fn end_of_stream(stream: &impl AsFd, deadline: Instant) -> io::Result<()> {
+    if read_before(stream, &mut [0; 1], deadline)? != 0 {
         return Err(io::Error::other("extra probe bytes"));
     }
     Ok(())
@@ -147,9 +171,9 @@ pub(super) fn exchange(
         }
         at(
             "read",
-            read_exact(&mut stream, &mut buffer[..payload.len()], deadline),
+            read_exact(&stream, &mut buffer[..payload.len()], deadline),
         )?;
-        at("read_eof", end_of_stream(&mut stream, deadline))?;
+        at("read_eof", end_of_stream(&stream, deadline))?;
         if &buffer[..payload.len()] != payload {
             return at("nonce", Err(io::Error::other("probe nonce mismatch")));
         }

@@ -67,6 +67,38 @@ class Failures(unittest.TestCase):
         self.assertTrue(receiver.killed)
         sender.assert_not_called()
 
+    def test_sender_failure_reports_successful_receiver_completion(self):
+        for completion, expected in ((record("receiver", "completed"), "completed"),
+                                     ({**record("receiver", "completed"), "protocol": "udp"},
+                                      "invalid completion")):
+            with self.subTest(expected=expected):
+                ready_r, ready_w = os.pipe()
+                error_r, error_w = os.pipe()
+                os.write(ready_w, (json.dumps(record("receiver", "ready")) + "\n"
+                                   + json.dumps(completion) + "\n").encode())
+                os.close(ready_w)
+                os.close(error_w)
+
+                class Receiver:
+                    stdout = os.fdopen(ready_r, "rb")
+                    stderr = os.fdopen(error_r, "rb")
+                    def __enter__(self): return self
+                    def __exit__(self, *args):
+                        self.stdout.close()
+                        self.stderr.close()
+                    def poll(self): return 0
+                    def kill(self): raise AssertionError("exited child must not be killed")
+
+                sender = subprocess.CompletedProcess([], 1, b"", json.dumps(record("sender")).encode())
+                with patch.object(peer, "free_ports", return_value=(1001, 1002)), \
+                     patch.object(peer.secrets, "token_hex", return_value=NONCE), \
+                     patch.object(peer.subprocess, "Popen", return_value=Receiver()), \
+                     patch.object(peer.subprocess, "run", return_value=sender):
+                    with self.assertRaises(ValueError) as error:
+                        peer.exchange(socket.AF_INET, "127.0.0.1", "tcp")
+                self.assertIn(f"ipv4/tcp receiver exit=0: {expected}", str(error.exception))
+                self.assertNotIn("missing or invalid structured failure", str(error.exception))
+
     def test_sender_failure_includes_already_available_receiver_failure(self):
         # Pipes simulate helper output and do not create network traffic.
         ready_r, ready_w = os.pipe()

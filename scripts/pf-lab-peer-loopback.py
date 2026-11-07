@@ -120,6 +120,15 @@ def exchange(family, host, protocol):
             def receiver_diagnostic():
                 raw = available_bytes(receiver.stderr)
                 exit_code = receiver.poll()
+                if exit_code == 0 and not raw:
+                    output = available_bytes(receiver.stdout)
+                    try:
+                        verify(output, "receiver", "completed", protocol, source, destination, nonce)
+                    except ValueError:
+                        result = "invalid completion"
+                    else:
+                        result = "completed"
+                    return f"; {family_name}/{protocol} receiver exit=0: {result}"
                 if raw or exit_code is not None:
                     return "; " + child_failure(family_name, protocol, "receiver", exit_code,
                                                 raw, source, destination, nonce)
