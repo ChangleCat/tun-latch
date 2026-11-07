@@ -162,6 +162,53 @@ fn durable_intent_survives_controller_loss_and_cannot_be_adopted()
     Ok(())
 }
 
+#[test]
+fn failed_independent_readback_leaves_write_unknown_and_refuses_replay()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use pf_lab::bootstrap::Error;
+    use pf_lab::ledger::{Ledger, Operation as Op, State};
+
+    let directory = ledger_directory()?;
+    let mut ledger = Ledger::create(fs::File::open(directory.path())?, [1; 32], [2; 32])?;
+    let effect = directory.path().join("simulated-effect");
+    let result = ledger.apply_and_observe(
+        Op::WriteFilter,
+        || {
+            fs::write(&effect, b"unexpected")?;
+            Ok(())
+        },
+        || {
+            assert!(matches!(
+                Ledger::reopen(fs::File::open(directory.path())?),
+                Err(Error::System(nix::errno::Errno::EWOULDBLOCK))
+            ));
+            if fs::read(&effect)? != b"expected" {
+                return Err(Error::Refused("independent readback mismatch"));
+            }
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Refused("independent readback mismatch"))
+    ));
+    assert_eq!(ledger.state(), State::Unknown(Op::WriteFilter));
+    assert!(
+        ledger
+            .apply_and_observe::<Error>(
+                Op::WriteFilter,
+                || fs::write(&effect, b"replayed").map_err(Error::from),
+                || Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(fs::read(&effect)?, b"unexpected");
+    drop(ledger);
+    let reopened = Ledger::reopen(fs::File::open(directory.path())?)?;
+    assert_eq!(reopened.state(), State::Unknown(Op::WriteFilter));
+    Ok(())
+}
+
 // Each fixture is a direct child of the test runner so failure cleanup can reap exactly those
 // processes. Marker files coordinate the request and durable intent without PF or networking.
 struct FixtureChild {
@@ -238,13 +285,21 @@ fn ledger_process_fixture() -> std::result::Result<(), Box<dyn std::error::Error
             wait_for_marker(&directory.join("request"))?;
             let mut ledger =
                 pf_lab::ledger::Ledger::create(fs::File::open(&directory)?, [1; 32], [2; 32])?;
-            ledger.begin(pf_lab::ledger::Operation::WriteFilter)?;
-            fs::File::create_new(directory.join("ready"))?;
-            // Model an operation that can still produce an effect after the controller dies.
-            wait_for_marker(&directory.join("finish-simulated-write"))?;
-            fs::File::create_new(directory.join("simulated-effect"))?;
-            wait_for_marker(&directory.join("writer-release"))?;
-            drop(ledger);
+            ledger.apply_and_observe::<pf_lab::bootstrap::Error>(
+                pf_lab::ledger::Operation::WriteFilter,
+                || {
+                    fs::File::create_new(directory.join("ready"))?;
+                    // The operation can still produce an effect after the controller dies.
+                    wait_for_marker(&directory.join("finish-simulated-write"))?;
+                    fs::File::create_new(directory.join("simulated-effect"))?;
+                    wait_for_marker(&directory.join("writer-release"))?;
+                    Ok(())
+                },
+                || {
+                    fs::File::open(directory.join("simulated-effect"))?;
+                    Ok(())
+                },
+            )?;
         }
         _ => return Err(std::io::Error::other("unknown fixture mode").into()),
     }

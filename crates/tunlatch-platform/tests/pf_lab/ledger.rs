@@ -255,6 +255,32 @@ impl Ledger {
         self.append(1, operation as u8)
     }
 
+    /// Persist intent before running a synchronous operation while holding both locks.
+    /// The separate verifier must read actual state through an independent path. Callers
+    /// must establish scope and authority, and keep mutation in this process.
+    pub(crate) fn apply_and_observe<E: From<Error>>(
+        &mut self,
+        operation: Operation,
+        apply: impl FnOnce() -> std::result::Result<(), E>,
+        verify: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.begin(operation)?;
+        let result = self
+            .check_named_objects()
+            .map_err(E::from)
+            .and_then(|()| apply())
+            .and_then(|()| verify());
+        match result {
+            Ok(()) => self.observed().map_err(E::from),
+            Err(error) => {
+                // If logging also fails, the original intent or an unreadable journal
+                // still prevents reopening the operation as ready.
+                let _ = self.unknown();
+                Err(error)
+            }
+        }
+    }
+
     /// The caller must independently establish its operation's complete postcondition. This
     /// method only durably records that report; it cannot authenticate arbitrary callers.
     pub(crate) fn observed(&mut self) -> Result<()> {

@@ -156,26 +156,25 @@ pub(crate) fn seal(path: &Path) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     let plan = Sha256::digest(&bytes).into();
     let mut ledger = Ledger::create(dir.try_clone()?, session, plan)?;
-    ledger.begin(Operation::StageProgram)?;
-    let publish = (|| {
-        let mut output = open(&dir, "package.json", true)?;
-        output.write_all(&bytes)?;
-        output.sync_all()?;
-        dir.sync_all()?;
-        let (_, observed) = read_entry(&dir, "package.json", 0o600)?;
-        if observed != bytes {
-            return Err(LabError::Refused("manifest changed during publication"));
-        }
-        ledger.observed()?;
-        ledger.close()?;
-        Ok(())
-    })();
-    if publish.is_err() && matches!(ledger.state(), State::Intent(_)) {
-        // Best effort only: failed logging leaves the original intent (or incomplete bytes)
-        // on disk. It never resets the index or claims the failed publication did not occur.
-        let _ = ledger.unknown();
-    }
-    publish
+    ledger.apply_and_observe(
+        Operation::StageProgram,
+        || -> Result<()> {
+            let mut output = open(&dir, "package.json", true)?;
+            output.write_all(&bytes)?;
+            output.sync_all()?;
+            dir.sync_all()?;
+            Ok(())
+        },
+        || {
+            let (_, observed) = read_entry(&dir, "package.json", 0o600)?;
+            if observed != bytes {
+                return Err(LabError::Refused("manifest changed during publication"));
+            }
+            Ok(())
+        },
+    )?;
+    ledger.close()?;
+    Ok(())
 }
 
 /// Opens the held directory and exact files, checks path ACLs/hashes and reads the ledger.
