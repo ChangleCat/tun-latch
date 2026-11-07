@@ -13,6 +13,7 @@ pub use native::{EventStatus, NetworkEventControl, NetworkEventMonitor, Subscrip
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nix::time::{ClockId, clock_gettime};
 use thiserror::Error;
 use tunlatch_core::status::NetworkInterface;
 
@@ -56,6 +57,9 @@ pub enum ScanError {
     /// Notifications arrived during the scan or the subscription was unavailable.
     #[error("network notification continuity unavailable or changed during scan")]
     Interrupted,
+    /// The scan consumed the allowed observation lifetime.
+    #[error("network observation expired before publication")]
+    Expired,
 }
 
 /// A scan result that carries no authority over interface ownership or lifetime.
@@ -64,7 +68,15 @@ pub struct NetworkSnapshot {
     generation: u64,
     pub(crate) token: Arc<()>,
     collected_at: Instant,
+    monitor: Option<MonitorStamp>,
     interfaces: Vec<NetworkInterface>,
+}
+
+#[derive(Debug)]
+struct MonitorStamp {
+    control: NetworkEventControl,
+    revision: u64,
+    started_at: Duration,
 }
 
 impl NetworkSnapshot {
@@ -110,7 +122,7 @@ impl NetworkObserver {
     }
 
     /// Scan while checking the subscription on both sides of enumeration.
-    /// A missing notification cannot prove a scan atomic or complete.
+    /// A notification still queued in the kernel may be observed only after the scan.
     pub fn refresh_with_monitor<F>(
         &mut self,
         monitor: &mut NetworkEventMonitor,
@@ -139,17 +151,35 @@ impl NetworkObserver {
             self.invalidate(Invalidation::Interrupted);
             return Err(ScanError::Interrupted);
         }
-        self.refresh_with(scan)?;
-        let after = control.status();
-        if after.0 != SubscriptionState::Running || after.1 != before.1 {
-            self.invalidate(Invalidation::Interrupted);
-            return Err(ScanError::Interrupted);
-        }
+        let started_at = match continuous_now() {
+            Ok(time) => time,
+            Err(error) => {
+                self.invalidate(Invalidation::ScanFailed);
+                return Err(error.into());
+            }
+        };
+        self.scan(
+            scan,
+            Some(MonitorStamp {
+                control: control.clone(),
+                revision: before.1,
+                started_at,
+            }),
+        )?;
+        self.recheck()?;
         self.current.as_ref().ok_or(ScanError::Interrupted)
     }
 
     /// Scan with an injected source. Supplied data is untrusted and cannot establish ownership.
     pub fn refresh_with<F>(&mut self, scan: F) -> Result<&NetworkSnapshot, ScanError>
+    where
+        F: FnOnce() -> Result<Vec<NetworkInterface>, nix::Error>,
+    {
+        self.scan(scan, None)?;
+        self.current.as_ref().ok_or(ScanError::Interrupted)
+    }
+
+    fn scan<F>(&mut self, scan: F, monitor: Option<MonitorStamp>) -> Result<(), ScanError>
     where
         F: FnOnce() -> Result<Vec<NetworkInterface>, nix::Error>,
     {
@@ -187,23 +217,46 @@ impl NetworkObserver {
             generation,
             token: Arc::new(()),
             collected_at: Instant::now(),
+            monitor,
             interfaces,
         });
         self.invalidation = None;
-        // The value was just assigned above.
-        self.current.as_ref().ok_or(ScanError::GenerationExhausted)
+        Ok(())
     }
 
-    /// Return the current observation only if its monotonic lifetime has not expired.
+    /// Recheck the lifetime and any recorded subscription at the time of access.
     pub fn current(&mut self) -> Option<&NetworkSnapshot> {
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.collected_at.elapsed() >= self.max_age)
-        {
-            self.invalidate(Invalidation::Expired);
-        }
+        self.recheck().ok()?;
         self.current.as_ref()
+    }
+
+    fn recheck(&mut self) -> Result<(), ScanError> {
+        let Some(snapshot) = self.current.as_ref() else {
+            return Ok(());
+        };
+        let age = if let Some(stamp) = &snapshot.monitor {
+            if stamp.control.status() != (SubscriptionState::Running, stamp.revision) {
+                self.invalidate(Invalidation::Interrupted);
+                return Err(ScanError::Interrupted);
+            }
+            continuous_now().and_then(|now| {
+                now.checked_sub(stamp.started_at)
+                    .ok_or(nix::errno::Errno::EIO)
+            })
+        } else {
+            Ok(snapshot.collected_at.elapsed())
+        };
+        match age {
+            Ok(age) if age < self.max_age => Ok(()),
+            Ok(_) => {
+                self.invalidate(Invalidation::Expired);
+                Err(ScanError::Expired)
+            }
+            Err(error) => {
+                self.invalidate(Invalidation::ScanFailed);
+                Err(error.into())
+            }
+        }
     }
 
     /// Forget cached data on any loss of continuity. Shutdown is permanent.
@@ -219,4 +272,16 @@ impl NetworkObserver {
     pub fn invalidation(&self) -> Option<Invalidation> {
         self.invalidation
     }
+}
+
+// Darwin CLOCK_MONOTONIC keeps advancing during system sleep. Measure from scan start
+// because early entries may already be old by the time native enumeration returns.
+fn continuous_now() -> Result<Duration, nix::Error> {
+    let time = clock_gettime(ClockId::CLOCK_MONOTONIC)?;
+    let seconds = u64::try_from(time.tv_sec()).map_err(|_| nix::errno::Errno::EIO)?;
+    let nanos = u32::try_from(time.tv_nsec())
+        .ok()
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .ok_or(nix::errno::Errno::EIO)?;
+    Ok(Duration::new(seconds, nanos))
 }

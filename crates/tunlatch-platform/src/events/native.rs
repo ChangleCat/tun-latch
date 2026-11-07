@@ -41,6 +41,7 @@ pub struct EventStatus {
     pub reaped: bool,
 }
 
+#[derive(Debug)]
 struct Shared {
     state: AtomicU8,
     revision: AtomicU64,
@@ -48,7 +49,7 @@ struct Shared {
 }
 
 /// Cloneable, non-owning control for a supervised notification worker.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkEventControl {
     shared: Arc<Shared>,
 }
@@ -382,10 +383,61 @@ mod tests {
                 .is_ok()
         );
         shared.state.store(FAILED, Ordering::Release);
+        assert!(observer.current().is_none());
+        assert_eq!(observer.invalidation(), Some(Invalidation::Interrupted));
         assert!(matches!(
             observer.refresh_with_monitor(&mut monitor, || Ok(Vec::new())),
             Err(ScanError::Interrupted)
         ));
+        assert!(observer.current().is_none());
+    }
+
+    #[test]
+    fn processed_notifications_invalidate_old_hints_without_another_scan() -> Result<(), ScanError>
+    {
+        use crate::identity::{HintStatus, tunnel_hints};
+        use tunlatch_core::status::NetworkInterface;
+
+        let (mut monitor, shared) = fake_monitor();
+        let mut observer = NetworkObserver::new(Duration::from_secs(10));
+        let scan = || {
+            Ok(vec![NetworkInterface {
+                name: "utun4".into(),
+                index: 19,
+                up: true,
+                loopback: false,
+                addresses: vec![],
+            }])
+        };
+        let hints = tunnel_hints(observer.refresh_with_monitor(&mut monitor, scan)?);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(
+            hints[0].check(&mut observer),
+            HintStatus::PresentOwnershipUnavailable
+        );
+        shared.revision.fetch_add(2, Ordering::AcqRel);
+        assert_eq!(hints[0].check(&mut observer), HintStatus::Invalidated);
+        assert_eq!(observer.invalidation(), Some(Invalidation::Interrupted));
+
+        let new_hints = tunnel_hints(observer.refresh_with_monitor(&mut monitor, scan)?);
+        assert_eq!(
+            new_hints[0].check(&mut observer),
+            HintStatus::PresentOwnershipUnavailable
+        );
+        monitor.request_stop();
+        assert_eq!(new_hints[0].check(&mut observer), HintStatus::Invalidated);
+        Ok(())
+    }
+
+    #[test]
+    fn monitored_scan_rejects_an_expired_result_before_publication() {
+        let (mut monitor, _) = fake_monitor();
+        let mut observer = NetworkObserver::new(Duration::ZERO);
+        assert!(matches!(
+            observer.refresh_with_monitor(&mut monitor, || Ok(Vec::new())),
+            Err(ScanError::Expired)
+        ));
+        assert_eq!(observer.invalidation(), Some(Invalidation::Expired));
         assert!(observer.current().is_none());
     }
 
