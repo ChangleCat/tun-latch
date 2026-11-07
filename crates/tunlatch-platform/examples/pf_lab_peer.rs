@@ -112,6 +112,21 @@ fn status(plan: &Plan, name: &str, detail: &str) -> serde_json::Value {
         "pf_verdict": "not_evaluated",
     })
 }
+
+fn failure_status(plan: &Plan, error: &std::io::Error) -> serde_json::Value {
+    let (stage, source) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<peer_transport::ProbeFailure>())
+        .map_or(("exchange", error), |failure| {
+            (failure.stage, &failure.source)
+        });
+    let mut output = status(plan, "unavailable", "exchange failed or timed out");
+    output["stage"] = serde_json::json!(stage);
+    output["error_kind"] = serde_json::json!(format!("{:?}", source.kind()));
+    output["errno"] = serde_json::json!(source.raw_os_error());
+    output
+}
+
 fn main() -> ExitCode {
     let args: Result<Vec<String>, _> = std::env::args_os()
         .skip(1)
@@ -143,8 +158,9 @@ fn main() -> ExitCode {
         &plan.nonce,
         Duration::from_secs(30),
         || {
-            println!("{}", status(&plan, "ready", "receiver bound"));
-            std::io::stdout().flush()
+            let mut output = std::io::stdout().lock();
+            writeln!(output, "{}", status(&plan, "ready", "receiver bound"))?;
+            output.flush()
         },
     );
     match result {
@@ -157,11 +173,8 @@ fn main() -> ExitCode {
             println!("{}", status(&plan, "completed", detail));
             ExitCode::SUCCESS
         }
-        Err(_) => {
-            eprintln!(
-                "{}",
-                status(&plan, "unavailable", "exchange failed or timed out")
-            );
+        Err(error) => {
+            eprintln!("{}", failure_status(&plan, &error));
             ExitCode::FAILURE
         }
     }
@@ -171,6 +184,41 @@ mod tests {
     use super::*;
     fn args() -> Vec<String> {
         "run --role sender --protocol tcp --source 192.0.2.1:1234 --destination 192.0.2.2:2345 --nonce 01010101010101010101010101010101 --ack CONTROLLED-PROBE".split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn structured_failure_retains_stage_and_native_errno() -> Result<(), &'static str> {
+        use std::io::Error;
+        let plan = parse(&args(), false)?.ok_or("missing plan")?;
+        let native = nix::errno::Errno::EADDRINUSE as i32;
+        let failure = peer_transport::ProbeFailure {
+            stage: "bind",
+            source: Error::from_raw_os_error(native),
+        };
+        let result = failure_status(&plan, &Error::other(failure));
+        assert_eq!(result["stage"], "bind");
+        assert_eq!(result["error_kind"], "AddrInUse");
+        assert_eq!(result["errno"], native);
+        assert_eq!(result["pf_verdict"], "not_evaluated");
+        Ok(())
+    }
+
+    #[test]
+    fn ipv6_peer_matches_address_port_and_scope_without_flow_label() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let base = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 0);
+        let observed = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 7, 0);
+        let other_scope = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1234, 0, 1);
+        let other_port = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 4321, 0, 0);
+        assert!(peer_transport::peer_matches(observed.into(), base.into()));
+        assert!(!peer_transport::peer_matches(
+            other_scope.into(),
+            base.into()
+        ));
+        assert!(!peer_transport::peer_matches(
+            other_port.into(),
+            base.into()
+        ));
     }
     #[test]
     fn requires_explicit_ack_and_ordinary_user() {

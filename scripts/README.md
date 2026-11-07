@@ -151,4 +151,4 @@ cargo build -p tunlatch-platform --example pf_lab_peer --release --locked
 /usr/bin/python3 scripts/pf-lab-peer-loopback.py --ack RUN-LOOPBACK-PROBE
 ```
 
-四项均成功时输出 `loopback_checked`。回环结果只验证对端程序的收发和记录，物理出口、跨 UID、抓包和 PF 匹配需要独立验证。
+四项均成功时输出 `loopback_checked`。失败时会报告地址族、协议、出错端、退出状态，以及可取得的阶段和系统错误码。回环结果只验证对端程序的收发和记录，物理出口、跨 UID、抓包和 PF 匹配需要独立验证。

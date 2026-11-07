@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import select
@@ -54,6 +55,56 @@ def verify(raw, role, status, protocol, source, destination, nonce):
         raise ValueError("peer result does not match this exchange")
 
 
+def failure_record(raw, role, protocol, source, destination, nonce):
+    """Accept only a bounded, matching helper failure and expose safe fields."""
+    try:
+        if len(raw) > 4096:
+            raise ValueError("oversized failure")
+        def unique_object(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError("duplicate field")
+                obj[key] = value
+            return obj
+
+        obj = json.loads(raw, object_pairs_hook=unique_object)
+        expected_keys = {"role", "status", "protocol", "source", "destination", "nonce",
+                         "effective_uid", "pf_verdict", "detail", "stage", "error_kind", "errno"}
+        if not isinstance(obj, dict) or set(obj) != expected_keys:
+            raise ValueError("invalid failure record")
+        verify(raw, role, "unavailable", protocol, source, destination, nonce)
+        stage, kind, errno = obj["stage"], obj["error_kind"], obj["errno"]
+        if not all(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_]{1,64}", value)
+                   for value in (stage, kind)):
+            raise ValueError("invalid failure fields")
+        if errno is not None and (type(errno) is not int or not -(2**31) <= errno < 2**31):
+            raise ValueError("invalid errno")
+        return f"stage={stage} error_kind={kind} errno={errno}"
+    except (ValueError, KeyError, TypeError):
+        return "missing or invalid structured failure"
+
+
+def available_bytes(stream):
+    """Read only bytes already available, without waiting for the child."""
+    os.set_blocking(stream.fileno(), False)
+    data = bytearray()
+    while len(data) <= 4096:
+        try:
+            chunk = os.read(stream.fileno(), 4097 - len(data))
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
+def child_failure(family, protocol, role, exit_code, raw, source, destination, nonce):
+    return (f"{family}/{protocol} {role} exit={exit_code}: "
+            + failure_record(raw, role, protocol, source, destination, nonce))
+
+
 def exchange(family, host, protocol):
     kind = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
     ports = free_ports(family, kind, host)
@@ -62,20 +113,51 @@ def exchange(family, host, protocol):
     nonce = secrets.token_hex(16)
     args = ["--protocol", protocol, "--source", source, "--destination", destination,
             "--nonce", nonce, "--ack", "CONTROLLED-PROBE"]
+    family_name = "ipv6" if family == socket.AF_INET6 else "ipv4"
     with subprocess.Popen([BINARY, "run", "--role", "receiver", *args],
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as receiver:
         try:
-            ready = ready_line(receiver.stdout)
-            verify(ready, "receiver", "ready", protocol, source, destination, nonce)
-            sender = subprocess.run([BINARY, "run", "--role", "sender", *args],
-                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=32, check=False)
+            def receiver_diagnostic():
+                raw = available_bytes(receiver.stderr)
+                exit_code = receiver.poll()
+                if raw or exit_code is not None:
+                    return "; " + child_failure(family_name, protocol, "receiver", exit_code,
+                                                raw, source, destination, nonce)
+                return ""
+
+            try:
+                ready = ready_line(receiver.stdout)
+                verify(ready, "receiver", "ready", protocol, source, destination, nonce)
+            except (ValueError, OSError):
+                raw = available_bytes(receiver.stderr)
+                raise ValueError(child_failure(family_name, protocol, "receiver", receiver.poll(),
+                                               raw, source, destination, nonce)) from None
+            try:
+                sender = subprocess.run([BINARY, "run", "--role", "sender", *args],
+                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=32, check=False)
+            except subprocess.TimeoutExpired:
+                raise ValueError(f"{family_name}/{protocol} sender timed out"
+                                 + receiver_diagnostic()) from None
             if sender.returncode != 0 or sender.stderr:
-                raise ValueError("sender did not receive a matching echo")
-            verify(sender.stdout, "sender", "completed", protocol, source, destination, nonce)
-            output, errors = receiver.communicate(timeout=2)
+                message = child_failure(family_name, protocol, "sender", sender.returncode,
+                                        sender.stderr, source, destination, nonce)
+                raise ValueError(message + receiver_diagnostic())
+            try:
+                verify(sender.stdout, "sender", "completed", protocol, source, destination, nonce)
+            except ValueError:
+                raise ValueError(f"{family_name}/{protocol} sender exit={sender.returncode}: invalid completion"
+                                 + receiver_diagnostic()) from None
+            try:
+                output, errors = receiver.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                raise ValueError(f"{family_name}/{protocol} receiver timed out") from None
             if receiver.returncode != 0 or errors:
-                raise ValueError("receiver did not complete")
-            verify(output, "receiver", "completed", protocol, source, destination, nonce)
+                raise ValueError(child_failure(family_name, protocol, "receiver", receiver.returncode,
+                                               errors, source, destination, nonce))
+            try:
+                verify(output, "receiver", "completed", protocol, source, destination, nonce)
+            except ValueError:
+                raise ValueError(f"{family_name}/{protocol} receiver exit={receiver.returncode}: invalid completion") from None
         finally:
             if receiver.poll() is None:
                 receiver.kill()
