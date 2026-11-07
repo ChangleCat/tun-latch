@@ -6,7 +6,8 @@ mod pf_lab_model;
 
 use std::collections::VecDeque;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 
 use pf_lab::{LabError, Operation, Result};
 use pf_lab_model::{Executor, Output};
@@ -158,6 +159,154 @@ fn durable_intent_survives_controller_loss_and_cannot_be_adopted()
     assert!(resumed.close().is_err());
     drop(resumed);
     assert!(Ledger::create(fs::File::open(directory.path())?, [3; 32], [4; 32]).is_err());
+    Ok(())
+}
+
+// Each fixture is a direct child of the test runner so failure cleanup can reap exactly those
+// processes. Marker files coordinate the request and durable intent without PF or networking.
+struct FixtureChild {
+    child: std::process::Child,
+    signalled: bool,
+}
+
+impl FixtureChild {
+    fn stop(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(status) = self.child.try_wait()? {
+            return Ok(status);
+        }
+        if !self.signalled {
+            self.child.kill()?;
+            self.signalled = true;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::other("fixture reap timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn wait_for_marker(path: &std::path::Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::other("fixture marker timed out"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[test]
+fn ledger_process_fixture() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let Some(mode) = std::env::var_os("TUNLATCH_LEDGER_FIXTURE") else {
+        return Ok(());
+    };
+    if nix::unistd::geteuid().is_root() {
+        return Err(std::io::Error::other("fixture must not run as root").into());
+    }
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("TUNLATCH_LEDGER_DIRECTORY")
+            .ok_or_else(|| std::io::Error::other("missing fixture directory"))?,
+    );
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !directory.is_absolute()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(std::io::Error::other("invalid fixture directory").into());
+    }
+    match mode.to_str() {
+        Some("controller") => {
+            fs::File::create_new(directory.join("request"))?;
+            // This marker is never created in the test: the harness kills and reaps us.
+            wait_for_marker(&directory.join("controller-release"))?;
+        }
+        Some("writer") => {
+            wait_for_marker(&directory.join("request"))?;
+            let mut ledger =
+                pf_lab::ledger::Ledger::create(fs::File::open(&directory)?, [1; 32], [2; 32])?;
+            ledger.begin(pf_lab::ledger::Operation::WriteFilter)?;
+            fs::File::create_new(directory.join("ready"))?;
+            // Model an operation that can still produce an effect after the controller dies.
+            wait_for_marker(&directory.join("finish-simulated-write"))?;
+            fs::File::create_new(directory.join("simulated-effect"))?;
+            wait_for_marker(&directory.join("writer-release"))?;
+            drop(ledger);
+        }
+        _ => return Err(std::io::Error::other("unknown fixture mode").into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn independent_writer_retains_lock_after_controller_death()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use pf_lab::bootstrap::Error;
+    use pf_lab::ledger::{Ledger, Operation as Op, State};
+
+    if nix::unistd::geteuid().is_root() {
+        return Err(std::io::Error::other("test must not run as root").into());
+    }
+    let directory = ledger_directory()?;
+    let spawn = |mode| -> std::io::Result<FixtureChild> {
+        Ok(FixtureChild {
+            child: std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "ledger_process_fixture", "--nocapture"])
+                .env_clear()
+                .env("TUNLATCH_LEDGER_FIXTURE", mode)
+                .env("TUNLATCH_LEDGER_DIRECTORY", directory.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()?,
+            signalled: false,
+        })
+    };
+    let mut writer = spawn("writer")?;
+    let mut controller = spawn("controller")?;
+    wait_for_marker(&directory.path().join("ready"))?;
+    assert!(controller.child.try_wait()?.is_none());
+    assert!(writer.child.try_wait()?.is_none());
+    assert_eq!(controller.stop()?.signal(), Some(nix::libc::SIGKILL));
+    fs::File::create_new(directory.path().join("finish-simulated-write"))?;
+    wait_for_marker(&directory.path().join("simulated-effect"))?;
+    assert!(writer.child.try_wait()?.is_none());
+    assert!(matches!(
+        Ledger::reopen(fs::File::open(directory.path())?),
+        Err(Error::System(nix::errno::Errno::EWOULDBLOCK))
+    ));
+    // Replacing the lock pathname must not bypass the lock held on the original journal.
+    let lock_path = directory.path().join("recovery.lock");
+    let original_lock = directory.path().join("original.lock");
+    fs::rename(&lock_path, &original_lock)?;
+    fs::File::create_new(&lock_path)?;
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))?;
+    assert!(matches!(
+        Ledger::reopen(fs::File::open(directory.path())?),
+        Err(Error::System(nix::errno::Errno::EWOULDBLOCK))
+    ));
+    fs::remove_file(&lock_path)?;
+    fs::rename(&original_lock, &lock_path)?;
+    assert!(writer.child.try_wait()?.is_none());
+    assert_eq!(writer.stop()?.signal(), Some(nix::libc::SIGKILL));
+    let mut reopened = Ledger::reopen(fs::File::open(directory.path())?)?;
+    assert_eq!(reopened.state(), State::Intent(Op::WriteFilter));
+    assert!(reopened.observed().is_err());
+    assert!(reopened.unknown().is_err());
+    assert!(reopened.begin(Op::WriteFilter).is_err());
+    assert!(reopened.close().is_err());
     Ok(())
 }
 

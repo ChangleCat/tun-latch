@@ -67,7 +67,7 @@ pub(crate) enum State {
 pub(crate) struct Ledger {
     directory: File,
     lock: Flock<File>,
-    journal: File,
+    journal: Flock<File>,
     session: [u8; 32],
     plan: [u8; 32],
     sequence: u64,
@@ -107,6 +107,12 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+fn open_locked(directory: &File, name: &str, create: bool) -> Result<Flock<File>> {
+    let file = open(directory, name, create)?;
+    inspect(&file, false)?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, error)| Error::System(error))
+}
+
 impl Ledger {
     /// New directory records only. An existing/missing/corrupt journal is never reset here.
     pub(crate) fn create(directory: File, session: [u8; 32], plan: [u8; 32]) -> Result<Self> {
@@ -114,12 +120,10 @@ impl Ledger {
             return Err(Error::Refused("empty journal identity"));
         }
         inspect(&directory, true)?;
-        let lock = open(&directory, "recovery.lock", true)?;
-        inspect(&lock, false)?;
-        let lock = Flock::lock(lock, FlockArg::LockExclusiveNonblock)
-            .map_err(|(_, e)| Error::System(e))?;
-        let mut journal = open(&directory, "session.journal", true)?;
-        inspect(&journal, false)?;
+        // Both paths take the locks in this order. Locking the journal itself keeps a
+        // contender out even if the separate recovery.lock name was replaced.
+        let lock = open_locked(&directory, "recovery.lock", true)?;
+        let mut journal = open_locked(&directory, "session.journal", true)?;
         let mut header = Vec::from(*MAGIC);
         header.extend(session);
         header.extend(plan);
@@ -146,14 +150,10 @@ impl Ledger {
     /// clean close is an audit observation, not permission to reopen an old execution queue.
     pub(crate) fn reopen(directory: File) -> Result<Self> {
         inspect(&directory, true)?;
-        let lock = open(&directory, "recovery.lock", false)?;
-        inspect(&lock, false)?;
-        let lock = Flock::lock(lock, FlockArg::LockExclusiveNonblock)
-            .map_err(|(_, e)| Error::System(e))?;
-        let mut journal = open(&directory, "session.journal", false)?;
-        inspect(&journal, false)?;
+        let lock = open_locked(&directory, "recovery.lock", false)?;
+        let mut journal = open_locked(&directory, "session.journal", false)?;
         let mut bytes = Vec::new();
-        Read::by_ref(&mut journal)
+        Read::by_ref(&mut *journal)
             .take(MAX_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() < HEADER
@@ -209,7 +209,7 @@ impl Ledger {
         inspect(&self.directory, true)?;
         for (name, held) in [
             ("recovery.lock", &*self.lock),
-            ("session.journal", &self.journal),
+            ("session.journal", &*self.journal),
         ] {
             inspect(held, false)?;
             let named = open(&self.directory, name, false)?;
