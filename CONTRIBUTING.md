@@ -5,6 +5,17 @@ read-only observer and offline toolset; PF enforcement and real leak protection 
 Chinese and English discussion are both welcome. Please read [README.md](README.md) and
 [SAFETY.md](SAFETY.md) before changing behavior.
 
+## Platform support
+
+- **macOS**: the full workspace, service, CLI, and TUI.
+- **Linux**: documentation, most Python helper checks, and `tunlatch-core` only.
+
+`tunlatch-platform` contains an explicit `compile_error!` on non-macOS targets, so
+`tunlatch-ipc`, `tunlatchd`, and `tunlatch` cannot be built or tested on Linux. On Linux, use
+`cargo test -p tunlatch-core --locked`; do not run `cargo test --workspace` or workspace-wide
+Clippy. A few script tests invoke macOS tools such as `/usr/bin/script`; those are verified on
+macOS CI. CI currently runs on `macos-15` only.
+
 ## Before you start
 
 - Use macOS with Rustup and the Xcode Command Line Tools.

@@ -10,6 +10,8 @@ macOS 上独立于代理客户端运行的 TUN 出口保护工具，使用 Rust�
 
 需要 macOS、Rustup 和 Xcode Command Line Tools。仓库固定 Rust 1.99.1 / Edition 2024，并提交 `Cargo.lock`。当前实测环境为 Apple Silicon、macOS 26.6.2；更低系统版本和 Intel 尚未实测，不声明最低兼容系统版本。`rust-version` 暂与固定工具链一致，不承诺支持更早的 Rust。
 
+工作区其他 crate 依赖 macOS 适配层；Linux 只能构建和测试 `tunlatch-core`，以及运行文档检查和大部分 Python 单元测试，不能构建服务、CLI 或 TUI。
+
 ```sh
 cargo build --workspace --locked
 cargo run -p tunlatch -- config check examples/config.toml
