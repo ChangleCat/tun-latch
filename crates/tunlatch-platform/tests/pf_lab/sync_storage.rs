@@ -32,6 +32,7 @@ fn record_name(name: &str) -> Result<()> {
             | "before-recovery.json"
             | "after-recovery.json"
             | "recovery-return.sha256"
+            | "unrecognized-slot.json"
     ) {
         Ok(())
     } else {

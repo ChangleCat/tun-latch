@@ -26,9 +26,10 @@ MODE = "pf-sync-manual-trial"
 HELPER_TIMEOUT = 45
 HELPER_OUTPUT_LIMIT = 4096
 # Replace only after independent review of the precise release binary.
-AUDITED_BINARY_SHA256 = "4fa655e5913edebf2515f4ab182130e3592c913e731bf4e8a468b5380f341257"
+AUDITED_BINARY_SHA256 = "3afeab571c1b43be8c26816d65747cb95e7a09a64dcb1213015583af76101365"
 # Requires a separate scope review and approval before any real PF write.
 PF_WRITES_REVIEWED = False
+OLD_PREFLIGHT_SHA256 = "4fa655e5913edebf2515f4ab182130e3592c913e731bf4e8a468b5380f341257"
 staging.SOURCE = SOURCE
 stage.SOURCE = SOURCE
 
@@ -63,7 +64,7 @@ def inspect(runner, expected):
 
 
 def invoke(runner, action):
-    if action not in ("prepare", "status", "stage", "recover"):
+    if action not in ("prepare", "status", "stage", "recover", "capture-unknown"):
         raise Refused("未知 helper 动作")
     code, output = runner.root(HELPER, action, limit=HELPER_OUTPUT_LIMIT,
                                allowed_codes=(0, 1), with_code=True, timeout=HELPER_TIMEOUT)
@@ -138,24 +139,83 @@ def status_phase(raw, *, include_baseline=False):
                     or not isinstance(obj["baseline_sha256"], str)
                     or not re.fullmatch(r"[0-9a-f]{64}", obj["baseline_sha256"])):
                 raise ValueError("invalid preflight")
-        elif (set(obj) not in (keys, keys | {"baseline_sha256"})
+        elif (set(obj) - {"slot_sha256", "slot_bytes"} not in (keys, keys | {"baseline_sha256"})
               or ("baseline_sha256" in obj and
                   (phase != "prepared" or not isinstance(obj["baseline_sha256"], str)
                    or not re.fullmatch(r"[0-9a-f]{64}", obj["baseline_sha256"])))
               or not isinstance(obj["anchor"], str)
               or not re.fullmatch(r"tunlatch-lab-[0-9a-f]{8}", obj["anchor"])
-              or obj["active_slot"] not in ("absent", "empty", "candidate")
+              or obj["active_slot"] not in ("absent", "empty", "candidate", "unrecognized")
               or (phase == "prepared" and obj["active_slot"] != "absent")):
             raise ValueError("invalid trial report")
+        if obj["active_slot"] == "unrecognized":
+            if (phase not in ("stage_intent_unsettled", "stage_outcome_unknown", "recovery_unknown")
+                    or not isinstance(obj["slot_sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", obj["slot_sha256"])
+                    or type(obj["slot_bytes"]) is not int or not 1 <= obj["slot_bytes"] <= 65536):
+                raise ValueError("invalid unknown slot metadata")
+        elif {"slot_sha256", "slot_bytes"} & obj.keys():
+            raise ValueError("unexpected unknown slot metadata")
         return obj if include_baseline else phase
     except (ValueError, UnicodeError, KeyError, TypeError) as error:
         raise Refused("helper 状态 JSON 或阶段无效；保留现场") from error
 
 
+def directory_identity(runner, path):
+    raw = runner.root("/usr/bin/stat", "-f", "%d:%i:%u:%Lp:%HT", path, limit=256)
+    match = re.fullmatch(rb"(-?[0-9]+):([0-9]+):0:700:Directory\n", raw)
+    lines = runner.root("/bin/ls", "-lde", path, limit=4096).splitlines()
+    if not match or len(lines) != 1 or not lines[0].startswith(b"drwx------ "):
+        raise Refused("归档路径的目录身份或 ACL 不合格；保留现场")
+    return match.groups()
+
+
+def replace_preflight(runner, expected):
+    if expected == OLD_PREFLIGHT_SHA256:
+        raise Refused("替换需要经独立审阅的新构建摘要")
+    # Verify the replacement and dependencies before moving the existing copy.
+    staging.source_bytes(expected)
+    stage.dependencies(runner, expected)
+
+    def check_old():
+        inspect(runner, OLD_PREFLIGHT_SHA256)
+        if runner.root("/bin/ls", "-1A", SESSION, limit=512) != (
+                b"operator-manifest.json\npf-lab-sync\n"):
+            raise Refused("旧目录成员不符合纯预检部署；保留现场")
+        raw = invoke(runner, "status")
+        if status_phase(raw) != "preflight_ready":
+            raise Refused("旧部署不是纯预检状态；保留现场")
+        return raw
+
+    before = check_old()
+    original = directory_identity(runner, SESSION)
+    if check_old() != before:
+        raise Refused("旧部署状态发生变化；保留现场")
+    raw_archive = runner.root("/usr/bin/mktemp", "-d",
+                              "/private/var/root/tunlatch-pf-sync-archive.XXXXXXXX", limit=256)
+    if not re.fullmatch(rb"/private/var/root/tunlatch-pf-sync-archive\.[A-Za-z0-9]{8}\n", raw_archive):
+        raise Refused("归档目录输出无效；保留现场")
+    archive = raw_archive.decode("ascii").strip()
+    print("旧部署归档目录（失败或中断时保留）：" + archive, file=sys.stderr, flush=True)
+    archived = archive + "/tunlatch-pf-sync"
+    if (directory_identity(runner, archive)[0] != original[0]
+            or runner.root("/bin/ls", "-1A", archive, limit=512) != b""):
+        raise Refused("归档目录不在同一文件系统或非空；保留现场：" + archive)
+    # Recheck after creating the archive, immediately before the no-clobber move.
+    if check_old() != before or directory_identity(runner, SESSION) != original:
+        raise Refused("旧部署状态发生变化；保留现场：" + archive)
+    runner.root("/bin/mv", "-n", SESSION, archived)
+    if directory_identity(runner, archived) != original:
+        raise Refused("归档目录与原部署身份不一致；保留现场：" + archive)
+    return prepare(runner, expected)
+
+
 def execute(runner, action, expected, confirm=input):
     if action == "prepare":
         return prepare(runner, expected)
-    if action not in ("status", "stage", "recover"):
+    if action == "replace-preflight":
+        return replace_preflight(runner, expected)
+    if action not in ("status", "stage", "recover", "capture-unknown"):
         raise Refused("未知动作")
     inspect(runner, expected)
     before = invoke(runner, "status")
@@ -163,10 +223,17 @@ def execute(runner, action, expected, confirm=input):
     phase = previous["phase"]
     if action == "status":
         return before
+    if action == "capture-unknown":
+        if (phase not in ("stage_intent_unsettled", "stage_outcome_unknown", "recovery_unknown")
+                or previous["active_slot"] != "unrecognized"):
+            raise Refused("当前状态不允许记录未知槽位；保留现场")
+        return invoke(runner, action)
     if action == "stage" and phase not in ("preflight_ready", "prepared"):
         raise Refused("当前阶段不允许首次暂存；保留现场")
     if action == "recover" and phase not in ("stage_intent_unsettled", "stage_outcome_unknown"):
         raise Refused("当前阶段不允许人工恢复；保留现场")
+    if action == "recover" and previous["active_slot"] == "unrecognized":
+        raise Refused("未知槽位不允许恢复；保留现场")
     print("只读状态：\n" + before.decode("utf-8", "strict"), flush=True)
     print("确认当前试验独占、原写入者已结束，独立核查期限及现场；不确定时停止。", flush=True)
     ack = "STAGE-PF-SYNC" if action == "stage" else "TAKEOVER-PF-SYNC-RECOVERY"
@@ -188,14 +255,17 @@ def execute(runner, action, expected, confirm=input):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", default="plan",
-                        choices=("plan", "prepare", "status", "stage", "recover"))
+                        choices=("plan", "prepare", "replace-preflight", "status", "stage", "recover",
+                                 "capture-unknown"))
     args = parser.parse_args()
     if os.geteuid() == 0:
         raise Refused("不要 sudo 整个程序")
     if args.action == "plan":
         actions = ["prepare", "status"] if AUDITED_BINARY_SHA256 is not None else []
+        if actions and AUDITED_BINARY_SHA256 != OLD_PREFLIGHT_SHA256:
+            actions.append("replace-preflight")
         if actions and PF_WRITES_REVIEWED:
-            actions.extend(["stage", "recover"])
+            actions.extend(["stage", "recover", "capture-unknown"])
         print(json.dumps({"directory": SESSION, "helper": HELPER,
                           "actions": actions, "pf_writes_reviewed": PF_WRITES_REVIEWED,
                           "digest_reviewed": AUDITED_BINARY_SHA256 is not None,
@@ -204,7 +274,7 @@ def main():
                                      "超时、中断或异常保留现场，特权命令树和 PF 状态可能未知。",
                                      "实验不证明实际保护或自动恢复。"]}, ensure_ascii=False, indent=2))
         return
-    if args.action in ("stage", "recover") and not PF_WRITES_REVIEWED:
+    if args.action in ("stage", "recover", "capture-unknown") and not PF_WRITES_REVIEWED:
         raise Refused("PF 写入尚未获得单独审阅与批准")
     expected = audited_digest()
     result = execute(stage.Runner(), args.action, expected)

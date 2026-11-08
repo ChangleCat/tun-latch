@@ -161,6 +161,50 @@ fn recovery_submits_empty_even_when_active_view_was_already_empty() -> TestResul
 }
 
 #[test]
+fn display_only_differences_allow_recovery_of_the_fixed_candidate() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    bound.stage(&trial)?;
+    let rules = String::from_utf8(native_filter::expected_rules(&bound.suffix)?)?
+        .replace("port = 55000", "port 55000")
+        .replace("127.0.0.1", "127.0.0.1/32");
+    *trial.slot.borrow_mut() = Slot::Active(rules.into_bytes());
+    assert_eq!(bound.status(&trial)?["active_slot"], "candidate");
+    assert_eq!(
+        bound.recover(&trial)?["phase"],
+        "recovery_readback_verified"
+    );
+    Ok(())
+}
+
+#[test]
+fn unrecognized_slot_can_be_captured_without_starting_recovery() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    bound.stage(&trial)?;
+    let observed = b"pass out quick on lo0 all\n".to_vec();
+    *trial.slot.borrow_mut() = Slot::Active(observed.clone());
+    let status = bound.status(&trial)?;
+    assert_eq!(status["active_slot"], "unrecognized");
+    assert_eq!(status["slot_sha256"], hex(&sha(&observed)));
+    assert_eq!(status["slot_bytes"], observed.len());
+    assert!(bound.recover(&trial).is_err());
+    assert!(!trial.exists("recovery")?);
+    assert_eq!(
+        bound.capture_unknown(&trial)?["phase"],
+        "unrecognized_slot_captured"
+    );
+    let capture = trial.read("unrecognized-slot.json", MAX_RECORD)?;
+    assert_eq!(capture, json_bytes(&trial.observe(&bound.anchor)?)?);
+    assert!(bound.capture_unknown(&trial).is_err());
+    assert_eq!(trial.read("unrecognized-slot.json", MAX_RECORD)?, capture);
+    assert_eq!(*trial.submissions.borrow(), ["stage"]);
+    Ok(())
+}
+
+#[test]
 fn mismatching_independent_readback_leaves_recovery_unknown_and_cannot_replay() -> TestResult {
     let trial = FakeTrial::new()?;
     prepare(&trial, NONCE)?;

@@ -39,6 +39,7 @@ enum Action {
     Status,
     Stage,
     Recover,
+    CaptureUnknown,
 }
 
 impl Action {
@@ -48,6 +49,7 @@ impl Action {
             Some("status") => Self::Status,
             Some("stage") => Self::Stage,
             Some("recover") => Self::Recover,
+            Some("capture-unknown") => Self::CaptureUnknown,
             _ => return Err(Error::Refused("expected one fixed PF trial action")),
         };
         if args.next().is_some() {
@@ -258,14 +260,15 @@ impl Bound {
         match current {
             Slot::Absent => Ok("absent"),
             Slot::Empty => Ok("empty"),
-            Slot::Active(raw)
-                if *raw
-                    == native_filter::expected_rules(&self.suffix)
-                        .map_err(|_| Error::Refused("invalid fixed rule profile"))? =>
-            {
-                Ok("candidate")
+            Slot::Active(raw) => {
+                if native_filter::matches_observed(&self.suffix, raw)
+                    .map_err(|_| Error::Refused("invalid fixed rule profile"))?
+                {
+                    Ok("candidate")
+                } else {
+                    Ok("unrecognized")
+                }
             }
-            Slot::Active(_) => Err(Error::Refused("slot contains different active rules")),
         }
     }
 
@@ -348,7 +351,11 @@ impl Bound {
             return Err(Error::Refused("stage has no recoverable intent"));
         }
         let before = self.observe(trial)?;
-        self.slot(&before.slot)?;
+        if self.slot(&before.slot)? == "unrecognized" {
+            return Err(Error::Refused(
+                "slot contains unrecognized active rules; preserve it",
+            ));
+        }
         let dir = trial.subdir("recovery", true)?;
         let data = json_bytes(&before)?;
         trial.write("before-recovery.json", &data)?;
@@ -415,12 +422,48 @@ impl Bound {
         };
         let snapshot = self.observe(trial)?;
         let slot = self.slot(&snapshot.slot)?;
-        if phase == "recovery_readback_recorded" && slot == "candidate" {
+        if phase == "recovery_readback_recorded" && matches!(snapshot.slot, Slot::Active(_)) {
             return Err(Error::Refused(
                 "active filter appeared after recorded recovery",
             ));
         }
-        Ok(report(&self.anchor, phase, slot))
+        Ok(self.slot_report(phase, slot, &snapshot.slot))
+    }
+
+    fn capture_unknown(&self, trial: &impl Trial) -> Result<Value> {
+        let stage = self.reopen(trial, "stage", "before-stage.json")?;
+        if !matches!(
+            stage.state(),
+            State::Intent(Operation::WriteFilter) | State::Unknown(Operation::WriteFilter)
+        ) {
+            return Err(Error::Refused("stage has no unsettled intent"));
+        }
+        if trial.exists("recovery")?
+            && self
+                .reopen(trial, "recovery", "before-recovery.json")?
+                .state()
+                == State::Closed
+        {
+            return Err(Error::Refused("recorded recovery is already closed"));
+        }
+        let snapshot = self.observe(trial)?;
+        if self.slot(&snapshot.slot)? != "unrecognized" {
+            return Err(Error::Refused("no unrecognized active rules to capture"));
+        }
+        stage.check_named_objects()?;
+        trial.write("unrecognized-slot.json", &json_bytes(&snapshot)?)?;
+        Ok(self.slot_report("unrecognized_slot_captured", "unrecognized", &snapshot.slot))
+    }
+
+    fn slot_report(&self, phase: &str, label: &str, slot: &Slot) -> Value {
+        let mut result = report(&self.anchor, phase, label);
+        if label == "unrecognized"
+            && let Slot::Active(raw) = slot
+        {
+            result["slot_sha256"] = json!(hex(&sha(raw)));
+            result["slot_bytes"] = json!(raw.len());
+        }
+        result
     }
 }
 
@@ -451,6 +494,7 @@ fn run(action: Action) -> Result<Value> {
         Action::Status => bound.status(&trial),
         Action::Stage => bound.stage(&trial),
         Action::Recover => bound.recover(&trial),
+        Action::CaptureUnknown => bound.capture_unknown(&trial),
     }
 }
 

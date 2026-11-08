@@ -156,6 +156,15 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 首次预检应得到 `phase=preflight_ready` 和 `anchor=not_allocated`。它不会占用规则槽或开始暂存期限。准备失败或超时后保留固定目录。若已成功暂存 helper，可以用 `status` 只读检查；`prepare` 会拒绝已有目录。当前脚本的 `stage` 和 `recover` 关闭，实际 PF 写入要另行审阅。
 
+已安装过本项目指定的旧预检构建时，用 `replace-preflight`。它只接受当前启动、旧摘要、目录内恰好两个部署文件及稳定的 `preflight_ready`，将旧目录整体移入同一文件系统上的 root 私有归档，再部署新构建并只读复查。失败时保留旧归档和现有固定目录，终端会给出归档路径。
+
+```sh
+/usr/bin/sudo -v && /usr/bin/python3 scripts/pf-lab-sync.py replace-preflight
+/usr/bin/python3 scripts/pf-lab-sync.py status
+```
+
+当前规则核对会接受固定四条规则的等价地址及端口显示。其余活动规则报告为 `unrecognized` 并拒绝清空。后续获准的写入实验可通过 `capture-unknown` 保存一次受保护的原始观察，该动作仅查询 PF。
+
 ## TCP 与 UDP 对端预检
 
 `pf_lab_peer` 是普通用户实验辅助程序。两端使用同一组数字地址、端口、协议和一次性 nonce。接收端报告 `ready` 后可启动发送端。发送端的 `completed` 表示收到了匹配的回显。超时或不一致均失败，保护状态始终为 `not_evaluated`。实机外部地址须来自已确认的受控实验环境。
