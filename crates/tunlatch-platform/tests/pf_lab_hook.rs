@@ -1,10 +1,22 @@
 //! Complete offline lifecycle and injected failures. No native PF adapter is linked.
 #[path = "pf_lab/bootstrap.rs"]
 mod bootstrap;
+#[path = "pf_lab/driver.rs"]
+mod driver;
 #[path = "pf_lab/hook.rs"]
 mod hook;
+#[allow(dead_code)] // Only the fixed hook journal operations are exercised by this target.
+#[path = "pf_lab/ledger.rs"]
+mod ledger;
+#[allow(dead_code)] // Reuse the same ACL check as the deployed single-slot helper.
+#[path = "pf_lab/native_files.rs"]
+mod native_files;
 #[path = "pf_lab/preflight.rs"]
 mod preflight;
+#[path = "pf_lab/root_hook_readback.rs"]
+mod root_hook_readback;
+#[path = "pf_lab/root_hook_recovery.rs"]
+mod root_hook_recovery;
 
 use hook::{Boundary, Error, Filter, Object, Phase, Scene, Session, Window};
 use preflight::{Anchor, CheckedBoundary, Output, Query, ReadBoundary};

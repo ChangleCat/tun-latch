@@ -312,6 +312,23 @@ impl Ledger {
     pub(crate) fn identity(&self) -> ([u8; 32], [u8; 32]) {
         (self.session, self.plan)
     }
+
+    /// Requires one intent, its matching observation, and close in a reopened journal.
+    #[cfg(test)]
+    #[allow(dead_code)] // Used only by the offline root hook test target.
+    pub(crate) fn is_single_closed_operation(&self, operation: Operation) -> Result<bool> {
+        use std::os::unix::fs::FileExt;
+
+        if self.writable || self.state() != State::Closed || self.sequence != 3 {
+            return Ok(false);
+        }
+        self.check_named_objects()?;
+        // Reopen has checked the entire chain and all transitions. Inspect its first intent.
+        let mut intent = [0; 2];
+        self.journal
+            .read_exact_at(&mut intent, (HEADER + 8) as u64)?;
+        Ok(intent == [1, operation as u8])
+    }
 }
 
 fn transition(state: State, phase: u8, operation: u8) -> Result<State> {
