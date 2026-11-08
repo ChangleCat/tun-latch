@@ -173,6 +173,18 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 /usr/bin/sudo -v && /usr/bin/python3 scripts/pf-lab-sync-evidence.py audit
 ```
 
+## 同步写入者异常退出的独立预检
+
+`pf-lab-sync-fault.py` 先确认前一次试验已关闭、原槽缺席，再将本次已核对构建部署到独立的 `/private/var/root/tunlatch-pf-sync-fault`，并只读确认相同 PF 基线。旧部署和审计记录保留。以普通用户在同一终端执行。
+
+```sh
+/usr/bin/python3 scripts/pf-lab-sync-fault.py plan
+/usr/bin/sudo -v && /usr/bin/python3 scripts/pf-lab-sync-fault.py prepare
+/usr/bin/python3 scripts/pf-lab-sync-fault.py status
+```
+
+预检通过时应返回 `preflight_ready` 和 `not_allocated`。实际故障动作在同步提交返回后、发回执前由写入者请求终止自身，父进程须获得 SIGKILL 的直接等待结果及受保护见证。当前写入开关关闭。超时、记录缺失、规则不明或旧状态变化时保留现场；等待超时不能推断子进程已经退出。
+
 ## TCP 与 UDP 对端预检
 
 `pf_lab_peer` 是普通用户实验辅助程序。两端使用同一组数字地址、端口、协议和一次性 nonce。接收端报告 `ready` 后可启动发送端。发送端的 `completed` 表示收到了匹配的回显。超时或不一致均失败，保护状态始终为 `not_evaluated`。实机外部地址须来自已确认的受控实验环境。

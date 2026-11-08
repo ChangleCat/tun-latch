@@ -141,6 +141,10 @@ def invoke(runner, action):
         raise Refused("未知 helper 动作")
     code, output = runner.root(HELPER, action, limit=HELPER_OUTPUT_LIMIT,
                                allowed_codes=(0, 1), with_code=True, timeout=HELPER_TIMEOUT)
+    return checked_helper_output(code, output)
+
+
+def checked_helper_output(code, output):
     if code == 0:
         return output
 

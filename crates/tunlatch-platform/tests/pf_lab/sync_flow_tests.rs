@@ -12,34 +12,46 @@ type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 struct FakeTrial {
     dir: tempfile::TempDir,
+    mode: &'static str,
     slot: RefCell<Slot>,
     boot: RefCell<String>,
     submissions: RefCell<Vec<&'static str>>,
     ignore_empty: Cell<bool>,
+    fail_fault_ready: Cell<bool>,
     ticks: RefCell<VecDeque<u64>>,
     current_tick: Cell<u64>,
 }
 impl FakeTrial {
     fn new() -> Result<Self> {
+        Self::new_in_mode(MODE)
+    }
+
+    fn new_in_mode(mode: &'static str) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
         let this = Self {
             dir,
+            mode,
             slot: RefCell::new(Slot::Absent),
             boot: RefCell::new(BOOT.to_owned()),
             submissions: RefCell::new(Vec::new()),
             ignore_empty: Cell::new(false),
+            fail_fault_ready: Cell::new(false),
             ticks: RefCell::new(VecDeque::new()),
             current_tick: Cell::new(1000),
         };
         this.write(
             "operator-manifest.json",
-            &json_bytes(&json!({"boot": BOOT, "mode": MODE, "sha256": hex(&[9; 32])}))?,
+            &json_bytes(&json!({"boot": BOOT, "mode": mode, "sha256": hex(&[9; 32])}))?,
         )?;
         Ok(this)
     }
 }
 impl Trial for FakeTrial {
+    fn mode(&self) -> &'static str {
+        self.mode
+    }
+
     fn program_digest(&self) -> Result<[u8; 32]> {
         Ok([9; 32])
     }
@@ -67,6 +79,11 @@ impl Trial for FakeTrial {
         Ok(())
     }
     fn subdir(&self, name: &str, create: bool) -> Result<File> {
+        if name == "fault-ready" && create && self.fail_fault_ready.get() {
+            return Err(Error::Refused(
+                "injected failure before readiness publication",
+            ));
+        }
         let path = self.dir.path().join(name);
         if create {
             fs::create_dir(&path)?;
@@ -249,5 +266,119 @@ fn deadline_crossed_during_preflight_refuses_before_submission() -> TestResult {
         bound.reopen(&trial, "stage", "before-stage.json")?.state(),
         State::Unknown(Operation::WriteFilter)
     );
+    Ok(())
+}
+
+#[test]
+fn fault_recovery_requires_the_direct_sigkill_and_bound_witness() -> TestResult {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    for killed in [true, false] {
+        let trial = FakeTrial::new_in_mode(FAULT_MODE)?;
+        prepare(&trial, NONCE)?;
+        let bound = Bound::load(&trial)?;
+        let result = fault::launch(&bound, &trial, || {
+            let writer = fault::write_candidate(&bound, &trial)?;
+            assert!(bound.recover(&trial).is_err());
+            assert_eq!(writer.state(), State::Intent(Operation::WriteFilter));
+            drop(writer);
+            Ok(ExitStatus::from_raw(if killed {
+                nix::libc::SIGKILL
+            } else {
+                137 << 8
+            }))
+        });
+        if killed {
+            assert_eq!(result?["phase"], "fault_writer_reaped");
+            let status = bound.status(&trial)?;
+            assert_eq!(status["phase"], "fault_writer_reaped");
+            assert_eq!(status["active_slot"], "candidate");
+            assert_eq!(
+                bound.recover(&trial)?["phase"],
+                "recovery_readback_verified"
+            );
+            assert_eq!(*trial.submissions.borrow(), ["stage", "empty"]);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(bound.status(&trial)?["phase"], "fault_unconfirmed");
+            assert!(bound.recover(&trial).is_err());
+            assert!(!trial.exists("recovery")?);
+            assert_eq!(*trial.submissions.borrow(), ["stage"]);
+        }
+        assert!(
+            fault::launch(&bound, &trial, || Err(Error::Refused("unexpected replay"))).is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn missing_or_changed_fault_evidence_never_allows_empty_submit() -> TestResult {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    let trial = FakeTrial::new_in_mode(FAULT_MODE)?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    let result = fault::launch(&bound, &trial, || {
+        let writer = fault::write_candidate(&bound, &trial)?;
+        drop(writer);
+        fs::write(
+            trial.dir.path().join("fault-before-signal.json"),
+            b"different stage",
+        )?;
+        Ok(ExitStatus::from_raw(nix::libc::SIGKILL))
+    });
+    assert!(result.is_err());
+    assert!(!trial.exists("fault-reaped.json")?);
+    assert_eq!(bound.status(&trial)?["phase"], "fault_unconfirmed");
+    assert!(bound.recover(&trial).is_err());
+    assert_eq!(*trial.submissions.borrow(), ["stage"]);
+    Ok(())
+}
+
+#[test]
+fn complete_witness_without_ready_marker_is_not_a_reaped_fault() -> TestResult {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    let trial = FakeTrial::new_in_mode(FAULT_MODE)?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    trial.fail_fault_ready.set(true);
+    let result = fault::launch(&bound, &trial, || {
+        assert!(fault::write_candidate(&bound, &trial).is_err());
+        assert!(trial.exists("fault-before-signal.json")?);
+        assert!(!trial.exists("fault-ready")?);
+        Ok(ExitStatus::from_raw(nix::libc::SIGKILL))
+    });
+    assert!(result.is_err());
+    assert_eq!(bound.status(&trial)?["phase"], "fault_unconfirmed");
+    assert!(bound.recover(&trial).is_err());
+    assert_eq!(*trial.submissions.borrow(), ["stage"]);
+    Ok(())
+}
+
+#[test]
+fn late_writer_after_lost_parent_wait_cannot_authorize_recovery() -> TestResult {
+    let trial = FakeTrial::new_in_mode(FAULT_MODE)?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    assert!(
+        fault::launch(&bound, &trial, || Err(Error::Refused(
+            "wait outcome unknown"
+        )))
+        .is_err()
+    );
+    assert_eq!(bound.status(&trial)?["phase"], "fault_unconfirmed");
+    let writer = fault::write_candidate(&bound, &trial)?;
+    assert!(bound.recover(&trial).is_err());
+    drop(writer);
+    assert!(trial.exists("fault-ready")?);
+    assert!(!trial.exists("fault-reaped.json")?);
+    assert_eq!(bound.status(&trial)?["phase"], "fault_unconfirmed");
+    assert!(bound.recover(&trial).is_err());
+    assert_eq!(*trial.submissions.borrow(), ["stage"]);
     Ok(())
 }

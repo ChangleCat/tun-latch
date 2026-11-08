@@ -19,10 +19,12 @@ use super::native_files::{NativePathInspection, ObservedChain};
 const BASE: &str = "/private/var/root/tunlatch-pf-sync";
 const PROGRAM: &str = "pf-lab-sync";
 const EXECUTABLE: &str = "/private/var/root/tunlatch-pf-sync/pf-lab-sync";
+const FAULT_BASE: &str = "/private/var/root/tunlatch-pf-sync-fault";
+const FAULT_EXECUTABLE: &str = "/private/var/root/tunlatch-pf-sync-fault/pf-lab-sync";
 const MAX_PROGRAM: usize = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 1024 * 1024;
 
-fn record_name(name: &str) -> Result<()> {
+fn record_name(name: &str, fault: bool) -> Result<()> {
     if matches!(
         name,
         "operator-manifest.json"
@@ -33,7 +35,12 @@ fn record_name(name: &str) -> Result<()> {
             | "after-recovery.json"
             | "recovery-return.sha256"
             | "unrecognized-slot.json"
-    ) {
+    ) || (fault
+        && matches!(
+            name,
+            "fault-launch.json" | "fault-before-signal.json" | "fault-reaped.json"
+        ))
+    {
         Ok(())
     } else {
         Err(Error::Refused("unsupported record name"))
@@ -99,26 +106,52 @@ fn read_bounded(file: &File, max: usize, mode: u32) -> Result<Vec<u8>> {
 pub(crate) struct Storage {
     chain: ObservedChain,
     program: File,
+    fault: bool,
 }
 
 impl Storage {
     pub(crate) fn open() -> Result<Self> {
-        if !nix::unistd::geteuid().is_root() || std::env::current_exe()? != Path::new(EXECUTABLE) {
+        if !nix::unistd::geteuid().is_root() {
             return Err(Error::Refused("requires root and fixed executable path"));
         }
-        let chain = ObservedChain::open(Path::new(BASE))?;
+        let executable = std::env::current_exe()?;
+        let fault = if executable == Path::new(EXECUTABLE) {
+            false
+        } else if executable == Path::new(FAULT_EXECUTABLE) {
+            true
+        } else {
+            return Err(Error::Refused("requires root and fixed executable path"));
+        };
+        let base = if fault { FAULT_BASE } else { BASE };
+        let chain = ObservedChain::open(Path::new(base))?;
         checked(chain.directory()?, 0o700, true)?;
         let program = open_file(chain.directory()?, PROGRAM, OFlag::O_RDONLY, 0)?;
         checked(&program, 0o500, false)?;
-        let result = Self { chain, program };
+        let result = Self {
+            chain,
+            program,
+            fault,
+        };
         result.recheck()?;
         Ok(result)
+    }
+
+    pub(crate) fn is_fault(&self) -> bool {
+        self.fault
+    }
+
+    pub(crate) fn executable(&self) -> &'static str {
+        if self.fault {
+            FAULT_EXECUTABLE
+        } else {
+            EXECUTABLE
+        }
     }
 
     pub(crate) fn recheck(&self) -> Result<()> {
         self.chain.recheck()?;
         let old = checked(self.chain.directory()?, 0o700, true)?;
-        let fresh = ObservedChain::open(Path::new(BASE))?;
+        let fresh = ObservedChain::open(Path::new(if self.fault { FAULT_BASE } else { BASE }))?;
         let new = checked(fresh.directory()?, 0o700, true)?;
         if identity(&old) != identity(&new) {
             return Err(Error::Refused("protected directory replaced"));
@@ -148,8 +181,8 @@ impl Storage {
     }
 
     pub(crate) fn exists(&self, name: &str) -> Result<bool> {
-        if !matches!(name, "stage" | "recovery") {
-            record_name(name)?;
+        if !(matches!(name, "stage" | "recovery") || self.fault && name == "fault-ready") {
+            record_name(name, self.fault)?;
         }
         self.recheck()?;
         match fstatat(self.chain.directory()?, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
@@ -160,7 +193,7 @@ impl Storage {
     }
 
     pub(crate) fn read(&self, name: &str, max: usize) -> Result<Vec<u8>> {
-        record_name(name)?;
+        record_name(name, self.fault)?;
         if max > MAX_RECORD {
             return Err(Error::Refused("record limit excessive"));
         }
@@ -179,7 +212,7 @@ impl Storage {
     }
 
     pub(crate) fn write(&self, name: &str, data: &[u8]) -> Result<()> {
-        record_name(name)?;
+        record_name(name, self.fault)?;
         if data.len() > MAX_RECORD {
             return Err(Error::Refused("record limit excessive"));
         }
@@ -203,7 +236,7 @@ impl Storage {
     }
 
     pub(crate) fn subdir(&self, name: &str, create: bool) -> Result<File> {
-        if !matches!(name, "stage" | "recovery") {
+        if !(matches!(name, "stage" | "recovery") || self.fault && name == "fault-ready") {
             return Err(Error::Refused("unsupported subdirectory"));
         }
         self.recheck()?;

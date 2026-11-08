@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 #[path = "../tests/pf_lab/bootstrap.rs"]
 mod bootstrap;
+#[path = "../tests/pf_lab/sync_fault.rs"]
+mod fault;
 #[cfg(test)]
 #[path = "../tests/pf_lab/sync_flow_tests.rs"]
 mod flow_tests;
@@ -32,6 +34,7 @@ use sync_storage::Storage;
 const MAX_RECORD: usize = 1024 * 1024;
 const STAGE_WINDOW_SECS: u64 = 300;
 const MODE: &str = "pf-sync-manual-trial";
+const FAULT_MODE: &str = "pf-sync-fault-after-submit";
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -39,6 +42,9 @@ enum Action {
     Status,
     Stage,
     Recover,
+    StageFault,
+    StageFaultWriter,
+    RecoverFault,
     CaptureUnknown,
 }
 
@@ -49,6 +55,9 @@ impl Action {
             Some("status") => Self::Status,
             Some("stage") => Self::Stage,
             Some("recover") => Self::Recover,
+            Some("stage-fault") => Self::StageFault,
+            Some("stage-fault-writer") => Self::StageFaultWriter,
+            Some("recover-fault") => Self::RecoverFault,
             Some("capture-unknown") => Self::CaptureUnknown,
             _ => return Err(Error::Refused("expected one fixed PF trial action")),
         };
@@ -62,6 +71,7 @@ impl Action {
 }
 
 trait Trial {
+    fn mode(&self) -> &'static str;
     fn program_digest(&self) -> Result<[u8; 32]>;
     fn recheck(&self) -> Result<()>;
     fn exists(&self, name: &str) -> Result<bool>;
@@ -75,6 +85,10 @@ trait Trial {
 }
 
 impl Trial for Storage {
+    fn mode(&self) -> &'static str {
+        if self.is_fault() { FAULT_MODE } else { MODE }
+    }
+
     fn program_digest(&self) -> Result<[u8; 32]> {
         self.program_digest()
     }
@@ -157,7 +171,7 @@ fn operator(trial: &impl Trial) -> Result<(String, [u8; 32])> {
         .map_err(io::Error::other)?;
     let boot = trial.boot()?;
     let helper = trial.program_digest()?;
-    if manifest.mode != MODE || manifest.boot != boot || manifest.sha256 != hex(&helper) {
+    if manifest.mode != trial.mode() || manifest.boot != boot || manifest.sha256 != hex(&helper) {
         return Err(Error::Refused(
             "operator manifest does not match this boot and executable",
         ));
@@ -173,6 +187,9 @@ fn fresh_observation(trial: &impl Trial, nonce: &[u8; 32]) -> Result<(String, Sn
         if trial.exists(name)? {
             return Err(Error::Refused("trial directory has prior records"));
         }
+    }
+    if trial.mode() == FAULT_MODE && fault::has_records(trial)? {
+        return Err(Error::Refused("fault trial already has a protected record"));
     }
     let anchor = format!("tunlatch-lab-{}", hex(&nonce[..4]));
     let first = trial.observe(&anchor)?;
@@ -307,7 +324,7 @@ impl Bound {
         Ok(())
     }
 
-    fn stage(&self, trial: &impl Trial) -> Result<Value> {
+    fn submit_candidate(&self, trial: &impl Trial) -> Result<Ledger> {
         self.check_stage_window(trial)?;
         if trial.exists("stage")? || trial.exists("recovery")? {
             return Err(Error::Refused("stage attempt already consumed"));
@@ -330,6 +347,11 @@ impl Bound {
             let _ = ledger.unknown();
             return Err(error);
         }
+        Ok(ledger)
+    }
+
+    fn stage(&self, trial: &impl Trial) -> Result<Value> {
+        let _writer = self.submit_candidate(trial)?;
         // Intent deliberately remains unsettled. The agreed controlled stop is after
         // the synchronous call returns and before the first post-submit PF query.
         Ok(report(
@@ -350,6 +372,9 @@ impl Bound {
         ) {
             return Err(Error::Refused("stage has no recoverable intent"));
         }
+        if trial.mode() == FAULT_MODE {
+            fault::verify_reaped(self, trial, &stage)?;
+        }
         let before = self.observe(trial)?;
         if self.slot(&before.slot)? == "unrecognized" {
             return Err(Error::Refused(
@@ -367,6 +392,9 @@ impl Bound {
             || {
                 self.recheck_before_write(trial, &before)?;
                 stage.check_named_objects()?;
+                if trial.mode() == FAULT_MODE {
+                    fault::verify_reaped(self, trial, &stage)?;
+                }
                 // A read of active empty cannot rule out old inactive rules.
                 trial.submit(&self.suffix, Replacement::Empty)
             },
@@ -402,6 +430,10 @@ impl Bound {
         let phase = if trial.exists("recovery")? {
             let recovered = self.reopen(trial, "recovery", "before-recovery.json")?;
             if recovered.state() == State::Closed {
+                if trial.mode() == FAULT_MODE {
+                    let stage = self.reopen(trial, "stage", "before-stage.json")?;
+                    fault::verify_reaped(self, trial, &stage)?;
+                }
                 let after = trial.read("after-recovery.json", MAX_RECORD)?;
                 if trial.read("recovery-return.sha256", 65)? != receipt_digest(&after) {
                     return Err(Error::Refused("recovery readback record changed"));
@@ -412,11 +444,21 @@ impl Bound {
             }
         } else if trial.exists("stage")? {
             let staged = self.reopen(trial, "stage", "before-stage.json")?;
-            match staged.state() {
-                State::Intent(Operation::WriteFilter) => "stage_intent_unsettled",
-                State::Unknown(Operation::WriteFilter) => "stage_outcome_unknown",
-                _ => "stage_consumed_without_intent",
+            if trial.mode() == FAULT_MODE {
+                if fault::verify_reaped(self, trial, &staged).is_ok() {
+                    "fault_writer_reaped"
+                } else {
+                    "fault_unconfirmed"
+                }
+            } else {
+                match staged.state() {
+                    State::Intent(Operation::WriteFilter) => "stage_intent_unsettled",
+                    State::Unknown(Operation::WriteFilter) => "stage_outcome_unknown",
+                    _ => "stage_consumed_without_intent",
+                }
             }
+        } else if trial.mode() == FAULT_MODE && fault::has_records(trial)? {
+            "fault_unconfirmed"
         } else {
             "prepared"
         };
@@ -478,6 +520,18 @@ fn report(anchor: &str, phase: &str, slot: &str) -> Value {
 
 fn run(action: Action) -> Result<Value> {
     let trial = Storage::open()?;
+    if matches!(
+        (trial.is_fault(), action),
+        (true, Action::Stage | Action::Recover)
+            | (
+                false,
+                Action::StageFault | Action::StageFaultWriter | Action::RecoverFault
+            )
+    ) {
+        return Err(Error::Refused(
+            "action does not match the protected trial layout",
+        ));
+    }
     if matches!(action, Action::Prepare)
         || (matches!(action, Action::Status) && !trial.exists("session.json")?)
     {
@@ -494,6 +548,13 @@ fn run(action: Action) -> Result<Value> {
         Action::Status => bound.status(&trial),
         Action::Stage => bound.stage(&trial),
         Action::Recover => bound.recover(&trial),
+        Action::StageFault => fault::launch(&bound, &trial, || fault::spawn_writer(&trial)),
+        Action::StageFaultWriter => {
+            let _writer = fault::write_candidate(&bound, &trial)?;
+            fault::terminate_self()?;
+            Err(Error::Refused("fault writer unexpectedly survived SIGKILL"))
+        }
+        Action::RecoverFault => bound.recover(&trial),
         Action::CaptureUnknown => bound.capture_unknown(&trial),
     }
 }
