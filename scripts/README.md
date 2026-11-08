@@ -167,6 +167,12 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 获准的单槽实验由本机忽略目录 `docs/.pf-lab-sync/` 保存批准、暂存尝试及正常返回记录。脚本核对已部署 helper、当前启动和预检基线。暂存启动后，记录原样保留。若缺少同一槽的正常返回，操作脚本只允许只读状态检查和符合条件的未知证据采集。启用本机单次批准后，脚本会拒绝重新部署或替换 helper。
 
+正常完成的同步单槽试验可用 `pf-lab-sync-evidence.py audit` 核对受保护的阶段观察、已关闭日志和当前只读状态。使用同一启动的现有部署，在本机终端认证后以普通用户运行脚本。输出只有摘要和阶段信息，原始规则留在 root 私有目录。
+
+```sh
+/usr/bin/sudo -v && /usr/bin/python3 scripts/pf-lab-sync-evidence.py audit
+```
+
 ## TCP 与 UDP 对端预检
 
 `pf_lab_peer` 是普通用户实验辅助程序。两端使用同一组数字地址、端口、协议和一次性 nonce。接收端报告 `ready` 后可启动发送端。发送端的 `completed` 表示收到了匹配的回显。超时或不一致均失败，保护状态始终为 `not_evaluated`。实机外部地址须来自已确认的受控实验环境。
