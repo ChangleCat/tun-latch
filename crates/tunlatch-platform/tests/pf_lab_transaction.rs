@@ -1,6 +1,8 @@
 //! Transaction fault injections distinguish instrumented doubles from opaque real submission.
 #[path = "pf_lab/driver.rs"]
 mod driver;
+#[path = "pf_lab/native_filter.rs"]
+mod native_filter;
 #[path = "pf_lab/transaction.rs"]
 mod transaction;
 use driver::{Error, Guard, Identity, Observation, Result};
