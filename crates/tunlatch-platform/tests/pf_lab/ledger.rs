@@ -205,7 +205,7 @@ impl Ledger {
         Ok(ledger)
     }
 
-    fn check_named_objects(&self) -> Result<()> {
+    pub(crate) fn check_named_objects(&self) -> Result<()> {
         inspect(&self.directory, true)?;
         for (name, held) in [
             ("recovery.lock", &*self.lock),

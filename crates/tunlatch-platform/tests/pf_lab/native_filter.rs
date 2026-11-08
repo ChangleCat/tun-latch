@@ -7,7 +7,7 @@ use pfctl::{
 };
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+pub(crate) enum Error {
     #[error("expected an eight-character ASCII alphanumeric slot suffix")]
     InvalidSuffix,
     #[error(transparent)]
@@ -15,15 +15,20 @@ enum Error {
 }
 
 #[derive(Clone, Copy)]
-enum Replacement {
+pub(crate) enum Replacement {
     Stage,
     Empty,
 }
 
-fn transaction(suffix: &str, replacement: Replacement) -> Result<Transaction, Error> {
+fn check_suffix(suffix: &str) -> Result<(), Error> {
     if suffix.len() != 8 || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return Err(Error::InvalidSuffix);
     }
+    Ok(())
+}
+
+pub(crate) fn transaction(suffix: &str, replacement: Replacement) -> Result<Transaction, Error> {
+    check_suffix(suffix)?;
     let anchor = format!("tunlatch-lab-{suffix}");
     let mut rules = Vec::new();
     if matches!(replacement, Replacement::Stage) {
@@ -57,11 +62,30 @@ fn transaction(suffix: &str, replacement: Replacement) -> Result<Transaction, Er
     Ok(transaction)
 }
 
+/// Exact canonical text expected from the independent system rule reader.
+pub(crate) fn expected_rules(suffix: &str) -> Result<Vec<u8>, Error> {
+    check_suffix(suffix)?;
+    let mut rules = String::new();
+    for (family, address) in [("inet", "127.0.0.1"), ("inet6", "::1")] {
+        for protocol in ["tcp", "udp"] {
+            rules.push_str(&format!(
+                "block drop out quick on lo0 {family} proto {protocol} from {address} to {address} \
+                 port = 55000 label \"tunlatch-lab:{suffix}\"\n"
+            ));
+        }
+    }
+    Ok(rules.into_bytes())
+}
+
 #[test]
 fn constructs_fixed_stage_and_empty_transactions_without_submitting() -> Result<(), Error> {
     let stage = transaction("Abc123XY", Replacement::Stage)?;
     let empty = transaction("Abc123XY", Replacement::Empty)?;
     let _commit: fn(Transaction) -> pfctl::Result<()> = Transaction::commit;
+    assert_eq!(
+        expected_rules("Abc123XY")?.split(|b| *b == b'\n').count(),
+        5
+    );
     drop((stage, empty));
     Ok(())
 }

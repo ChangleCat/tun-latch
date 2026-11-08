@@ -51,7 +51,12 @@ class Runner:
         # A retained handle does not prove its privileged descendants have exited.
         self.children = []
 
-    def call(self, argv, data=b"", limit=MAX_RESULT, allowed_codes=(0,), with_code=False):
+    def call(self, argv, data=b"", limit=MAX_RESULT, allowed_codes=(0,), with_code=False,
+             timeout=None):
+        if timeout is None:
+            timeout = COMMAND_TIME
+        if not isinstance(timeout, (int, float)) or not 0 < timeout <= 45:
+            raise Refused("命令等待预算无效")
         if time.monotonic() >= self.deadline:
             raise Refused("总等待预算已耗尽；保留现场，进程状态未知")
         p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -61,7 +66,7 @@ class Runner:
         sel = selectors.DefaultSelector()
         result = {"out": bytearray(), "err": bytearray()}
         pos = 0
-        until = min(self.deadline, time.monotonic() + COMMAND_TIME)
+        until = min(self.deadline, time.monotonic() + timeout)
         try:
             for stream in (p.stdin, p.stdout, p.stderr):
                 os.set_blocking(stream.fileno(), False)
@@ -112,8 +117,9 @@ class Runner:
                 if not stream.closed:
                     stream.close()
 
-    def root(self, *argv, data=b"", limit=MAX_RESULT, allowed_codes=(0,), with_code=False):
-        return self.call(ROOT + list(argv), data, limit, allowed_codes, with_code)
+    def root(self, *argv, data=b"", limit=MAX_RESULT, allowed_codes=(0,), with_code=False,
+             timeout=None):
+        return self.call(ROOT + list(argv), data, limit, allowed_codes, with_code, timeout)
 
 
 def session_path(value):

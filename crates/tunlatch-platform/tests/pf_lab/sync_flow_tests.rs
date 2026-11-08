@@ -1,0 +1,209 @@
+//! End-to-end flow tests on ordinary temporary files and simulated PF observations.
+use super::*;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+const BOOT: &str = "01234567-89ab-cdef-0123-456789abcdef";
+const NONCE: [u8; 32] = [7; 32];
+
+type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+struct FakeTrial {
+    dir: tempfile::TempDir,
+    slot: RefCell<Slot>,
+    boot: RefCell<String>,
+    submissions: RefCell<Vec<&'static str>>,
+    ignore_empty: Cell<bool>,
+    ticks: RefCell<VecDeque<u64>>,
+    current_tick: Cell<u64>,
+}
+impl FakeTrial {
+    fn new() -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let this = Self {
+            dir,
+            slot: RefCell::new(Slot::Absent),
+            boot: RefCell::new(BOOT.to_owned()),
+            submissions: RefCell::new(Vec::new()),
+            ignore_empty: Cell::new(false),
+            ticks: RefCell::new(VecDeque::new()),
+            current_tick: Cell::new(1000),
+        };
+        this.write(
+            "operator-manifest.json",
+            &json_bytes(&json!({"boot": BOOT, "mode": MODE, "sha256": hex(&[9; 32])}))?,
+        )?;
+        Ok(this)
+    }
+}
+impl Trial for FakeTrial {
+    fn program_digest(&self) -> Result<[u8; 32]> {
+        Ok([9; 32])
+    }
+    fn recheck(&self) -> Result<()> {
+        Ok(())
+    }
+    fn exists(&self, name: &str) -> Result<bool> {
+        Ok(self.dir.path().join(name).exists())
+    }
+    fn read(&self, name: &str, max: usize) -> Result<Vec<u8>> {
+        let data = fs::read(self.dir.path().join(name))?;
+        if data.len() > max {
+            return Err(Error::Refused("fixture record exceeds bound"));
+        }
+        Ok(data)
+    }
+    fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.dir.path().join(name))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    fn subdir(&self, name: &str, create: bool) -> Result<File> {
+        let path = self.dir.path().join(name);
+        if create {
+            fs::create_dir(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(File::open(path)?)
+    }
+    fn ticks(&self) -> Result<u64> {
+        if let Some(next) = self.ticks.borrow_mut().pop_front() {
+            self.current_tick.set(next);
+        }
+        Ok(self.current_tick.get())
+    }
+    fn boot(&self) -> Result<String> {
+        Ok(self.boot.borrow().clone())
+    }
+    fn observe(&self, anchor: &str) -> Result<Snapshot> {
+        Ok(sync_observe::fixture(anchor, self.slot.borrow().clone()))
+    }
+    fn submit(&self, suffix: &str, replacement: Replacement) -> Result<()> {
+        match replacement {
+            Replacement::Stage => {
+                self.submissions.borrow_mut().push("stage");
+                let rules = native_filter::expected_rules(suffix)
+                    .map_err(|_| Error::Refused("bad test suffix"))?;
+                *self.slot.borrow_mut() = Slot::Active(rules);
+            }
+            Replacement::Empty => {
+                self.submissions.borrow_mut().push("empty");
+                if !self.ignore_empty.get() {
+                    *self.slot.borrow_mut() = Slot::Empty;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn preflight_does_not_allocate_a_slot_or_start_the_stage_window() -> TestResult {
+    let trial = FakeTrial::new()?;
+    let first = preflight(&trial, NONCE)?;
+    assert_eq!(first["phase"], "preflight_ready");
+    assert_eq!(first["anchor"], "not_allocated");
+    assert_eq!(preflight(&trial, [8; 32])?, first);
+    for path in ["prepare.json", "session.json", "stage", "recovery"] {
+        assert!(!trial.exists(path)?);
+    }
+    assert!(trial.submissions.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn stage_durable_intent_then_recovery_clears_candidate_without_replay() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    assert_eq!(bound.stage(&trial)?["phase"], "submit_returned_unverified");
+    assert_eq!(
+        bound.reopen(&trial, "stage", "before-stage.json")?.state(),
+        State::Intent(Operation::WriteFilter)
+    );
+    assert!(bound.stage(&trial).is_err());
+    assert_eq!(
+        bound.recover(&trial)?["phase"],
+        "recovery_readback_verified"
+    );
+    assert_eq!(
+        bound
+            .reopen(&trial, "recovery", "before-recovery.json")?
+            .state(),
+        State::Closed
+    );
+    assert!(bound.recover(&trial).is_err());
+    assert_eq!(*trial.submissions.borrow(), ["stage", "empty"]);
+    assert_eq!(bound.status(&trial)?["phase"], "recovery_readback_recorded");
+    fs::write(trial.dir.path().join("after-recovery.json"), b"changed")?;
+    assert!(bound.status(&trial).is_err());
+    Ok(())
+}
+
+#[test]
+fn recovery_submits_empty_even_when_active_view_was_already_empty() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    bound.stage(&trial)?;
+    *trial.slot.borrow_mut() = Slot::Empty;
+    assert_eq!(bound.recover(&trial)?["active_slot"], "empty");
+    assert_eq!(*trial.submissions.borrow(), ["stage", "empty"]);
+    Ok(())
+}
+
+#[test]
+fn mismatching_independent_readback_leaves_recovery_unknown_and_cannot_replay() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    bound.stage(&trial)?;
+    trial.ignore_empty.set(true);
+    assert!(bound.recover(&trial).is_err());
+    assert_eq!(
+        bound
+            .reopen(&trial, "recovery", "before-recovery.json")?
+            .state(),
+        State::Unknown(Operation::WriteFilter)
+    );
+    assert!(trial.exists("after-recovery.json")?);
+    assert!(bound.recover(&trial).is_err());
+    assert_eq!(*trial.submissions.borrow(), ["stage", "empty"]);
+    Ok(())
+}
+
+#[test]
+fn stale_window_and_changed_boot_refuse_before_any_submit() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    trial.current_tick.set(1000 + STAGE_WINDOW_SECS);
+    assert!(bound.stage(&trial).is_err());
+    *trial.boot.borrow_mut() = "changed-boot".to_owned();
+    assert!(Bound::load(&trial).is_err());
+    assert!(trial.submissions.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn deadline_crossed_during_preflight_refuses_before_submission() -> TestResult {
+    let trial = FakeTrial::new()?;
+    prepare(&trial, NONCE)?;
+    let bound = Bound::load(&trial)?;
+    *trial.ticks.borrow_mut() = VecDeque::from([1001, 1000 + STAGE_WINDOW_SECS]);
+    assert!(bound.stage(&trial).is_err());
+    assert!(trial.submissions.borrow().is_empty());
+    assert_eq!(
+        bound.reopen(&trial, "stage", "before-stage.json")?.state(),
+        State::Unknown(Operation::WriteFilter)
+    );
+    Ok(())
+}

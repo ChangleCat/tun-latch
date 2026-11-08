@@ -144,6 +144,18 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 这一步只检查保存的文件，无需断网。若读取失败，保留终端提示与原始会话即可。
 
+## 同步规则槽的首次管理员预检
+
+`pf-lab-sync.py` 默认打印计划。首次管理员测试只验证固定发布版 helper 的受保护部署、启动身份和实际 PF 只读查询。`prepare` 在全新的 `/private/var/root/tunlatch-pf-sync` 中保存已核对的 helper 和启动记录，再调用只读入口。`status` 可以独立复查。项目 Python 仍以普通用户运行。
+
+```sh
+/usr/bin/python3 scripts/pf-lab-sync.py plan
+/usr/bin/sudo -v && /usr/bin/python3 scripts/pf-lab-sync.py prepare
+/usr/bin/python3 scripts/pf-lab-sync.py status
+```
+
+首次预检应得到 `phase=preflight_ready` 和 `anchor=not_allocated`。它不会占用规则槽或开始暂存期限。准备失败或超时后保留固定目录。若已成功暂存 helper，可以用 `status` 只读检查；`prepare` 会拒绝已有目录。当前脚本的 `stage` 和 `recover` 关闭，实际 PF 写入要另行审阅。
+
 ## TCP 与 UDP 对端预检
 
 `pf_lab_peer` 是普通用户实验辅助程序。两端使用同一组数字地址、端口、协议和一次性 nonce。接收端报告 `ready` 后可启动发送端。发送端的 `completed` 表示收到了匹配的回显。超时或不一致均失败，保护状态始终为 `not_evaluated`。实机外部地址须来自已确认的受控实验环境。
