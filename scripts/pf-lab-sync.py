@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 
 _spec = importlib.util.spec_from_file_location(
@@ -27,11 +28,83 @@ HELPER_TIMEOUT = 45
 HELPER_OUTPUT_LIMIT = 4096
 # Replace only after independent review of the precise release binary.
 AUDITED_BINARY_SHA256 = "3afeab571c1b43be8c26816d65747cb95e7a09a64dcb1213015583af76101365"
-# Requires a separate scope review and approval before any real PF write.
-PF_WRITES_REVIEWED = False
 OLD_PREFLIGHT_SHA256 = "4fa655e5913edebf2515f4ab182130e3592c913e731bf4e8a468b5380f341257"
+LOCAL_TRIAL = Path(__file__).resolve().parent.parent / "docs" / ".pf-lab-sync"
+APPROVAL = LOCAL_TRIAL / "approval.json"
+STAGE_ATTEMPT = LOCAL_TRIAL / "stage-attempt.json"
+STAGE_RETURN = LOCAL_TRIAL / "stage-return.json"
+TRIAL_ACTIONS = ("stage", "recover", "capture-unknown")
 staging.SOURCE = SOURCE
 stage.SOURCE = SOURCE
+
+
+def unique_fields(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate field")
+        obj[key] = value
+    return obj
+
+
+def check_local_directory(path):
+    info = os.lstat(path.parent)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise Refused("本地实验记录目录不是本人独占的 0700 目录")
+
+
+def read_local(path):
+    check_local_directory(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as record:
+        info = os.fstat(record.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or not 0 < info.st_size <= 512):
+            raise Refused("本地实验记录的权限、类型或大小无效")
+        raw = record.read(513)
+    if len(raw) != info.st_size:
+        raise Refused("本地实验记录读取期间变化")
+    return json.loads(raw, object_pairs_hook=unique_fields)
+
+
+def save_local(path, value):
+    check_local_directory(path)
+    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as record:
+        os.fchmod(record.fileno(), 0o600)
+        record.write(data)
+        record.flush()
+        os.fsync(record.fileno())
+    if read_local(path) != value:
+        raise Refused("本地实验记录回读不一致；保留现场")
+
+
+def approved_trial():
+    try:
+        approval = read_local(APPROVAL)
+    except FileNotFoundError:
+        return None
+    if (not isinstance(approval, dict)
+            or set(approval) != {"helper_sha256", "baseline_sha256", "boot"}
+            or approval["helper_sha256"] != AUDITED_BINARY_SHA256
+            or not isinstance(approval["baseline_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", approval["baseline_sha256"])
+            or not isinstance(approval["boot"], str)
+            or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", approval["boot"])):
+        raise Refused("本地单槽实验批准记录无效")
+    return approval
+
+
+def require_local(path, expected):
+    try:
+        matched = read_local(path) == expected
+    except FileNotFoundError:
+        matched = False
+    if not matched:
+        raise Refused("缺少匹配的本次暂存记录；保留现场")
 
 
 def audited_digest():
@@ -71,16 +144,8 @@ def invoke(runner, action):
     if code == 0:
         return output
 
-    def unique(pairs):
-        obj = {}
-        for key, value in pairs:
-            if key in obj:
-                raise ValueError("duplicate field")
-            obj[key] = value
-        return obj
-
     try:
-        obj = json.loads(output.decode("utf-8", "strict"), object_pairs_hook=unique)
+        obj = json.loads(output.decode("utf-8", "strict"), object_pairs_hook=unique_fields)
         if (not isinstance(obj, dict) or set(obj) != {"result", "reason"}
                 or obj["result"] != "refused" or not isinstance(obj["reason"], str)
                 or not 1 <= len(obj["reason"]) <= 200
@@ -116,15 +181,8 @@ def prepare(runner, expected):
 
 
 def status_phase(raw, *, include_baseline=False):
-    def unique(pairs):
-        obj = {}
-        for key, value in pairs:
-            if key in obj:
-                raise ValueError("duplicate field")
-            obj[key] = value
-        return obj
     try:
-        obj = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=unique)
+        obj = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=unique_fields)
         if not isinstance(obj, dict):
             raise ValueError("invalid phase")
         phase = obj["phase"]
@@ -145,7 +203,8 @@ def status_phase(raw, *, include_baseline=False):
                    or not re.fullmatch(r"[0-9a-f]{64}", obj["baseline_sha256"])))
               or not isinstance(obj["anchor"], str)
               or not re.fullmatch(r"tunlatch-lab-[0-9a-f]{8}", obj["anchor"])
-              or obj["active_slot"] not in ("absent", "empty", "candidate", "unrecognized")
+              or (obj["active_slot"] != "not_read" if phase == "submit_returned_unverified"
+                  else obj["active_slot"] not in ("absent", "empty", "candidate", "unrecognized"))
               or (phase == "prepared" and obj["active_slot"] != "absent")):
             raise ValueError("invalid trial report")
         if obj["active_slot"] == "unrecognized":
@@ -210,30 +269,36 @@ def replace_preflight(runner, expected):
     return prepare(runner, expected)
 
 
-def execute(runner, action, expected, confirm=input):
+def execute(runner, action, expected, confirm=input, *, approval=None):
     if action == "prepare":
         return prepare(runner, expected)
     if action == "replace-preflight":
         return replace_preflight(runner, expected)
-    if action not in ("status", "stage", "recover", "capture-unknown"):
+    if action not in ("status", *TRIAL_ACTIONS):
         raise Refused("未知动作")
+    if action in TRIAL_ACTIONS and (approval is None or approval["helper_sha256"] != expected
+                                    or approval["boot"] != stage.boot(runner)):
+        raise Refused("本次批准与 helper 或当前启动不匹配")
     inspect(runner, expected)
     before = invoke(runner, "status")
     previous = status_phase(before, include_baseline=True)
     phase = previous["phase"]
     if action == "status":
         return before
+    if action != "stage":
+        require_local(STAGE_ATTEMPT, approval)
     if action == "capture-unknown":
         if (phase not in ("stage_intent_unsettled", "stage_outcome_unknown", "recovery_unknown")
                 or previous["active_slot"] != "unrecognized"):
             raise Refused("当前状态不允许记录未知槽位；保留现场")
         return invoke(runner, action)
-    if action == "stage" and phase not in ("preflight_ready", "prepared"):
-        raise Refused("当前阶段不允许首次暂存；保留现场")
-    if action == "recover" and phase not in ("stage_intent_unsettled", "stage_outcome_unknown"):
-        raise Refused("当前阶段不允许人工恢复；保留现场")
-    if action == "recover" and previous["active_slot"] == "unrecognized":
-        raise Refused("未知槽位不允许恢复；保留现场")
+    if action == "stage" and (phase != "preflight_ready"
+                              or previous["baseline_sha256"] != approval["baseline_sha256"]):
+        raise Refused("当前阶段或基线与获准的首次暂存不符；保留现场")
+    if action == "recover":
+        if phase != "stage_intent_unsettled" or previous["active_slot"] == "unrecognized":
+            raise Refused("当前阶段或槽位不允许人工恢复；保留现场")
+        require_local(STAGE_RETURN, {**approval, "anchor": previous["anchor"]})
     print("只读状态：\n" + before.decode("utf-8", "strict"), flush=True)
     print("确认当前试验独占、原写入者已结束，独立核查期限及现场；不确定时停止。", flush=True)
     ack = "STAGE-PF-SYNC" if action == "stage" else "TAKEOVER-PF-SYNC-RECOVERY"
@@ -243,13 +308,20 @@ def execute(runner, action, expected, confirm=input):
     after = invoke(runner, "status")
     if before != after:
         raise Refused("确认期间状态发生变化；保留现场")
-    if action == "stage" and phase == "preflight_ready":
-        prepared = invoke(runner, "prepare")
-        initialized = status_phase(prepared, include_baseline=True)
-        if (initialized["phase"] != "prepared"
-                or initialized.get("baseline_sha256") != previous["baseline_sha256"]):
-            raise Refused("初始化阶段或基线与确认的预检不一致；保留现场")
-    return invoke(runner, action)
+    if action == "recover":
+        return invoke(runner, action)
+    save_local(STAGE_ATTEMPT, approval)
+    initialized = status_phase(invoke(runner, "prepare"), include_baseline=True)
+    if (initialized["phase"] != "prepared"
+            or initialized.get("baseline_sha256") != approval["baseline_sha256"]):
+        raise Refused("初始化阶段或基线与批准不一致；保留现场")
+    raw = invoke(runner, "stage")
+    submitted = status_phase(raw, include_baseline=True)
+    if (submitted["phase"] != "submit_returned_unverified"
+            or submitted["anchor"] != initialized["anchor"]):
+        raise Refused("缺少本次提交正常返回记录；保留现场")
+    save_local(STAGE_RETURN, {**approval, "anchor": initialized["anchor"]})
+    return raw
 
 
 def main():
@@ -260,24 +332,29 @@ def main():
     args = parser.parse_args()
     if os.geteuid() == 0:
         raise Refused("不要 sudo 整个程序")
+    approval = approved_trial() if args.action != "status" else None
     if args.action == "plan":
-        actions = ["prepare", "status"] if AUDITED_BINARY_SHA256 is not None else []
-        if actions and AUDITED_BINARY_SHA256 != OLD_PREFLIGHT_SHA256:
-            actions.append("replace-preflight")
-        if actions and PF_WRITES_REVIEWED:
-            actions.extend(["stage", "recover", "capture-unknown"])
+        actions = ["status"] if AUDITED_BINARY_SHA256 is not None else []
+        if actions and approval:
+            actions.extend(TRIAL_ACTIONS)
+        elif actions:
+            actions.append("prepare")
+            if AUDITED_BINARY_SHA256 != OLD_PREFLIGHT_SHA256:
+                actions.append("replace-preflight")
         print(json.dumps({"directory": SESSION, "helper": HELPER,
-                          "actions": actions, "pf_writes_reviewed": PF_WRITES_REVIEWED,
+                          "actions": actions, "pf_writes_reviewed": approval is not None,
                           "digest_reviewed": AUDITED_BINARY_SHA256 is not None,
                           "limits": ["已有目录即拒绝，绝不自动删除或重用。",
                                      "暂存和恢复分别需要在场确认、独立检查有效期限及连续独占。",
                                      "超时、中断或异常保留现场，特权命令树和 PF 状态可能未知。",
                                      "实验不证明实际保护或自动恢复。"]}, ensure_ascii=False, indent=2))
         return
-    if args.action in ("stage", "recover", "capture-unknown") and not PF_WRITES_REVIEWED:
+    if args.action in TRIAL_ACTIONS and approval is None:
         raise Refused("PF 写入尚未获得单独审阅与批准")
+    if args.action in ("prepare", "replace-preflight") and approval is not None:
+        raise Refused("本次批准只覆盖已部署的单槽实验；保留当前部署")
     expected = audited_digest()
-    result = execute(stage.Runner(), args.action, expected)
+    result = execute(stage.Runner(), args.action, expected, approval=approval)
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.flush()
 

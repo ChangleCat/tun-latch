@@ -154,7 +154,7 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 /usr/bin/python3 scripts/pf-lab-sync.py status
 ```
 
-首次预检应得到 `phase=preflight_ready` 和 `anchor=not_allocated`。它不会占用规则槽或开始暂存期限。准备失败或超时后保留固定目录。若已成功暂存 helper，可以用 `status` 只读检查；`prepare` 会拒绝已有目录。当前脚本的 `stage` 和 `recover` 关闭，实际 PF 写入要另行审阅。
+首次预检应得到 `phase=preflight_ready` 和 `anchor=not_allocated`。它不会占用规则槽或开始暂存期限。准备失败或超时后保留固定目录。若已成功暂存 helper，可以用 `status` 只读检查；`prepare` 会拒绝已有目录。实际 PF 写入需要针对具体范围另行批准。
 
 已安装过本项目指定的旧预检构建时，用 `replace-preflight`。它只接受当前启动、旧摘要、目录内恰好两个部署文件及稳定的 `preflight_ready`，将旧目录整体移入同一文件系统上的 root 私有归档，再部署新构建并只读复查。失败时保留旧归档和现有固定目录，终端会给出归档路径。
 
@@ -164,6 +164,8 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 ```
 
 当前规则核对会接受固定四条规则的等价地址及端口显示。其余活动规则报告为 `unrecognized` 并拒绝清空。后续获准的写入实验可通过 `capture-unknown` 保存一次受保护的原始观察，该动作仅查询 PF。
+
+获准的单槽实验由本机忽略目录 `docs/.pf-lab-sync/` 保存批准、暂存尝试及正常返回记录。脚本核对已部署 helper、当前启动和预检基线。暂存启动后，记录原样保留。若缺少同一槽的正常返回，操作脚本只允许只读状态检查和符合条件的未知证据采集。启用本机单次批准后，脚本会拒绝重新部署或替换 helper。
 
 ## TCP 与 UDP 对端预检
 
