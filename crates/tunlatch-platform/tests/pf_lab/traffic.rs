@@ -42,6 +42,7 @@ impl Flow {
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
+    pub(crate) case_id: u32,
     pub(crate) interface: String,
     pub(crate) before_control: Flow,
     pub(crate) negative: Flow,
@@ -63,7 +64,8 @@ impl Plan {
                 ));
             }
         }
-        if self.before_control == self.after_control
+        if self.case_id == 0
+            || self.before_control == self.after_control
             || self.interface.is_empty()
             || self.interface.len() > 15
             || !self.interface.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -380,21 +382,80 @@ pub(crate) trait Boundary {
 }
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Verdict {
-    NoObservedLeak { session: [u8; 32] },
-    Leak { packets: usize },
+    NoObservedLeak {
+        session: [u8; 32],
+        case_id: u32,
+    },
+    Leak {
+        session: [u8; 32],
+        case_id: u32,
+        packets: usize,
+    },
     NotRun(&'static str),
 }
+
+/// Classifies only the declared, complete set of offline case results.
+/// This does not authorize a live run or establish protection.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum BatchVerdict {
+    NoObservedLeak,
+    Leak,
+    Incomplete,
+}
+pub(crate) fn classify_batch(
+    session: [u8; 32],
+    expected: &[u32],
+    results: &[(u32, Result<Verdict>)],
+) -> Result<BatchVerdict> {
+    use std::collections::BTreeSet;
+    if session == [0; 32] || expected.is_empty() || expected.len() > 32 {
+        return Err(Error("invalid batch scope"));
+    }
+    let expected_ids: BTreeSet<_> = expected.iter().copied().collect();
+    if expected_ids.len() != expected.len() || expected_ids.contains(&0) || results.len() > 32 {
+        return Err(Error("invalid batch case identifiers"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut incomplete = false;
+    let mut leak = false;
+    for (case_id, result) in results {
+        if !expected_ids.contains(case_id) || !seen.insert(*case_id) {
+            return Err(Error("unexpected or repeated batch case"));
+        }
+        match result {
+            Ok(Verdict::NoObservedLeak {
+                session: actual,
+                case_id: actual_case,
+            }) if *actual == session && actual_case == case_id => {}
+            Ok(Verdict::Leak {
+                session: actual,
+                case_id: actual_case,
+                packets,
+            }) if *actual == session && actual_case == case_id && *packets > 0 => leak = true,
+            _ => incomplete = true,
+        }
+    }
+    if leak {
+        Ok(BatchVerdict::Leak)
+    } else if incomplete || seen.len() != expected_ids.len() {
+        Ok(BatchVerdict::Incomplete)
+    } else {
+        Ok(BatchVerdict::NoObservedLeak)
+    }
+}
+
 pub(crate) struct Experiment {
     guard: Guard,
     consumed: bool,
     unknown: bool,
 }
-pub(crate) fn nonce(identity: super::driver::Identity, phase: u8) -> [u8; 16] {
+pub(crate) fn nonce(identity: super::driver::Identity, case_id: u32, phase: u8) -> [u8; 16] {
     let mut digest = Sha256::new();
     digest.update(b"tunlatch-controlled-probe");
     digest.update(identity.boot);
     digest.update(identity.session);
     digest.update(identity.plan);
+    digest.update(case_id.to_be_bytes());
     digest.update([phase]);
     let digest = digest.finalize();
     let mut result = [0; 16];
@@ -443,9 +504,9 @@ impl Experiment {
         if handle.instance == 0 || handle.birth == 0 {
             return Err(Error("capture ownership missing"));
         }
-        let pre = nonce(self.guard.identity(), 1);
-        let negative = nonce(self.guard.identity(), 2);
-        let post = nonce(self.guard.identity(), 3);
+        let pre = nonce(self.guard.identity(), plan.case_id, 1);
+        let negative = nonce(self.guard.identity(), plan.case_id, 2);
+        let post = nonce(self.guard.identity(), plan.case_id, 3);
         let mut negative_acknowledged = false;
         for (flow, nonce, positive) in [
             (plan.before_control, pre, true),
@@ -493,7 +554,11 @@ impl Experiment {
         }
         let leaked = packets.iter().filter(|p| p.flow == plan.negative).count();
         if leaked > 0 {
-            Ok(Verdict::Leak { packets: leaked })
+            Ok(Verdict::Leak {
+                session: self.guard.identity().session,
+                case_id: plan.case_id,
+                packets: leaked,
+            })
         } else if negative_acknowledged {
             Err(Error(
                 "negative receiver acknowledged without matching capture",
@@ -501,6 +566,7 @@ impl Experiment {
         } else {
             Ok(Verdict::NoObservedLeak {
                 session: self.guard.identity().session,
+                case_id: plan.case_id,
             })
         }
     }

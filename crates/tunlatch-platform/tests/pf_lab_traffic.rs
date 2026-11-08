@@ -35,6 +35,7 @@ fn flow(ipv6: bool, protocol: Protocol, port: u16) -> Flow {
 }
 fn plan(ipv6: bool, protocol: Protocol) -> Plan {
     Plan {
+        case_id: 1,
         interface: "lab0".into(),
         before_control: flow(ipv6, protocol, 45001),
         negative: flow(ipv6, protocol, 45002),
@@ -139,6 +140,7 @@ fn pcap(packets: &[Vec<u8>], link: u32) -> Vec<u8> {
 }
 struct Fake {
     seq: u64,
+    case_id: u32,
     packets: Vec<Vec<u8>>,
     leak: bool,
     fault: Option<&'static str>,
@@ -149,6 +151,7 @@ impl Fake {
     fn new() -> Self {
         Self {
             seq: 0,
+            case_id: 1,
             packets: Vec::new(),
             leak: false,
             fault: None,
@@ -169,8 +172,9 @@ impl Boundary for Fake {
             writers_reclaimed: true,
         })
     }
-    fn start_capture(&mut self, _: &Plan) -> Result<CaptureHandle> {
+    fn start_capture(&mut self, plan: &Plan) -> Result<CaptureHandle> {
         self.calls += 1;
+        self.case_id = plan.case_id;
         Ok(CaptureHandle {
             instance: 1,
             birth: 2,
@@ -178,12 +182,13 @@ impl Boundary for Fake {
     }
     fn exchange(&mut self, flow: Flow, nonce: [u8; 16]) -> Result<Sent> {
         self.calls += 1;
-        let negative = nonce == traffic::nonce(id(), 2);
+        let negative = nonce == traffic::nonce(id(), self.case_id, 2);
         if (!negative || self.leak)
-            && !(self.fault == Some("missing-post") && nonce == traffic::nonce(id(), 3))
+            && !(self.fault == Some("missing-post")
+                && nonce == traffic::nonce(id(), self.case_id, 3))
         {
             let payload = if self.fault == Some("old-session") {
-                let phase = if nonce == traffic::nonce(id(), 1) {
+                let phase = if nonce == traffic::nonce(id(), self.case_id, 1) {
                     1
                 } else {
                     3
@@ -193,6 +198,7 @@ impl Boundary for Fake {
                         session: [9; 32],
                         ..id()
                     },
+                    self.case_id,
                     phase,
                 )
             } else {
@@ -259,7 +265,8 @@ fn negative_absence_requires_before_after_capture_and_receiver_positive_controls
             assert_eq!(
                 run.run(&mut fake, &plan(ipv6, protocol))?,
                 Verdict::NoObservedLeak {
-                    session: id().session
+                    session: id().session,
+                    case_id: 1,
                 }
             );
             assert!(!run.unknown());
@@ -275,7 +282,11 @@ fn any_negative_tuple_packet_is_a_leak_even_without_payload_nonce() -> Result<()
     fake.packets.push(packet(p.negative, &[]));
     assert_eq!(
         Experiment::new(Guard::new(id(), 0)?).run(&mut fake, &p)?,
-        Verdict::Leak { packets: 1 }
+        Verdict::Leak {
+            session: id().session,
+            case_id: 1,
+            packets: 1
+        }
     );
     Ok(())
 }
@@ -433,5 +444,81 @@ fn fixed_capture_scope_and_native_sender_receiver_compile_without_network_execut
     let mut bad = p;
     bad.interface = "lab0; command".into();
     assert!(bad.capture_argv().is_err());
+    Ok(())
+}
+
+#[test]
+fn batch_requires_every_unique_correlated_case_and_preserves_leak() -> Result<()> {
+    use traffic::{BatchVerdict, classify_batch};
+    let clean = |case_id| {
+        Ok(Verdict::NoObservedLeak {
+            session: id().session,
+            case_id,
+        })
+    };
+    assert_eq!(
+        classify_batch(id().session, &[1, 2], &[(1, clean(1)), (2, clean(2))])?,
+        BatchVerdict::NoObservedLeak
+    );
+    assert_eq!(
+        classify_batch(id().session, &[1, 2], &[(1, clean(1))])?,
+        BatchVerdict::Incomplete
+    );
+    assert_eq!(
+        classify_batch(id().session, &[1, 2], &[(1, clean(1)), (2, clean(1))])?,
+        BatchVerdict::Incomplete
+    );
+    assert_eq!(
+        classify_batch(
+            id().session,
+            &[1, 2],
+            &[(1, clean(1)), (2, Err(Error("missing control")))]
+        )?,
+        BatchVerdict::Incomplete
+    );
+    assert_eq!(
+        classify_batch(
+            id().session,
+            &[1, 2],
+            &[(1, clean(1)), (2, Ok(Verdict::NotRun("unsupported")))]
+        )?,
+        BatchVerdict::Incomplete
+    );
+    assert_eq!(
+        classify_batch(
+            id().session,
+            &[1, 2],
+            &[(
+                1,
+                Ok(Verdict::Leak {
+                    session: id().session,
+                    case_id: 1,
+                    packets: 1
+                })
+            )]
+        )?,
+        BatchVerdict::Leak
+    );
+    assert!(classify_batch(id().session, &[1, 1], &[]).is_err());
+    assert!(classify_batch(id().session, &[1, 2], &[(1, clean(1)), (1, clean(1))]).is_err());
+    assert!(classify_batch(id().session, &[1], &[(2, clean(2))]).is_err());
+    Ok(())
+}
+
+#[test]
+fn distinct_cases_have_distinct_controls_and_results() -> Result<()> {
+    assert_ne!(traffic::nonce(id(), 1, 1), traffic::nonce(id(), 2, 1));
+    let mut p = plan(false, Protocol::Tcp);
+    p.case_id = 2;
+    let verdict = Experiment::new(Guard::new(id(), 0)?).run(&mut Fake::new(), &p)?;
+    assert_eq!(
+        verdict,
+        Verdict::NoObservedLeak {
+            session: id().session,
+            case_id: 2
+        }
+    );
+    p.case_id = 0;
+    assert!(p.validate().is_err());
     Ok(())
 }
