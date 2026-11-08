@@ -197,3 +197,7 @@ cargo build -p tunlatch-platform --example pf_lab_peer --release --locked
 ```
 
 四项均成功时输出 `loopback_checked`。失败时会报告地址族、协议、出错端、退出状态，以及可取得的阶段和系统错误码。回环结果只验证对端程序的收发和记录，物理出口、跨 UID、抓包和 PF 匹配需要独立验证。
+
+`pf-lab-peer-batch.py` 把四种组合并行收发。两端都需构建上面的 `pf_lab_peer`。向两端提供同一份 JSON，顶层 `cases` 包含四项，每项有 `family`（`ipv4` 或 `ipv6`）、`protocol`（`tcp` 或 `udp`）、`source`、`destination` 和 `nonce`。地址须为具体数字 `IP:端口`，IPv6 使用方括号。每项使用不同的 32 位小写十六进制 nonce。每轮使用新 nonce 和独立流。
+
+先以 `--role receiver` 或 `--role sender` 只查看计划。仅在确认对端及地址范围后加 `--ack RUN-CONTROLLED-PEER-BATCH`。接收端四项就绪后输出 `ready`，此时发送端可用同一计划启动。任一交换失败时记录 `incomplete` 或 `unavailable`。这些结果用于收发对照，PF 判定始终为 `not_evaluated`。
