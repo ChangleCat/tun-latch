@@ -34,9 +34,6 @@ LOCAL_TRIAL = Path(__file__).resolve().parent.parent / 'docs/.pf-lab-sync-fault'
 APPROVAL = LOCAL_TRIAL / 'approval.json'
 STAGE_ATTEMPT = LOCAL_TRIAL / 'stage-attempt.json'
 AUDITED_BINARY_SHA256 = '2f4220c54c322bc25ff3e78a7606a52014ae0d150c39f08e670b0b2291494cd5'
-# Separate authorization is required even after a digest is pinned.
-PF_WRITES_AUTHORIZED = False
-
 base.SESSION = SESSION
 base.HELPER = HELPER
 base.MANIFEST = MANIFEST
@@ -119,9 +116,9 @@ def execute(runner, action, expected, confirm=input, *, approval=None):
         return prepare(runner, expected)
     if action == 'status':
         return status(runner, expected)
-    if action not in ('stage-fault', 'recover-fault') or not PF_WRITES_AUTHORIZED:
+    if action not in ('stage-fault', 'recover-fault') or approval is None:
         raise Refused('本次异常返回实验的 PF 写入尚未单独审阅和批准')
-    if (approval is None or approval.get('helper_sha256') != expected
+    if (approval.get('helper_sha256') != expected
             or approval.get('boot') != stage.boot(runner)):
         raise Refused('本次批准与 helper 或当前启动不匹配')
     before = status(runner, expected)
@@ -170,23 +167,24 @@ def main():
     args = parser.parse_args()
     if os.geteuid() == 0:
         raise Refused('不要 sudo 整个程序')
+    base.AUDITED_BINARY_SHA256 = AUDITED_BINARY_SHA256
+    runner = stage.Runner()
+    approval = (base.approved_trial()
+                if args.action in ('plan', 'stage-fault', 'recover-fault') else None)
     if args.action == 'plan':
         actions = ['prepare', 'status'] if AUDITED_BINARY_SHA256 else []
-        if actions and PF_WRITES_AUTHORIZED:
+        write_approved = bool(actions and approval and approval['boot'] == stage.boot(runner))
+        if write_approved:
             actions.extend(['stage-fault', 'recover-fault'])
         print(json.dumps({'directory': SESSION, 'helper': HELPER,
                           'digest_reviewed': AUDITED_BINARY_SHA256 is not None,
-                          'pf_writes_reviewed': PF_WRITES_AUTHORIZED,
+                          'pf_writes_reviewed': write_approved,
                           'actions': actions,
                           'limitations': ['原实验批准不适用于本实验。',
                                           '超时或中断时保留现场，状态可能未知。']},
                          ensure_ascii=False, indent=2))
         return
-    if args.action not in ('prepare', 'status') and not PF_WRITES_AUTHORIZED:
-        raise Refused('本次异常返回实验的 PF 写入尚未单独审阅和批准')
-    base.AUDITED_BINARY_SHA256 = AUDITED_BINARY_SHA256
-    approval = base.approved_trial() if args.action in ('stage-fault', 'recover-fault') else None
-    result = execute(stage.Runner(), args.action, audited_digest(), approval=approval)
+    result = execute(runner, args.action, audited_digest(), approval=approval)
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.flush()
 

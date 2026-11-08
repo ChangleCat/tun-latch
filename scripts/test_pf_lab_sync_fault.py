@@ -25,14 +25,29 @@ class FaultOperatorTests(unittest.TestCase):
         self.assertNotEqual(op.old.stage, op.stage)
         self.assertNotEqual(op.old.APPROVAL, op.APPROVAL)
 
-    def test_digest_and_all_mutations_are_closed(self):
+    def test_missing_digest_and_approval_fail_closed(self):
         with mock.patch.object(op, 'AUDITED_BINARY_SHA256', None), self.assertRaises(op.Refused):
             op.audited_digest()
         runner = mock.Mock()
-        for action in ('stage-fault', 'recover-fault', 'capture-unknown'):
-            with self.subTest(action=action), self.assertRaises(op.Refused):
-                op.execute(runner, action, 'a' * 64)
-        runner.assert_not_called()
+        with mock.patch.object(op, 'status') as status, mock.patch.object(op, 'invoke') as invoke:
+            for action in ('stage-fault', 'recover-fault', 'capture-unknown'):
+                with self.subTest(action=action), self.assertRaises(op.Refused):
+                    op.execute(runner, action, 'a' * 64)
+            status.assert_not_called()
+            invoke.assert_not_called()
+        self.assertEqual(runner.mock_calls, [])
+
+    def test_fault_writes_refuse_approval_for_another_boot_or_binary(self):
+        approval = {'helper_sha256': 'a' * 64, 'baseline_sha256': 'b' * 64, 'boot': 'boot'}
+        with (mock.patch.object(op.stage, 'boot', return_value='boot'),
+              mock.patch.object(op, 'status') as status,
+              mock.patch.object(op, 'invoke') as invoke):
+            for action in ('stage-fault', 'recover-fault'):
+                for wrong in ({**approval, 'boot': 'other'}, {**approval, 'helper_sha256': 'c' * 64}):
+                    with self.subTest(action=action, wrong=wrong), self.assertRaises(op.Refused):
+                        op.execute(None, action, 'a' * 64, approval=wrong)
+            status.assert_not_called()
+            invoke.assert_not_called()
 
     def test_prepare_requires_old_protected_closed_readback(self):
         runner = mock.Mock()
@@ -93,8 +108,7 @@ class FaultOperatorTests(unittest.TestCase):
         def invoke(_runner, action):
             events.append(action)
             return {'prepare': prepared, 'stage-fault': returned}[action]
-        with (mock.patch.object(op, 'PF_WRITES_AUTHORIZED', True),
-              mock.patch.object(op.stage, 'boot', return_value='boot'),
+        with (mock.patch.object(op.stage, 'boot', return_value='boot'),
               mock.patch.object(op, 'status', side_effect=[initial, initial]),
               mock.patch.object(op.base, 'save_local', side_effect=lambda *_: events.append('attempt')),
               mock.patch.object(op, 'invoke', side_effect=invoke)):
@@ -103,8 +117,7 @@ class FaultOperatorTests(unittest.TestCase):
         self.assertEqual(events, ['attempt', 'prepare', 'stage-fault'])
         observed = report('fault_writer_reaped', 'candidate')
         recovered = report('recovery_readback_verified', 'empty')
-        with (mock.patch.object(op, 'PF_WRITES_AUTHORIZED', True),
-              mock.patch.object(op.stage, 'boot', return_value='boot'),
+        with (mock.patch.object(op.stage, 'boot', return_value='boot'),
               mock.patch.object(op.base, 'require_local') as require,
               mock.patch.object(op, 'status', side_effect=[observed, observed]),
               mock.patch.object(op, 'invoke', return_value=recovered)):
@@ -117,8 +130,7 @@ class FaultOperatorTests(unittest.TestCase):
                 value = json.loads(observed)
                 value.update(slot_sha256='c' * 64, slot_bytes=1)
                 observed = json.dumps(value).encode()
-            with (mock.patch.object(op, 'PF_WRITES_AUTHORIZED', True),
-                  mock.patch.object(op.stage, 'boot', return_value='boot'),
+            with (mock.patch.object(op.stage, 'boot', return_value='boot'),
                   mock.patch.object(op.base, 'require_local'),
                   mock.patch.object(op, 'status', return_value=observed),
                   mock.patch.object(op, 'invoke') as call,

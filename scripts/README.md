@@ -183,7 +183,7 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 /usr/bin/python3 scripts/pf-lab-sync-fault.py status
 ```
 
-预检通过时应返回 `preflight_ready` 和 `not_allocated`。实际故障动作在同步提交返回后、发回执前由写入者请求终止自身，父进程须获得 SIGKILL 的直接等待结果及受保护见证。当前写入开关关闭。超时、记录缺失、规则不明或旧状态变化时保留现场；等待超时不能推断子进程已经退出。
+预检通过时应返回 `preflight_ready` 和 `not_allocated`。实际故障动作在同步提交返回后、发回执前由写入者请求终止自身，父进程须获得 SIGKILL 的直接等待结果及受保护见证。`stage-fault` 和 `recover-fault` 需要单独的本机批准记录，绑定当前启动、已部署构建和基线，并各自要求现场确认。超时、记录缺失、规则不明或旧状态变化时保留现场。等待超时无法确认子进程已退出。
 
 ## TCP 与 UDP 对端预检
 
