@@ -160,7 +160,7 @@ def checked_helper_output(code, output):
     raise Refused("helper 拒绝：" + obj["reason"] + "；保留现场")
 
 
-def prepare(runner, expected):
+def install(runner, expected):
     data = staging.source_bytes(expected)
     stage.dependencies(runner, expected)
     stage.protected_parents(runner)
@@ -178,6 +178,10 @@ def prepare(runner, expected):
     runner.root("/bin/chmod", "600", MANIFEST)
     if inspect(runner, expected) != len(data):
         raise Refused("受保护 helper 长度不匹配")
+
+
+def prepare(runner, expected):
+    install(runner, expected)
     status = invoke(runner, "status")
     if status_phase(status) != "preflight_ready":
         raise Refused("首次检查未报告 preflight_ready；保留现场")

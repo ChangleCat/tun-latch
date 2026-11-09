@@ -154,7 +154,7 @@ fn pump<R: Read + Send + 'static>(mut pipe: R, tag: u8, tx: SyncSender<(u8, io::
         }
     });
 }
-fn execute_program(
+pub(crate) fn execute_program(
     program: &str,
     args: &[&str],
     outer_deadline: Instant,

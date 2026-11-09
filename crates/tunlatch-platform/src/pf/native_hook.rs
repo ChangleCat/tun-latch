@@ -28,7 +28,7 @@ const PF_GET_NONE: u32 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-enum Operation {
+pub(crate) enum Operation {
     Count = 6,
     Read = 7,
     Insert = 27,
@@ -46,7 +46,7 @@ impl Operation {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+pub(crate) enum Error {
     #[error("PF hook refused: {0}")]
     Refused(&'static str),
     #[error("PF hook {operation:?} ioctl failed; result unconfirmed")]
@@ -142,6 +142,7 @@ struct Request {
 impl Request {
     fn new(operation: Operation) -> Self {
         let mut frame = Frame([0; SIZE]);
+        frame.set_u32(GET_ACTION, PF_GET_NONE);
         frame.0[RULE_ACTION] = PF_PASS;
         Self { operation, frame }
     }
@@ -157,10 +158,12 @@ impl Request {
             // XNU can accept these requests on an O_RDONLY descriptor.
             return Err(Error::Refused("protected PF write entry is not connected"));
         }
-        if self.frame.u32(GET_ACTION) != PF_GET_NONE
-            || !self.frame.is_root()
-            || self.frame.0[RULE_ACTION] != PF_PASS
-        {
+        let mut expected = Self::new(self.operation).frame;
+        if self.operation == Operation::Read {
+            expected.set_u32(SET_TICKET, self.frame.u32(SET_TICKET));
+            expected.set_u32(INDEX, self.frame.u32(INDEX));
+        }
+        if self.frame.0 != expected.0 {
             return Err(Error::Refused(
                 "only non-mutating root filter reads are allowed",
             ));
@@ -183,11 +186,11 @@ fn summary(frame: &Frame) -> Result<(u32, u32)> {
     Ok((count, frame.u32(SET_TICKET)))
 }
 
-/// Collects only the exact hook's owned fields. The root ruleset ticket checks for change
-/// during enumeration. A caller must also compare complete semantics with independent output.
-fn observe(name: &RootName, mut run: impl FnMut(Request) -> Result<Frame>) -> Result<Option<Hook>> {
+fn read_rows(
+    mut run: impl FnMut(Request) -> Result<Frame>,
+    mut read: impl FnMut(u32, &Frame) -> Result<()>,
+) -> Result<()> {
     let (count, ticket) = summary(&run(Request::new(Operation::Count))?)?;
-    let mut hook = None;
     for index in 0..count {
         // A new frame for each call keeps opaque output from being sent back as input.
         let mut row = Request::new(Operation::Read);
@@ -201,8 +204,23 @@ fn observe(name: &RootName, mut run: impl FnMut(Request) -> Result<Frame>) -> Re
         {
             return Err(Error::Refused("root rules changed during enumeration"));
         }
+        read(index, &frame)?;
+    }
+    if summary(&run(Request::new(Operation::Count))?)? != (count, ticket) {
+        return Err(Error::Refused(
+            "root rule summary changed during enumeration",
+        ));
+    }
+    Ok(())
+}
+
+/// Collects only the exact hook's owned fields. The root ruleset ticket checks for change
+/// during enumeration. A caller must also compare complete semantics with independent output.
+fn observe(name: &RootName, run: impl FnMut(Request) -> Result<Frame>) -> Result<Option<Hook>> {
+    let mut hook = None;
+    read_rows(run, |index, frame| {
         if frame.field(CALL, 1024)? == name.0.as_bytes() {
-            name.check_owner(&frame)?;
+            name.check_owner(frame)?;
             let found = Hook {
                 index,
                 ticket: frame.rule_ticket()?,
@@ -211,12 +229,8 @@ fn observe(name: &RootName, mut run: impl FnMut(Request) -> Result<Frame>) -> Re
                 return Err(Error::Refused("duplicate root hook"));
             }
         }
-    }
-    if summary(&run(Request::new(Operation::Count))?)? != (count, ticket) {
-        return Err(Error::Refused(
-            "root rule summary changed during enumeration",
-        ));
-    }
+        Ok(())
+    })?;
     Ok(hook)
 }
 
@@ -241,7 +255,7 @@ fn remove(
 
 /// Static candidate layout gate. Identifiers must come from the current host. Matching
 /// identifiers still require independent read-only ABI qualification before any live writes.
-fn check_host(build: &str, kernel: &str) -> Result<()> {
+pub(crate) fn check_host(build: &str, kernel: &str) -> Result<()> {
     if !cfg!(all(
         target_os = "macos",
         target_arch = "aarch64",
@@ -255,8 +269,56 @@ fn check_host(build: &str, kernel: &str) -> Result<()> {
     Ok(())
 }
 
-/// The future isolated helper must provide a freshly qualified build, the held PF device
-/// and the checked experiment's authority. The current workspace provides no live caller.
+/// Ordered root-filter observations; opaque PF data is never exposed to the caller.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ReadonlyRule {
+    pub(crate) class: &'static str,
+    pub(crate) call: String,
+}
+
+pub(crate) fn readonly_rules(
+    device: &File,
+    build: &str,
+    kernel: &str,
+) -> Result<Vec<ReadonlyRule>> {
+    enumerate(|request| ioctl(device, build, kernel, request))
+}
+
+pub(crate) fn readonly_layout() -> (usize, usize, libc::c_ulong, libc::c_ulong) {
+    (
+        std::mem::size_of::<Frame>(),
+        std::mem::align_of::<Frame>(),
+        Operation::Count.code(),
+        Operation::Read.code(),
+    )
+}
+
+fn enumerate(run: impl FnMut(Request) -> Result<Frame>) -> Result<Vec<ReadonlyRule>> {
+    let mut rules = Vec::new();
+    read_rows(run, |_, frame| {
+        let call = std::str::from_utf8(frame.field(CALL, 1024)?)
+            .map_err(|_| Error::Refused("invalid root call encoding"))?
+            .to_owned();
+        if !call.is_ascii() || call.bytes().any(|b| b.is_ascii_control()) {
+            return Err(Error::Refused("invalid root call encoding"));
+        }
+        let class = match (frame.0[RULE_ACTION], call.is_empty()) {
+            (0, true) => "pass",
+            (1, true) => "block",
+            (0, false) => "anchor",
+            _ => return Err(Error::Refused("unsupported root filter class")),
+        };
+        rules.push(ReadonlyRule { class, call });
+        Ok(())
+    })?;
+    if !rules.iter().any(|rule| !rule.call.is_empty()) {
+        return Err(Error::Refused("root filter lacks an anchor call"));
+    }
+    Ok(rules)
+}
+
+/// The isolated helper must provide fresh host identifiers and a checked PF device. This
+/// transport accepts only the two read requests, regardless of the descriptor's open mode.
 fn ioctl(device: &File, build: &str, kernel: &str, mut request: Request) -> Result<Frame> {
     request.validate_read_only()?;
     if !nix::unistd::geteuid().is_root() {
@@ -308,6 +370,7 @@ mod tests {
 
     #[test]
     fn requests_match_the_audited_darwin_abi() {
+        assert_eq!(readonly_layout(), (3104, 8, 0xcc20_4406, 0xcc20_4407));
         assert_eq!(Operation::Count.code(), 0xcc20_4406);
         assert_eq!(Operation::Read.code(), 0xcc20_4407);
         assert_eq!(Operation::Insert.code(), 0xcc20_441b);
@@ -468,8 +531,51 @@ mod tests {
     }
 
     #[test]
+    fn readonly_enumeration_requires_stable_nonempty_calls() -> Result<()> {
+        for change in ["ok", "empty", "no-call", "late", "bad-class", "index"] {
+            let mut sweeps = 0;
+            let result = enumerate(|request| match request.operation {
+                Operation::Count => {
+                    sweeps += 1;
+                    let mut frame = request.frame;
+                    frame.set_u32(INDEX, u32::from(change != "empty"));
+                    frame.set_u32(
+                        SET_TICKET,
+                        if change == "late" && sweeps > 1 { 2 } else { 1 },
+                    );
+                    Ok(frame)
+                }
+                Operation::Read => {
+                    let mut frame = request.frame;
+                    if change != "no-call" {
+                        frame.0[CALL..CALL + 11].copy_from_slice(b"com.apple/*");
+                    }
+                    if change == "bad-class" {
+                        frame.0[RULE_ACTION] = 2;
+                    }
+                    if change == "index" {
+                        frame.set_u32(RULE_INDEX, 1);
+                    }
+                    Ok(frame)
+                }
+                _ => Err(Error::Refused("unexpected test request")),
+            });
+            if change == "ok" {
+                assert_eq!(result?.len(), 1);
+            } else {
+                assert!(result.is_err(), "{change}");
+            }
+        }
+        let mut request = Request::new(Operation::Read);
+        request.frame.0[CALL] = 1;
+        assert!(request.validate_read_only().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn transport_refuses_mutations_and_non_pf_descriptors() -> Result<()> {
         let file = tempfile::tempfile()?;
+        assert!(readonly_rules(&file, BUILD, KERNEL).is_err());
         let name = RootName::new(SESSION)?;
         assert!(matches!(
             ioctl(&file, BUILD, KERNEL, name.request(Operation::Insert)),

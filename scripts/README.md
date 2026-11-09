@@ -185,6 +185,12 @@ root只运行系统mktemp、sysctl、script、tee、stat、ls、cat、test、mkd
 
 预检通过时应返回 `preflight_ready` 和 `not_allocated`。实际故障动作在同步提交返回后、发回执前由写入者请求终止自身，父进程须获得 SIGKILL 的直接等待结果及受保护见证。`stage-fault` 和 `recover-fault` 需要单独的本机批准记录，绑定当前启动、已部署构建和基线，并各自要求现场确认。超时、记录缺失、规则不明或旧状态变化时保留现场。等待超时无法确认子进程已退出。
 
+## 根规则读取布局的只读核对
+
+`pf-lab-root-hook-readonly.py plan` 查看本机候选操作。经精确构建审查后，`prepare` 在固定私有目录独占暂存 helper，然后立即执行只读核对。`check` 复用同一启动的受保护副本执行同一核对。脚本本身保持普通用户权限，使用已认证的管理员终端启动固定系统工具和 helper。
+
+`readback_matched` 表示两次系统根规则显示相同，原生读取的条数、顺序、规则类别和调用名与显示相符。结果附根规则摘要。规则票据、owner、修改请求的运行时布局、挂接生效和真实流量需要各自的证据。写请求在此入口一律拒绝。
+
 ## TCP 与 UDP 对端预检
 
 `pf_lab_peer` 是普通用户实验辅助程序。两端使用同一组数字地址、端口、协议和一次性 nonce。接收端报告 `ready` 后可启动发送端。发送端的 `completed` 表示收到了匹配的回显。超时或不一致均失败，保护状态始终为 `not_evaluated`。实机外部地址须来自已确认的受控实验环境。
@@ -203,3 +209,5 @@ cargo build -p tunlatch-platform --example pf_lab_peer --release --locked
 先以 `--role receiver` 或 `--role sender` 只查看计划。仅在确认对端及地址范围后加 `--ack RUN-CONTROLLED-PEER-BATCH`。接收端四项就绪后输出 `ready`，此时发送端可用同一计划启动。任一交换失败时记录 `incomplete` 或 `unavailable`。这些结果用于收发对照，PF 判定始终为 `not_evaluated`。
 
 可将四条待阻断流的端点写成同样的 `cases` 文件，省略 `nonce`，以 `--prepare-controls` 一次生成 `before`、`blocked`、`after` 三组计划。准备命令只向标准输出写 JSON。前后对照保持相同源 IP 和目的端点，使用独立源端口和 nonce。将同一输出用于两端，以 `--phase before`、`--phase blocked` 或 `--phase after` 选择对应组。生成阶段无需打开 socket，端口能否绑定由执行阶段验证。
+
+对端可使用标准 Python 3 接收器。将 `pf-lab-peer-portable.py` 和 `pf-lab-peer-batch.py` 放在同一目录，与发送端使用同一份计划和同一 `--phase`，并在对端确认范围后传入 `--ack RUN-CONTROLLED-PEER-BATCH`。接收端结果报告脚本与计划校验器的摘要。本机 Rust 发送端与便携接收端已完成四路回环互通，仍需受控环境验证外部链路。
