@@ -3,6 +3,8 @@
 use super::driver::{Error, Guard, Identity, Observation, Result};
 use sha2::{Digest, Sha256};
 
+const MAX_REPLY_BYTES: usize = 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct Token(u64);
 impl Token {
@@ -14,11 +16,31 @@ impl Token {
 pub(crate) struct Reply {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
-    pub(crate) success: bool,
+    pub(crate) exit_code: i32,
     pub(crate) truncated: bool,
+    pub(crate) creator_birth: u64,
 }
+/// Cancellation is valid only when the boundary proves the child was never started.
+pub(crate) enum Acquisition {
+    CanceledBeforeStart,
+    Returned(Reply),
+}
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AcquireOutcome {
+    Held,
+    CanceledBeforeStart,
+}
+
+fn reply_bounded(reply: &Reply) -> bool {
+    reply
+        .stdout
+        .len()
+        .checked_add(reply.stderr.len())
+        .is_some_and(|bytes| bytes <= MAX_REPLY_BYTES)
+}
+
 pub(crate) fn parse_token(reply: &Reply) -> Result<Token> {
-    if !reply.success || reply.truncated || reply.stdout.len() + reply.stderr.len() > 1024 {
+    if reply.exit_code != 0 || reply.truncated || !reply_bounded(reply) {
         return Err(Error("incomplete enable reply"));
     }
     let mut found = None;
@@ -59,6 +81,7 @@ pub(crate) enum Phase {
     Held = 2,
     ReleaseIntent = 3,
     Closed = 4,
+    Canceled = 5,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Record {
@@ -113,6 +136,7 @@ impl Record {
             2 => Phase::Held,
             3 => Phase::ReleaseIntent,
             4 => Phase::Closed,
+            5 => Phase::Canceled,
             _ => return Err(Error("unknown reference stage")),
         };
         let value = number(121)?;
@@ -123,7 +147,7 @@ impl Record {
             || identity.controller_birth == 0
             || identity.lock_inode == 0
             || operation == 0
-            || (phase == Phase::AcquireIntent) != (value == 0)
+            || matches!(phase, Phase::AcquireIntent | Phase::Canceled) != (value == 0)
         {
             return Err(Error("inconsistent reference record"));
         }
@@ -136,7 +160,7 @@ impl Record {
     }
     /// An audit classification, never authorization to resume a previous process's cleanup.
     pub(crate) fn requires_takeover(self) -> bool {
-        self.phase != Phase::Closed
+        !matches!(self.phase, Phase::Closed | Phase::Canceled)
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,7 +172,9 @@ pub(crate) trait Boundary {
     fn observe(&mut self) -> Result<Observation>;
     fn list(&mut self) -> Result<Vec<Reference>>;
     fn persist(&mut self, record: &[u8]) -> Result<()>;
-    fn acquire(&mut self) -> Result<Reply>;
+    /// Durably store the complete unmodified process return before parsing it.
+    fn persist_reply(&mut self, reply: &Reply) -> Result<()>;
+    fn acquire(&mut self) -> Result<Acquisition>;
     fn release(&mut self, token: Token) -> Result<()>;
 }
 pub(crate) struct References {
@@ -157,6 +183,7 @@ pub(crate) struct References {
     token: Option<Token>,
     before: Vec<Reference>,
     unknown: bool,
+    creator_birth: u64,
 }
 impl References {
     pub(crate) fn new(guard: Guard) -> Self {
@@ -166,6 +193,7 @@ impl References {
             token: None,
             before: Vec::new(),
             unknown: false,
+            creator_birth: 0,
         }
     }
     pub(crate) fn unknown(&self) -> bool {
@@ -193,7 +221,7 @@ impl References {
         }
         Ok(list)
     }
-    pub(crate) fn acquire(&mut self, b: &mut impl Boundary) -> Result<()> {
+    pub(crate) fn acquire(&mut self, b: &mut impl Boundary) -> Result<AcquireOutcome> {
         if self.unknown || self.phase.is_some() {
             return Err(Error("reference acquisition not repeatable"));
         }
@@ -201,7 +229,22 @@ impl References {
             self.guard.check(b.observe()?)?;
             self.before = Self::list(b)?;
             self.persist(b, Phase::AcquireIntent)?;
-            let token = parse_token(&b.acquire()?)?;
+            let reply = match b.acquire()? {
+                Acquisition::CanceledBeforeStart => {
+                    self.persist(b, Phase::Canceled)?;
+                    return Ok(AcquireOutcome::CanceledBeforeStart);
+                }
+                Acquisition::Returned(reply) => reply,
+            };
+            if !reply_bounded(&reply) {
+                return Err(Error("enable reply exceeds capture bound"));
+            }
+            b.persist_reply(&reply)?;
+            let token = parse_token(&reply)?;
+            if reply.creator_birth == 0 {
+                return Err(Error("enable subprocess identity missing"));
+            }
+            self.creator_birth = reply.creator_birth;
             self.token = Some(token);
             self.guard.check(b.observe()?)?;
             let after = Self::list(b)?;
@@ -211,13 +254,14 @@ impl References {
             let mut expected = self.before.clone();
             expected.push(Reference {
                 token: token.value(),
-                creator_birth: self.guard.identity().controller_birth,
+                creator_birth: self.creator_birth,
             });
             expected.sort_by_key(|r| r.token);
             if after != expected {
                 return Err(Error("acquisition not independently associated"));
             }
-            self.persist(b, Phase::Held)
+            self.persist(b, Phase::Held)?;
+            Ok(AcquireOutcome::Held)
         })();
         if result.is_err() {
             self.unknown = true;
@@ -235,7 +279,7 @@ impl References {
             let mut expected = self.before.clone();
             expected.push(Reference {
                 token: token.value(),
-                creator_birth: self.guard.identity().controller_birth,
+                creator_birth: self.creator_birth,
             });
             expected.sort_by_key(|r| r.token);
             if current != expected {
