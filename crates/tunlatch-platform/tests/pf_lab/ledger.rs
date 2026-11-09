@@ -314,8 +314,7 @@ impl Ledger {
     }
 
     /// Requires one intent, its matching observation, and close in a reopened journal.
-    #[cfg(test)]
-    #[allow(dead_code)] // Used only by the offline root hook test target.
+    #[allow(dead_code)] // Only the attached-flow targets require this check.
     pub(crate) fn is_single_closed_operation(&self, operation: Operation) -> Result<bool> {
         use std::os::unix::fs::FileExt;
 

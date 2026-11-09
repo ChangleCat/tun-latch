@@ -21,10 +21,13 @@ const PROGRAM: &str = "pf-lab-sync";
 const EXECUTABLE: &str = "/private/var/root/tunlatch-pf-sync/pf-lab-sync";
 const FAULT_BASE: &str = "/private/var/root/tunlatch-pf-sync-fault";
 const FAULT_EXECUTABLE: &str = "/private/var/root/tunlatch-pf-sync-fault/pf-lab-sync";
+const FLOW_BASE: &str = "/private/var/root/tunlatch-pf-first-flow";
+const FLOW_PROGRAM: &str = "pf-lab-first-flow";
+const FLOW_EXECUTABLE: &str = "/private/var/root/tunlatch-pf-first-flow/pf-lab-first-flow";
 const MAX_PROGRAM: usize = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 1024 * 1024;
 
-fn record_name(name: &str, fault: bool) -> Result<()> {
+fn record_name(name: &str, layout: Layout) -> Result<()> {
     if matches!(
         name,
         "operator-manifest.json"
@@ -35,11 +38,12 @@ fn record_name(name: &str, fault: bool) -> Result<()> {
             | "after-recovery.json"
             | "recovery-return.sha256"
             | "unrecognized-slot.json"
-    ) || (fault
+    ) || (layout == Layout::Fault
         && matches!(
             name,
             "fault-launch.json" | "fault-before-signal.json" | "fault-reaped.json"
         ))
+        || (layout == Layout::Flow && name == "flow-plan.json")
     {
         Ok(())
     } else {
@@ -106,7 +110,24 @@ fn read_bounded(file: &File, max: usize, mode: u32) -> Result<Vec<u8>> {
 pub(crate) struct Storage {
     chain: ObservedChain,
     program: File,
-    fault: bool,
+    layout: Layout,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Layout {
+    Sync,
+    Fault,
+    Flow,
+}
+
+impl Layout {
+    fn paths(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Sync => (BASE, PROGRAM, EXECUTABLE),
+            Self::Fault => (FAULT_BASE, PROGRAM, FAULT_EXECUTABLE),
+            Self::Flow => (FLOW_BASE, FLOW_PROGRAM, FLOW_EXECUTABLE),
+        }
+    }
 }
 
 impl Storage {
@@ -115,49 +136,48 @@ impl Storage {
             return Err(Error::Refused("requires root and fixed executable path"));
         }
         let executable = std::env::current_exe()?;
-        let fault = if executable == Path::new(EXECUTABLE) {
-            false
+        let layout = if executable == Path::new(EXECUTABLE) {
+            Layout::Sync
         } else if executable == Path::new(FAULT_EXECUTABLE) {
-            true
+            Layout::Fault
+        } else if executable == Path::new(FLOW_EXECUTABLE) {
+            Layout::Flow
         } else {
             return Err(Error::Refused("requires root and fixed executable path"));
         };
-        let base = if fault { FAULT_BASE } else { BASE };
+        let (base, program_name, _) = layout.paths();
         let chain = ObservedChain::open(Path::new(base))?;
         checked(chain.directory()?, 0o700, true)?;
-        let program = open_file(chain.directory()?, PROGRAM, OFlag::O_RDONLY, 0)?;
+        let program = open_file(chain.directory()?, program_name, OFlag::O_RDONLY, 0)?;
         checked(&program, 0o500, false)?;
         let result = Self {
             chain,
             program,
-            fault,
+            layout,
         };
         result.recheck()?;
         Ok(result)
     }
 
     pub(crate) fn is_fault(&self) -> bool {
-        self.fault
+        self.layout == Layout::Fault
     }
 
     pub(crate) fn executable(&self) -> &'static str {
-        if self.fault {
-            FAULT_EXECUTABLE
-        } else {
-            EXECUTABLE
-        }
+        self.layout.paths().2
     }
 
     pub(crate) fn recheck(&self) -> Result<()> {
         self.chain.recheck()?;
         let old = checked(self.chain.directory()?, 0o700, true)?;
-        let fresh = ObservedChain::open(Path::new(if self.fault { FAULT_BASE } else { BASE }))?;
+        let (base, program_name, _) = self.layout.paths();
+        let fresh = ObservedChain::open(Path::new(base))?;
         let new = checked(fresh.directory()?, 0o700, true)?;
         if identity(&old) != identity(&new) {
             return Err(Error::Refused("protected directory replaced"));
         }
         let held = checked(&self.program, 0o500, false)?;
-        let named = open_file(fresh.directory()?, PROGRAM, OFlag::O_RDONLY, 0)?;
+        let named = open_file(fresh.directory()?, program_name, OFlag::O_RDONLY, 0)?;
         let named = checked(&named, 0o500, false)?;
         if !unchanged(&held, &named) {
             return Err(Error::Refused("protected executable replaced"));
@@ -168,7 +188,12 @@ impl Storage {
     pub(crate) fn program_digest(&self) -> Result<[u8; 32]> {
         self.recheck()?;
         // Open a second descriptor to avoid a shared seek position between digest calls.
-        let program = open_file(self.chain.directory()?, PROGRAM, OFlag::O_RDONLY, 0)?;
+        let program = open_file(
+            self.chain.directory()?,
+            self.layout.paths().1,
+            OFlag::O_RDONLY,
+            0,
+        )?;
         if identity(&program.metadata()?) != identity(&self.program.metadata()?) {
             return Err(Error::Refused("executable identity changed"));
         }
@@ -181,8 +206,8 @@ impl Storage {
     }
 
     pub(crate) fn exists(&self, name: &str) -> Result<bool> {
-        if !(matches!(name, "stage" | "recovery") || self.fault && name == "fault-ready") {
-            record_name(name, self.fault)?;
+        if !self.subdirectory_name(name) {
+            record_name(name, self.layout)?;
         }
         self.recheck()?;
         match fstatat(self.chain.directory()?, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
@@ -193,7 +218,7 @@ impl Storage {
     }
 
     pub(crate) fn read(&self, name: &str, max: usize) -> Result<Vec<u8>> {
-        record_name(name, self.fault)?;
+        record_name(name, self.layout)?;
         if max > MAX_RECORD {
             return Err(Error::Refused("record limit excessive"));
         }
@@ -212,7 +237,7 @@ impl Storage {
     }
 
     pub(crate) fn write(&self, name: &str, data: &[u8]) -> Result<()> {
-        record_name(name, self.fault)?;
+        record_name(name, self.layout)?;
         if data.len() > MAX_RECORD {
             return Err(Error::Refused("record limit excessive"));
         }
@@ -236,7 +261,7 @@ impl Storage {
     }
 
     pub(crate) fn subdir(&self, name: &str, create: bool) -> Result<File> {
-        if !(matches!(name, "stage" | "recovery") || self.fault && name == "fault-ready") {
+        if !self.subdirectory_name(name) {
             return Err(Error::Refused("unsupported subdirectory"));
         }
         self.recheck()?;
@@ -262,5 +287,11 @@ impl Storage {
         }
         self.recheck()?;
         Ok(dir)
+    }
+
+    fn subdirectory_name(&self, name: &str) -> bool {
+        matches!(name, "stage" | "recovery")
+            || self.is_fault() && name == "fault-ready"
+            || self.layout == Layout::Flow && matches!(name, "hook" | "flow-lock")
     }
 }

@@ -123,13 +123,19 @@ impl<'a> Trial<'a> {
         .map_err(Error::Refused)
     }
 
-    fn attached(&mut self, boundary: &mut impl Boundary, ticket: NonZeroU64) -> Result<Receipt> {
+    fn attached(
+        &mut self,
+        boundary: &mut impl Boundary,
+        ticket: NonZeroU64,
+        require_empty: bool,
+    ) -> Result<Receipt> {
         let view = self.observe(boundary)?;
         let (owner, receipt) = view.hook.ok_or(Error::Refused("root call missing"))?;
         if owner != self.anchor
             || receipt.ticket != ticket
             || receipt.index != self.index
-            || view.leaf != Leaf::Empty
+            || view.leaf == Leaf::Absent
+            || require_empty && view.leaf != Leaf::Empty
             || !view.states_and_sources_empty
         {
             return Err(Error::Refused(
@@ -172,7 +178,7 @@ impl<'a> Trial<'a> {
             file.write_all(&record)?;
             file.sync_all()?;
             directory.sync_all()?;
-            let observed = self.attached(boundary, ticket)?;
+            let observed = self.attached(boundary, ticket, true)?;
             if read_receipt(directory, self.binding)? != observed {
                 return Err(Error::Refused("root call receipt readback changed"));
             }
@@ -184,16 +190,7 @@ impl<'a> Trial<'a> {
     /// Reopens the original journal and uses a separate one-shot removal ledger. The supplied
     /// boundary must attest continuity of the original exclusive window and writer termination.
     pub(crate) fn detach(&mut self, directory: &File, boundary: &mut impl Boundary) -> Result<()> {
-        let stage = Ledger::reopen(directory.try_clone()?)?;
-        if stage.identity() != (self.guard.identity().session, self.binding)
-            || !stage.is_single_closed_operation(Operation::ChangeHook)?
-        {
-            return Err(Error::Refused("original root call stage not verified"));
-        }
-        let receipt = read_receipt(directory, self.binding)?;
-        if self.attached(boundary, receipt.ticket)? != receipt {
-            return Err(Error::Refused("root call position changed"));
-        }
+        let (stage, receipt) = self.verified_creation(directory, boundary, true)?;
         mkdirat(directory, "remove", Mode::from_bits_truncate(0o700))?;
         directory.sync_all()?;
         let open_removal = || -> Result<File> {
@@ -214,7 +211,7 @@ impl<'a> Trial<'a> {
         removal.begin(Operation::ChangeHook)?;
         let result = (|| {
             if read_receipt(directory, self.binding)? != receipt
-                || self.attached(boundary, receipt.ticket)? != receipt
+                || self.attached(boundary, receipt.ticket, true)? != receipt
             {
                 return Err(Error::Refused(
                     "root call receipt or position changed before removal",
@@ -231,6 +228,53 @@ impl<'a> Trial<'a> {
             self.detached(boundary, false)
         })();
         finish(removal, result)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn verified_creation(
+        &mut self,
+        directory: &File,
+        boundary: &mut impl Boundary,
+        require_empty: bool,
+    ) -> Result<(Ledger, Receipt)> {
+        let (stage, receipt) = self.creation_record(directory)?;
+        if self.attached(boundary, receipt.ticket, require_empty)? != receipt {
+            return Err(Error::Refused("root call position changed"));
+        }
+        Ok((stage, receipt))
+    }
+
+    pub(crate) fn creation_record(&self, directory: &File) -> Result<(Ledger, Receipt)> {
+        let stage = Ledger::reopen(directory.try_clone()?)?;
+        if stage.identity() != (self.guard.identity().session, self.binding)
+            || !stage.is_single_closed_operation(Operation::ChangeHook)?
+        {
+            return Err(Error::Refused("original root call stage not verified"));
+        }
+        let receipt = read_receipt(directory, self.binding)?;
+        Ok((stage, receipt))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn removal_verified(&self, directory: &File) -> Result<bool> {
+        let removal: File = match openat(
+            directory,
+            "remove",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd.into(),
+            Err(Errno::ENOENT) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let stage = Ledger::reopen(directory.try_clone()?)?;
+        let removal = Ledger::reopen(removal)?;
+        let identity = (self.guard.identity().session, self.binding);
+        Ok(stage.identity() == identity
+            && removal.identity() == identity
+            && read_receipt(directory, self.binding).is_ok()
+            && stage.is_single_closed_operation(Operation::ChangeHook)?
+            && removal.is_single_closed_operation(Operation::ChangeHook)?)
     }
 }
 

@@ -1,11 +1,11 @@
-//! Experimental root filter hook ABI. Compiled only for offline tests until the protected
-//! operator, runtime layout qualification, and independent recovery are connected.
+//! Experimental root filter hook ABI. Writes are confined to the fixed protected trial.
 
 use std::fs::{File, symlink_metadata};
 use std::io;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::Path;
 
 use nix::libc;
 
@@ -171,12 +171,24 @@ impl Request {
         }
         Ok(())
     }
+
+    fn validate(&self, write_scope: Option<&RootName>) -> Result<()> {
+        let expected = match (self.operation, write_scope) {
+            (Operation::Insert, Some(name)) => name.request(Operation::Insert),
+            (Operation::Delete, Some(name)) => Self::delete(name, self.frame.rule_ticket()?),
+            _ => return self.validate_read_only(),
+        };
+        if self.frame.0 != expected.frame.0 {
+            return Err(Error::Refused("unexpected protected PF write request"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct Hook {
-    index: u32,
-    ticket: NonZeroU64,
+pub(crate) struct Hook {
+    pub(crate) index: u32,
+    pub(crate) ticket: NonZeroU64,
 }
 
 fn summary(frame: &Frame) -> Result<(u32, u32)> {
@@ -274,6 +286,80 @@ fn remove(
     run(Request::delete(name, ticket)).map(|_| ())
 }
 
+/// Fixed scope checked by the transport as well as the operator. The caller holds the
+/// protected session lock and durably records intent before invoking either write.
+pub(crate) struct Writer<'a> {
+    device: &'a File,
+    build: &'a str,
+    kernel: &'a str,
+    name: RootName,
+}
+
+impl<'a> Writer<'a> {
+    pub(crate) fn new(
+        device: &'a File,
+        build: &'a str,
+        kernel: &'a str,
+        session: &str,
+    ) -> Result<Self> {
+        check_writer_location()?;
+        check_host(build, kernel)?;
+        Ok(Self {
+            device,
+            build,
+            kernel,
+            name: RootName::new(session)?,
+        })
+    }
+
+    pub(crate) fn index(&self) -> Result<u32> {
+        insertion_index(|req| self.read(req))
+    }
+
+    pub(crate) fn observe(&self) -> Result<Option<Hook>> {
+        observe(&self.name, |req| self.read(req))
+    }
+
+    pub(crate) fn insert(&self, expected_index: u32) -> Result<NonZeroU64> {
+        if self.observe()?.is_some() || self.index()? != expected_index {
+            return Err(Error::Refused("root changed before insertion"));
+        }
+        insert(&self.name, |req| self.write(req))
+    }
+
+    pub(crate) fn remove(&self, index: u32, ticket: NonZeroU64) -> Result<()> {
+        if self.observe()? != Some(Hook { index, ticket }) {
+            return Err(Error::Refused("root changed before deletion"));
+        }
+        remove(&self.name, ticket, |req| self.write(req))
+    }
+
+    fn read(&self, request: Request) -> Result<Frame> {
+        ioctl(self.device, self.build, self.kernel, request)
+    }
+
+    fn write(&self, request: Request) -> Result<Frame> {
+        check_writer_location()?;
+        ioctl_scoped(
+            self.device,
+            self.build,
+            self.kernel,
+            request,
+            Some(&self.name),
+        )
+    }
+}
+
+fn check_writer_location() -> Result<()> {
+    if !nix::unistd::geteuid().is_root()
+        || std::env::current_exe()?
+            != Path::new("/private/var/root/tunlatch-pf-first-flow/pf-lab-first-flow")
+    {
+        return Err(Error::Refused("requires fixed protected writer executable"));
+    }
+    Ok(())
+}
+
 /// Static candidate layout gate. Identifiers must come from the current host. Matching
 /// identifiers still require independent read-only ABI qualification before any live writes.
 pub(crate) fn check_host(build: &str, kernel: &str) -> Result<()> {
@@ -297,6 +383,51 @@ pub(crate) struct ReadonlyRule {
     pub(crate) call: String,
 }
 
+pub(crate) fn parse_rules(bytes: &[u8]) -> Result<Vec<ReadonlyRule>> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| Error::Refused("invalid root rule output"))?;
+    if !text.is_ascii()
+        || (!text.is_empty() && !text.ends_with('\n'))
+        || text
+            .bytes()
+            .any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\t'))
+    {
+        return Err(Error::Refused("invalid root rule framing"));
+    }
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_ascii_whitespace();
+        let class = words.next().ok_or(Error::Refused("empty root rule"))?;
+        // pfctl shows the system scrub hook with filters. PF_PASS selects only the
+        // filter ruleset; the full textual before/after check still covers this line.
+        if line == "scrub-anchor \"com.apple/*\" all fragment reassemble" {
+            continue;
+        }
+        let call = match class {
+            "pass" | "block" => String::new(),
+            "anchor" => words
+                .next()
+                .and_then(|s| s.strip_prefix('"'))
+                .and_then(|s| s.strip_suffix('"'))
+                .filter(|s| !s.is_empty())
+                .ok_or(Error::Refused("unsupported root call"))?
+                .to_owned(),
+            _ => return Err(Error::Refused("unsupported root rule class")),
+        };
+        if result.len() >= 256 {
+            return Err(Error::Refused("invalid or excessive root rule output"));
+        }
+        result.push(ReadonlyRule {
+            class: match class {
+                "pass" => "pass",
+                "block" => "block",
+                _ => "anchor",
+            },
+            call,
+        });
+    }
+    Ok(result)
+}
 pub(crate) fn readonly_rules(
     device: &File,
     build: &str,
@@ -340,8 +471,18 @@ fn enumerate(run: impl FnMut(Request) -> Result<Frame>) -> Result<Vec<ReadonlyRu
 
 /// The isolated helper must provide fresh host identifiers and a checked PF device. This
 /// transport accepts only the two read requests, regardless of the descriptor's open mode.
-fn ioctl(device: &File, build: &str, kernel: &str, mut request: Request) -> Result<Frame> {
-    request.validate_read_only()?;
+fn ioctl(device: &File, build: &str, kernel: &str, request: Request) -> Result<Frame> {
+    ioctl_scoped(device, build, kernel, request, None)
+}
+
+fn ioctl_scoped(
+    device: &File,
+    build: &str,
+    kernel: &str,
+    mut request: Request,
+    write_scope: Option<&RootName>,
+) -> Result<Frame> {
+    request.validate(write_scope)?;
     if !nix::unistd::geteuid().is_root() {
         return Err(Error::Refused("PF device requires an administrator"));
     }
@@ -388,6 +529,44 @@ mod tests {
     const BUILD: &str = "25G83";
     const KERNEL: &str = "Darwin Kernel Version 25.6.0: Fri Jul 31 19:16:20 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T8142";
     const NATIVE_TICKET: u64 = 0x9134_5678_0000_0015;
+
+    #[test]
+    fn ordinary_or_wrong_device_writer_cannot_execute_any_operation() -> Result<()> {
+        let device = File::open("/dev/null")?;
+        assert!(Writer::new(&device, BUILD, KERNEL, SESSION).is_err());
+        let writer = Writer {
+            device: &device,
+            build: BUILD,
+            kernel: KERNEL,
+            name: RootName::new(SESSION)?,
+        };
+        let ticket = NonZeroU64::new(NATIVE_TICKET).ok_or(Error::Refused("test ticket"))?;
+        assert!(writer.index().is_err());
+        assert!(writer.observe().is_err());
+        assert!(writer.insert(0).is_err());
+        assert!(writer.remove(0, ticket).is_err());
+        assert!(
+            writer
+                .write(writer.name.request(Operation::Insert))
+                .is_err()
+        );
+        assert!(
+            Request::new(Operation::Delete)
+                .validate(Some(&writer.name))
+                .is_err()
+        );
+        let rules = parse_rules(
+            b"scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all\n",
+        )?;
+        assert_eq!(
+            rules,
+            vec![ReadonlyRule {
+                class: "anchor",
+                call: "com.apple/*".to_owned()
+            }]
+        );
+        Ok(())
+    }
 
     #[test]
     fn requests_match_the_audited_darwin_abi() {

@@ -33,20 +33,41 @@ pub(crate) struct Guard {
 }
 impl Guard {
     pub(crate) fn new(identity: Identity, now_ms: u64) -> Result<Self> {
-        if nix::unistd::geteuid().is_root()
-            || identity.boot == [0; 32]
+        if nix::unistd::geteuid().is_root() {
+            return Err(Error("missing ordinary-user session identity"));
+        }
+        Self::bounded(identity, now_ms, 10_000)
+    }
+
+    // The fixed experiment binary authenticates the protected session and holds its
+    // lock; this only supplies a time and operation bound for that existing authority.
+    #[allow(dead_code)]
+    pub(crate) fn protected(identity: Identity, now_ms: u64) -> Result<Self> {
+        if !nix::unistd::geteuid().is_root()
+            || std::env::current_exe().ok().as_deref()
+                != Some(std::path::Path::new(
+                    "/private/var/root/tunlatch-pf-first-flow/pf-lab-first-flow",
+                ))
+        {
+            return Err(Error("missing fixed protected writer"));
+        }
+        Self::bounded(identity, now_ms, 120_000)
+    }
+
+    fn bounded(identity: Identity, now_ms: u64, duration: u64) -> Result<Self> {
+        if identity.boot == [0; 32]
             || identity.session == [0; 32]
             || identity.plan == [0; 32]
             || identity.controller_birth == 0
             || identity.lock_inode == 0
         {
-            return Err(Error("missing ordinary-user session identity"));
+            return Err(Error("missing session identity"));
         }
         Ok(Self {
             identity,
             sequence: 0,
             now_ms,
-            deadline: now_ms.checked_add(10_000).ok_or(Error("time overflow"))?,
+            deadline: now_ms.checked_add(duration).ok_or(Error("time overflow"))?,
             operations: 0,
         })
     }

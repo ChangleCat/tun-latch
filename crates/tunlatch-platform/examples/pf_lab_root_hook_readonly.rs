@@ -176,49 +176,7 @@ struct Manifest {
 }
 
 fn parse_rules(bytes: &[u8]) -> Result<Vec<native_hook::ReadonlyRule>> {
-    let text =
-        std::str::from_utf8(bytes).map_err(|_| Error::Refused("invalid root rule output"))?;
-    if !text.is_ascii()
-        || (!text.is_empty() && !text.ends_with('\n'))
-        || text
-            .bytes()
-            .any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\t'))
-    {
-        return Err(Error::Refused("invalid root rule framing"));
-    }
-    let mut result = Vec::new();
-    for line in text.lines() {
-        let mut words = line.split_ascii_whitespace();
-        let class = words.next().ok_or(Error::Refused("empty root rule"))?;
-        // pfctl shows the system scrub hook with filters. PF_PASS selects only the
-        // filter ruleset; the full textual before/after check still covers this line.
-        if line == "scrub-anchor \"com.apple/*\" all fragment reassemble" {
-            continue;
-        }
-        let call = match class {
-            "pass" | "block" => String::new(),
-            "anchor" => words
-                .next()
-                .and_then(|s| s.strip_prefix('"'))
-                .and_then(|s| s.strip_suffix('"'))
-                .filter(|s| !s.is_empty())
-                .ok_or(Error::Refused("unsupported root call"))?
-                .to_owned(),
-            _ => return Err(Error::Refused("unsupported root rule class")),
-        };
-        if result.len() >= 256 {
-            return Err(Error::Refused("invalid or excessive root rule output"));
-        }
-        result.push(native_hook::ReadonlyRule {
-            class: match class {
-                "pass" => "pass",
-                "block" => "block",
-                _ => "anchor",
-            },
-            call,
-        });
-    }
-    Ok(result)
+    native_hook::parse_rules(bytes).map_err(|_| Error::Refused("invalid system root filter output"))
 }
 fn check() -> Result<Value> {
     let protected = Protected::open()?;

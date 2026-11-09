@@ -118,6 +118,55 @@ pub(crate) struct Manifest {
     reports: Reports,
 }
 type Key = (String, String);
+pub(crate) struct CheckedCase {
+    key: Key,
+    pub(crate) plan: Plan,
+    nonces: [[u8; 16]; 3],
+}
+
+impl FrozenPlan {
+    pub(crate) fn checked(self, interface: &str) -> Result<[CheckedCase; 4]> {
+        let before = cases(self.before.cases)?;
+        let blocked = cases(self.blocked.cases)?;
+        let after = cases(self.after.cases)?;
+        let mut nonces = BTreeSet::new();
+        let mut flows = BTreeSet::new();
+        let mut checked = Vec::with_capacity(4);
+        for (index, (key, (negative, negative_nonce))) in blocked.into_iter().enumerate() {
+            let &(pre, pre_nonce) = before.get(&key).ok_or(Error("missing before case"))?;
+            let &(post, post_nonce) = after.get(&key).ok_or(Error("missing after case"))?;
+            let plan = Plan {
+                case_id: u32::try_from(index + 1).map_err(|_| Error("case id"))?,
+                interface: interface.to_owned(),
+                before_control: pre,
+                negative,
+                after_control: post,
+                application: Application::Probe,
+            };
+            plan.validate()?;
+            for (flow, nonce) in [
+                (pre, pre_nonce),
+                (negative, negative_nonce),
+                (post, post_nonce),
+            ] {
+                if !flows.insert((flow.source, flow.destination, key.1.clone()))
+                    || !nonces.insert(nonce)
+                {
+                    return Err(Error("reused flow or nonce"));
+                }
+            }
+            checked.push(CheckedCase {
+                key,
+                plan,
+                nonces: [pre_nonce, negative_nonce, post_nonce],
+            });
+        }
+        checked
+            .try_into()
+            .map_err(|_| Error("four exact flow cases required"))
+    }
+}
+
 fn cases(cases: Vec<Case>) -> Result<BTreeMap<Key, (Flow, [u8; 16])>> {
     let mut out = BTreeMap::new();
     for c in cases {
@@ -236,18 +285,11 @@ fn receiver_ack(report: &PeerReport, key: &Key, flow: Flow, nonce: [u8; 16]) -> 
     Ok(item.result == "nonce_received_and_echoed")
 }
 pub(crate) fn evaluate(manifest: Manifest, bytes: &[u8]) -> Result<Value> {
-    let before = cases(manifest.plan.before.cases)?;
-    let blocked = cases(manifest.plan.blocked.cases)?;
-    let after = cases(manifest.plan.after.cases)?;
-    let rule_flows = blocked
-        .values()
-        .map(|(flow, _)| RuleFlow {
-            source: flow.source,
-            destination: flow.destination,
-        })
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| Error("four exact rule flows required"))?;
+    let checked = manifest.plan.checked(&manifest.interface)?;
+    let rule_flows = checked.each_ref().map(|case| RuleFlow {
+        source: case.plan.negative.source,
+        destination: case.plan.negative.destination,
+    });
     let filter = ExactFilter::new(&manifest.pf.anchor_suffix, &manifest.interface, rule_flows)
         .map_err(|_| Error("invalid exact rule scope"))?;
     let deltas = if filter.matches_observed(manifest.pf.rules_before.as_bytes())
@@ -260,8 +302,6 @@ pub(crate) fn evaluate(manifest: Manifest, bytes: &[u8]) -> Result<Value> {
     } else {
         None
     };
-    let mut nonces = BTreeSet::new();
-    let mut flows = BTreeSet::new();
     let mut evidence = BTreeMap::new();
     for item in manifest.evidence {
         let key = (item.family.clone(), item.protocol.clone());
@@ -294,30 +334,23 @@ pub(crate) fn evaluate(manifest: Manifest, bytes: &[u8]) -> Result<Value> {
     let mut results = Vec::new();
     let mut any_leak = false;
     let mut any_incomplete = false;
-    for (index, (key, &(negative, negative_nonce))) in blocked.iter().enumerate() {
-        let delta = deltas.map(|counts| counts[index]);
-        let &(pre, pre_nonce) = before.get(key).ok_or(Error("missing before case"))?;
-        let &(post, post_nonce) = after.get(key).ok_or(Error("missing after case"))?;
-        let e = evidence.get(key).ok_or(Error("missing direct evidence"))?;
-        let plan = Plan {
-            case_id: u32::try_from(index + 1).map_err(|_| Error("case id"))?,
-            interface: manifest.interface.clone(),
+    for (
+        index,
+        CheckedCase {
+            key,
+            plan,
+            nonces: [pre_nonce, negative_nonce, post_nonce],
+        },
+    ) in checked.into_iter().enumerate()
+    {
+        let Plan {
             before_control: pre,
             negative,
             after_control: post,
-            application: Application::Probe,
-        };
-        plan.validate()?;
-        for (flow, nonce) in [
-            (pre, pre_nonce),
-            (negative, negative_nonce),
-            (post, post_nonce),
-        ] {
-            let tuple = (flow.source, flow.destination, key.1.clone());
-            if !flows.insert(tuple) || !nonces.insert(nonce) {
-                return Err(Error("reused flow or nonce"));
-            }
-        }
+            ..
+        } = plan;
+        let delta = deltas.map(|counts| counts[index]);
+        let e = evidence.get(&key).ok_or(Error("missing direct evidence"))?;
         // Any packet on the unique blocked tuple within the capture is a potential leak,
         // including a TCP SYN without application bytes or a nonce.
         let leaked = packets.iter().filter(|p| p.flow == negative).count();
@@ -331,9 +364,9 @@ pub(crate) fn evaluate(manifest: Manifest, bytes: &[u8]) -> Result<Value> {
                 && within(p.at_us, &w.after)
                 && p.payload.windows(16).any(|v| v == post_nonce)
         });
-        let before_ack = receiver_ack(&manifest.reports.before, key, pre, pre_nonce)?;
-        let after_ack = receiver_ack(&manifest.reports.after, key, post, post_nonce)?;
-        let blocked_ack = receiver_ack(&manifest.reports.blocked, key, negative, negative_nonce)?;
+        let before_ack = receiver_ack(&manifest.reports.before, &key, pre, pre_nonce)?;
+        let after_ack = receiver_ack(&manifest.reports.after, &key, post, post_nonce)?;
+        let blocked_ack = receiver_ack(&manifest.reports.blocked, &key, negative, negative_nonce)?;
         let complete = manifest.capture_complete
             && manifest.capture_dropped == 0
             && pre_seen
