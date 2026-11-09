@@ -1,5 +1,23 @@
 # 本机诊断与受控实验
 
+## 物理流量计划与离线核对
+
+由 `pf-lab-peer-batch.py --prepare-controls` 生成三阶段计划后，可用普通用户权限检查源地址和路由，并生成只包含本轮 12 条流的抓包过滤式。
+
+```sh
+/usr/bin/python3 scripts/pf-lab-flow-preflight.py phases.json --interface en0
+```
+
+预检只查询接口、路由和本机启动标识。源地址不在指定物理口、目的路由转入 TUN 或采样间地址变化时停止。通过表示此次路由观察与计划相符。目标端可达性由实际对照探针核实。
+
+已有采集文件时可离线运行以下核对。清单包含冻结计划、采集和阶段时间、各阶段接收端回报、待阻断流的逐项发送证据，以及探针前后同一叶槽的原始规则和标签计数输出。
+
+```sh
+cargo run -p tunlatch-platform --locked --example pf_lab_capture_eval -- manifest.json capture.pcap
+```
+
+`potential_leak` 表示捕获到待阻断流的五元组，包含无应用载荷的 TCP SYN。只有每项都有前后正向对照、完整的无丢包采集、发送证据及对应规则的出站计数增长，才得到 `no_observed_leak`。输出范围为 `offline_unverified_input`，取决于提供的采集和记录来源。
+
 ## 单次管理员身份只读采集
 
 `identity-readonly.py` 用于当前机器上一项受审查的开发诊断：读取一个明确选择的进程的 PID、UID、出生时间、FD 类型及 kernel-control 注册信息。它不会更改 PF、网络、代理或启动项，也不会读取进程命令行、环境、配置、连接端点或输出内核 opaque 值。结果仍是原始采样，不能据此授信 TUN 或宣称已保护。
