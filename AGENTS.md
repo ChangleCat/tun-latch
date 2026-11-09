@@ -29,7 +29,14 @@ Clippy rejects warnings. Create a private directory using `mktemp -d /tmp/tunlat
 
 ## Coding Style & Naming Conventions
 
-Rust 2024: four-space indentation, 100-column rustfmt width; YAML: two spaces. Use `snake_case` for modules/functions and `UpperCamelCase` for types. New crates inherit workspace metadata, dependencies, and lints. Use typed errors; avoid `unwrap`, `expect`, and explicit panics. Workspace code denies `unsafe`, with one user-approved exception: `tunlatch-platform/src/identity/native.rs` may contain the minimal, independently reviewed read-only `proc_pidinfo` / `proc_pidfdinfo` adapter and checked kernel-control union access. Keep all other code denied, expose only safe owned results, document every unsafe operation, and enforce exact lengths and fixed resource limits. This exception grants no PF writes, privilege escalation, or service installation. Document public contracts; isolate native network/PF integration in `tunlatch-platform`.
+Rust 2024: four-space indentation, 100-column rustfmt width; YAML: two spaces. Use `snake_case` for modules/functions and `UpperCamelCase` for types. New crates inherit workspace metadata, dependencies, and lints. Use typed errors; avoid `unwrap`, `expect`, and explicit panics. Document public contracts; isolate native network/PF integration in `tunlatch-platform`.
+
+Workspace code denies `unsafe` except for these independently reviewed adapters:
+
+- `tunlatch-platform/src/identity/native.rs` may contain the minimal read-only `proc_pidinfo` / `proc_pidfdinfo` adapter and checked kernel-control union access.
+- `tunlatch-platform/src/pf/native_hook.rs` may contain one minimal `ioctl` call site for `DIOCGETRULES`, `DIOCGETRULE`, `DIOCINSERTRULE`, and `DIOCDELETERULE` for the isolated root filter hook experiment. Require exact ABI and OS build qualification, fixed requests, a nonzero per-rule deletion ticket, and separate protected experiment authorization before any live writes.
+
+Keep all other code denied. Expose only safe owned results, document each unsafe operation, and enforce exact lengths and fixed resource limits. These exceptions grant no live PF operations, privilege escalation, or service installation.
 
 ## Testing Guidelines
 
