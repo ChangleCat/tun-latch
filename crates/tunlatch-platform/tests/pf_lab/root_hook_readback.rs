@@ -2,6 +2,7 @@
 
 const MAX_BYTES: usize = 65_536;
 const MAX_RULES: usize = 256;
+const SYSTEM_SCRUB: &[u8] = b"scrub-anchor \"com.apple/*\" all fragment reassemble\n";
 
 /// Bytes from one root filter query. `complete` must reflect successful, untruncated capture.
 pub(crate) struct Observation<'a> {
@@ -32,6 +33,35 @@ fn lines(observation: Observation<'_>) -> Result<Vec<&[u8]>, &'static str> {
     {
         return Err("empty or excessive root rules");
     }
+    // pfctl displays the system scrub hook before the PF_PASS filter ruleset.
+    // Only the previously observed canonical line is supported; unknown classes or
+    // scrub spellings cannot safely be mapped to native filter indices.
+    let mut saw_filter = false;
+    let mut saw_scrub = false;
+    for line in &rules {
+        if *line == SYSTEM_SCRUB && !saw_filter && !saw_scrub {
+            saw_scrub = true;
+            continue;
+        }
+        let text = std::str::from_utf8(line).map_err(|_| "invalid root rule")?;
+        let mut words = text.split_ascii_whitespace();
+        match words.next() {
+            Some("pass" | "block") if words.next().is_some() => {}
+            Some("anchor") => {
+                let name = words.next().ok_or("invalid root call")?;
+                if name
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .is_none_or(str::is_empty)
+                    || words.next().is_none()
+                {
+                    return Err("invalid root call");
+                }
+            }
+            _ => return Err("unsupported root rule class"),
+        }
+        saw_filter = true;
+    }
     Ok(rules)
 }
 
@@ -46,19 +76,34 @@ pub(crate) fn verify(
 ) -> Result<(), &'static str> {
     let baseline = baseline_without_call(baseline, anchor)?;
     let current = lines(current)?;
-    if native_index > baseline.len() {
-        return Err("invalid insertion index");
-    }
+    let display_index = display_index(&baseline, native_index)?;
     let call = format!("anchor \"{anchor}\" all\n");
-    if current.len() != baseline.len() + 1 || current.get(native_index) != Some(&call.as_bytes()) {
+    if current.len() != baseline.len() + 1 || current.get(display_index) != Some(&call.as_bytes()) {
         return Err("root call missing, malformed, or at wrong index");
     }
-    if current[..native_index] != baseline[..native_index]
-        || current[native_index + 1..] != baseline[native_index..]
+    if current[..display_index] != baseline[..display_index]
+        || current[display_index + 1..] != baseline[display_index..]
     {
         return Err("foreign root rules changed");
     }
     Ok(())
+}
+
+/// Validate an insertion position in the native PF_PASS filter ruleset.
+pub(crate) fn validate_index(
+    baseline: Observation<'_>,
+    anchor: &str,
+    native_index: usize,
+) -> Result<(), &'static str> {
+    display_index(&baseline_without_call(baseline, anchor)?, native_index).map(|_| ())
+}
+
+fn display_index(baseline: &[&[u8]], native_index: usize) -> Result<usize, &'static str> {
+    let scrub_offset = usize::from(baseline.first() == Some(&SYSTEM_SCRUB));
+    if native_index > baseline.len() - scrub_offset {
+        return Err("invalid insertion index");
+    }
+    Ok(scrub_offset + native_index)
 }
 
 pub(crate) fn verify_detached(
@@ -125,6 +170,40 @@ mod tests {
             assert!(verify(observe(BASE), observe(&current), ANCHOR, index).is_ok());
         }
         assert!(verify(observe(b""), observe(call().as_bytes()), ANCHOR, 0).is_ok());
+    }
+
+    #[test]
+    fn maps_native_indices_after_the_system_scrub_line() {
+        let baseline = b"scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all\nblock drop all\npass all\n";
+        let display: Vec<_> = baseline.split_inclusive(|b| *b == b'\n').collect();
+        for index in 0..=3 {
+            let mut current = display[..index + 1].concat();
+            current.extend_from_slice(call().as_bytes());
+            current.extend_from_slice(&display[index + 1..].concat());
+            assert!(verify(observe(baseline), observe(&current), ANCHOR, index).is_ok());
+            assert!(verify(observe(baseline), observe(&current), ANCHOR, index + 1).is_err());
+        }
+        let bad_baselines: &[&[u8]] = &[
+            b"scrub-anchor \"com.apple/*\" all\npass all\n",
+            b"scrub-anchor \"other\" all fragment reassemble\npass all\n",
+            b"pass all\nscrub-anchor \"com.apple/*\" all fragment reassemble\n",
+            b"scrub-anchor \"com.apple/*\" all fragment reassemble\nscrub-anchor \"com.apple/*\" all fragment reassemble\n",
+            b"nat-anchor \"other\" all\n",
+            b"anchor missing-quotes all\n",
+            b"pass\n",
+        ];
+        for bad in bad_baselines {
+            assert!(verify_detached(observe(bad), observe(bad), ANCHOR).is_err());
+        }
+        assert!(validate_index(observe(baseline), ANCHOR, 3).is_ok());
+        assert!(validate_index(observe(baseline), ANCHOR, 4).is_err());
+        let current = format!("{}{}", String::from_utf8_lossy(baseline), call());
+        assert!(verify(observe(baseline), observe(current.as_bytes()), ANCHOR, 3).is_ok());
+        assert!(verify(observe(baseline), observe(current.as_bytes()), ANCHOR, 4).is_err());
+        let changed = current.replace("fragment reassemble", "fragment crop");
+        assert!(verify(observe(baseline), observe(changed.as_bytes()), ANCHOR, 3).is_err());
+        let extra = format!("{current}pass all\n");
+        assert!(verify(observe(baseline), observe(extra.as_bytes()), ANCHOR, 3).is_err());
     }
 
     #[test]

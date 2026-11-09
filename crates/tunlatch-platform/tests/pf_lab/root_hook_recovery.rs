@@ -63,11 +63,9 @@ impl<'a> Trial<'a> {
         index: u32,
         foreign: [u8; 32],
     ) -> Result<Self> {
-        readback::verify_detached(bytes(root_before), bytes(root_before), anchor)
+        readback::validate_index(bytes(root_before), anchor, index as usize)
             .map_err(Error::Refused)?;
-        if foreign == [0; 32]
-            || index as usize > root_before.split_inclusive(|b| *b == b'\n').count()
-        {
+        if foreign == [0; 32] {
             return Err(Error::Refused(
                 "foreign baseline or intended root index invalid",
             ));

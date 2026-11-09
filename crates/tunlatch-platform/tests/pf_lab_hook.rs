@@ -1,4 +1,7 @@
 //! Complete offline lifecycle and injected failures. No native PF adapter is linked.
+#[allow(dead_code)]
+#[path = "pf_lab/attached_snapshot.rs"]
+mod attached_snapshot;
 #[path = "pf_lab/bootstrap.rs"]
 mod bootstrap;
 #[path = "pf_lab/driver.rs"]
@@ -17,6 +20,9 @@ mod preflight;
 mod root_hook_readback;
 #[path = "pf_lab/root_hook_recovery.rs"]
 mod root_hook_recovery;
+#[allow(dead_code)]
+#[path = "pf_lab/sync_observe.rs"]
+mod sync_observe;
 
 use hook::{Boundary, Error, Filter, Object, Phase, Scene, Session, Window};
 use preflight::{Anchor, CheckedBoundary, Output, Query, ReadBoundary};

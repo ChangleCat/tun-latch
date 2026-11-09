@@ -20,6 +20,7 @@ const CALL: usize = 1040;
 const RULE: usize = 2064;
 const RULE_TICKET: usize = RULE + 688;
 const OWNER: usize = RULE + 696;
+const PRIORITY: usize = RULE + 760;
 const RULE_INDEX: usize = RULE + 948;
 const RULE_ACTION: usize = RULE + 1004;
 const MAX_RULES: u32 = 256;
@@ -234,6 +235,26 @@ fn observe(name: &RootName, run: impl FnMut(Request) -> Result<Frame>) -> Result
     Ok(hook)
 }
 
+/// Predicts the zero-priority insertion position from a stable root enumeration. This is
+/// only a candidate: priority layout and actual insertion semantics still require separate
+/// host qualification, exclusive-writer guarantees and an independent post-write check.
+fn insertion_index(run: impl FnMut(Request) -> Result<Frame>) -> Result<u32> {
+    let mut count = 0;
+    let mut first_higher = None;
+    read_rows(run, |index, frame| {
+        if frame.u32(PRIORITY) > 0 && first_higher.is_none() {
+            first_higher = Some(index);
+        }
+        count += 1;
+        Ok(())
+    })?;
+    // A further observation must remain within the same bounded enumeration.
+    if count == MAX_RULES {
+        return Err(Error::Refused("root ruleset has no observation capacity"));
+    }
+    Ok(first_higher.unwrap_or(count))
+}
+
 /// The caller journals intent first and independently observes the returned rule.
 fn insert(name: &RootName, run: impl FnOnce(Request) -> Result<Frame>) -> Result<NonZeroU64> {
     let frame = run(name.request(Operation::Insert))?;
@@ -402,6 +423,7 @@ mod tests {
             assert!(frame.is_root());
             assert_eq!(frame.field(CALL, 1024)?, name.0.as_bytes());
             assert_eq!(frame.field(OWNER, 64)?, name.0.as_bytes());
+            assert_eq!(frame.u32(PRIORITY), 0);
             assert!(frame.rule_ticket().is_err());
             frame.0[RULE_TICKET..RULE_TICKET + 8].copy_from_slice(&NATIVE_TICKET.to_ne_bytes());
             Ok(frame)
@@ -421,6 +443,54 @@ mod tests {
             assert!(fields.0.iter().all(|&byte| byte == 0));
             Ok(fields)
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn insertion_position_uses_first_higher_priority_in_a_stable_root() -> Result<()> {
+        for (priorities, expected) in [
+            (vec![], 0),
+            (vec![0, 0], 2),
+            (vec![0, 1, 0], 1),
+            (vec![2, 0], 0),
+        ] {
+            let index = insertion_index(|request| match request.operation {
+                Operation::Count => {
+                    let mut frame = request.frame;
+                    frame.set_u32(INDEX, priorities.len() as u32);
+                    frame.set_u32(SET_TICKET, 13);
+                    Ok(frame)
+                }
+                Operation::Read => {
+                    let mut frame = request.frame;
+                    let index = frame.u32(INDEX);
+                    frame.set_u32(RULE_INDEX, index);
+                    frame.set_u32(PRIORITY, priorities[index as usize]);
+                    Ok(frame)
+                }
+                _ => Err(Error::Refused("unexpected test request")),
+            })?;
+            assert_eq!(index, expected);
+        }
+        for full in [false, true] {
+            let mut counts = 0;
+            let result = insertion_index(|request| match request.operation {
+                Operation::Count => {
+                    counts += 1;
+                    let mut frame = request.frame;
+                    frame.set_u32(INDEX, if full { MAX_RULES } else { 1 });
+                    frame.set_u32(SET_TICKET, if !full && counts > 1 { 14 } else { 13 });
+                    Ok(frame)
+                }
+                Operation::Read => {
+                    let mut frame = request.frame;
+                    frame.set_u32(RULE_INDEX, frame.u32(INDEX));
+                    Ok(frame)
+                }
+                _ => Err(Error::Refused("unexpected test request")),
+            });
+            assert!(result.is_err());
+        }
         Ok(())
     }
 

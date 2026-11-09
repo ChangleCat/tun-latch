@@ -67,7 +67,7 @@ fn valid_name(name: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         })
 }
-fn inventory(data: &[u8]) -> io::Result<BTreeSet<String>> {
+pub(crate) fn inventory(data: &[u8]) -> io::Result<BTreeSet<String>> {
     let text = std::str::from_utf8(data).map_err(|_| rejected("inventory is not ASCII"))?;
     if !text.is_ascii()
         || text
@@ -92,7 +92,7 @@ fn inventory(data: &[u8]) -> io::Result<BTreeSet<String>> {
     }
     Ok(names)
 }
-fn root_calls(data: &[u8], own: &str, context: Option<&str>) -> io::Result<()> {
+pub(crate) fn root_calls(data: &[u8], own: &str, context: Option<&str>) -> io::Result<()> {
     let text = std::str::from_utf8(data).map_err(|_| rejected("non-UTF8 root rules"))?;
     if !text.is_ascii() || (!text.is_empty() && !text.ends_with('\n')) {
         return Err(rejected("invalid root rule framing"));
@@ -350,10 +350,15 @@ pub(crate) fn read(anchor: &str) -> io::Result<Snapshot> {
 
 /// Read the kernel boot session identity with the same bounded read-only transport.
 pub(crate) fn boot() -> io::Result<String> {
+    boot_until(Instant::now() + Duration::from_secs(3))
+}
+
+/// Read boot identity within an existing observation deadline.
+pub(crate) fn boot_until(deadline: Instant) -> io::Result<String> {
     let (bytes, _) = execute_program(
         "/usr/sbin/sysctl",
         &["-n", "kern.bootsessionuuid"],
-        Instant::now() + Duration::from_secs(3),
+        deadline,
     )?;
     let value = std::str::from_utf8(&bytes).map_err(|_| rejected("invalid boot identity"))?;
     let uuid = value
