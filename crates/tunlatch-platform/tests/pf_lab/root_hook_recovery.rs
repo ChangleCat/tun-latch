@@ -38,6 +38,7 @@ pub(crate) struct View {
     pub(crate) foreign: [u8; 32],
     pub(crate) hook: Option<(String, Receipt)>,
     pub(crate) leaf: Leaf,
+    pub(crate) states_and_sources_empty: bool,
 }
 
 pub(crate) trait Boundary {
@@ -105,9 +106,13 @@ impl<'a> Trial<'a> {
 
     fn detached(&mut self, boundary: &mut impl Boundary, fresh: bool) -> Result<()> {
         let view = self.observe(boundary)?;
-        if view.hook.is_some() || view.leaf == Leaf::Other || (fresh && view.leaf != Leaf::Absent) {
+        if view.hook.is_some()
+            || !view.states_and_sources_empty
+            || view.leaf == Leaf::Other
+            || (fresh && view.leaf != Leaf::Absent)
+        {
             return Err(Error::Refused(
-                "expected detached empty or fresh absent slot",
+                "expected detached empty slot and no PF state or source records",
             ));
         }
         readback::verify_detached(
@@ -125,9 +130,10 @@ impl<'a> Trial<'a> {
             || receipt.ticket != ticket
             || receipt.index != self.index
             || view.leaf != Leaf::Empty
+            || !view.states_and_sources_empty
         {
             return Err(Error::Refused(
-                "root call instance or empty leaf did not match",
+                "root call, empty leaf, or empty PF state and source views did not match",
             ));
         }
         readback::verify(
@@ -155,13 +161,19 @@ impl<'a> Trial<'a> {
             stage.check_named_objects()?;
             require_no_receipts(directory)?;
             let ticket = boundary.insert(self.anchor)?;
-            let receipt = self.attached(boundary, ticket)?;
+            // Preserve the returned ticket even if the following independent PF read fails.
+            // Only the closed stage ledger can promote it to a normal detach receipt.
+            let receipt = Receipt {
+                ticket,
+                index: self.index,
+            };
             let record = receipt_bytes(self.binding, receipt);
             let mut file = open_receipt(directory, true)?;
             file.write_all(&record)?;
             file.sync_all()?;
             directory.sync_all()?;
-            if read_receipt(directory, self.binding)? != receipt {
+            let observed = self.attached(boundary, ticket)?;
+            if read_receipt(directory, self.binding)? != observed {
                 return Err(Error::Refused("root call receipt readback changed"));
             }
             Ok(())
@@ -359,6 +371,7 @@ mod tests {
         wrong_delta: bool,
         lose_insert_reply: bool,
         lose_remove_reply: bool,
+        states_and_sources_empty: bool,
     }
 
     impl Default for Fake {
@@ -375,6 +388,7 @@ mod tests {
                 wrong_delta: false,
                 lose_insert_reply: false,
                 lose_remove_reply: false,
+                states_and_sources_empty: true,
             }
         }
     }
@@ -395,6 +409,7 @@ mod tests {
                 foreign: self.foreign,
                 hook: self.receipt.map(|receipt| (self.owner.clone(), receipt)),
                 leaf: self.leaf,
+                states_and_sources_empty: self.states_and_sources_empty,
             })
         }
 
@@ -482,8 +497,13 @@ mod tests {
                 lose_insert_reply: !wrong_delta,
                 ..Fake::default()
             };
-            assert!(trial(IDENTITY)?.attach(&directory, &mut fake).is_err());
-            assert!(trial(IDENTITY)?.detach(&directory, &mut fake).is_err());
+            let mut trial = trial(IDENTITY)?;
+            assert!(trial.attach(&directory, &mut fake).is_err());
+            assert_eq!(
+                read_receipt(&directory, trial.binding).ok(),
+                if wrong_delta { fake.receipt } else { None },
+            );
+            assert!(trial.detach(&directory, &mut fake).is_err());
             assert_eq!(
                 Ledger::reopen(directory)?.state(),
                 State::Unknown(Operation::ChangeHook)
@@ -504,6 +524,7 @@ mod tests {
             "foreign",
             "leaf",
             "absent-leaf",
+            "states-or-sources",
         ] {
             let (temp, directory) = private_directory()?;
             let mut fake = Fake::default();
@@ -525,6 +546,7 @@ mod tests {
                 }
                 "foreign" => fake.foreign = [5; 32],
                 "absent-leaf" => fake.leaf = Leaf::Absent,
+                "states-or-sources" => fake.states_and_sources_empty = false,
                 _ => fake.leaf = Leaf::Other,
             }
             assert!(
