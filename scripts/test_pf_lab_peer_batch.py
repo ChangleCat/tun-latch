@@ -139,7 +139,7 @@ class Batch(unittest.TestCase):
                 ready = json.loads(batch.stdout.readline(peer.LIMIT + 1))
             self.assertEqual(ready["status"], "ready")
             sent = subprocess.run([*args, "sender"], capture_output=True, timeout=37)
-            self.assertEqual(sent.returncode, 0, sent.stderr)
+            self.assertEqual(sent.returncode, 0, (sent.stdout, sent.stderr))
             send_result = json.loads(sent.stdout)
             self.assertEqual(send_result["status"], "completed")
             self.assertEqual(send_result["cases"], [{**case, "result": "echo_matched"} for case in cases])
