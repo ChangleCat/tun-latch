@@ -201,3 +201,5 @@ cargo build -p tunlatch-platform --example pf_lab_peer --release --locked
 `pf-lab-peer-batch.py` 把四种组合并行收发。两端都需构建上面的 `pf_lab_peer`。向两端提供同一份 JSON，顶层 `cases` 包含四项，每项有 `family`（`ipv4` 或 `ipv6`）、`protocol`（`tcp` 或 `udp`）、`source`、`destination` 和 `nonce`。地址须为具体数字 `IP:端口`，IPv6 使用方括号。每项使用不同的 32 位小写十六进制 nonce。每轮使用新 nonce 和独立流。
 
 先以 `--role receiver` 或 `--role sender` 只查看计划。仅在确认对端及地址范围后加 `--ack RUN-CONTROLLED-PEER-BATCH`。接收端四项就绪后输出 `ready`，此时发送端可用同一计划启动。任一交换失败时记录 `incomplete` 或 `unavailable`。这些结果用于收发对照，PF 判定始终为 `not_evaluated`。
+
+可将四条待阻断流的端点写成同样的 `cases` 文件，省略 `nonce`，以 `--prepare-controls` 一次生成 `before`、`blocked`、`after` 三组计划。准备命令只向标准输出写 JSON。前后对照保持相同源 IP 和目的端点，使用独立源端口和 nonce。将同一输出用于两端，以 `--phase before`、`--phase blocked` 或 `--phase after` 选择对应组。生成阶段无需打开 socket，端口能否绑定由执行阶段验证。

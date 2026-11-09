@@ -30,6 +30,34 @@ def cases():
 
 
 class Batch(unittest.TestCase):
+    def test_prepare_controls_preserves_exact_blocked_flows(self):
+        endpoints = [{k: value for k, value in case.items() if k != "nonce"} for case in cases()]
+        plan = peer.generate_controls({"cases": endpoints})
+        blocked = peer.select_phase(plan, "blocked")
+        self.assertEqual([{k: v for k, v in case.items() if k != "nonce"} for case in blocked], endpoints)
+        for i, case in enumerate(blocked):
+            before = peer.select_phase(plan, "before")[i]
+            after = peer.select_phase(plan, "after")[i]
+            self.assertEqual(before["destination"], case["destination"])
+            self.assertEqual(after["destination"], case["destination"])
+            self.assertEqual(len({before["source"], case["source"], after["source"]}), 3)
+        plan["after"]["cases"][0]["nonce"] = blocked[0]["nonce"]
+        with self.assertRaises(ValueError):
+            peer.select_phase(plan, "before")
+
+    def test_phase_selection_rejects_mismatched_destination_or_reused_flow(self):
+        endpoints = [{k: value for k, value in case.items() if k != "nonce"} for case in cases()]
+        plan = peer.generate_controls({"cases": endpoints})
+        phase = plan["before"]["cases"][0]
+        original = phase["source"]
+        phase["source"] = endpoints[0]["source"]
+        with self.assertRaises(ValueError):
+            peer.select_phase(plan, "blocked")
+        phase["source"] = original
+        phase["destination"] = "127.0.0.2:55000"
+        with self.assertRaises(ValueError):
+            peer.select_phase(plan, "blocked")
+
     def test_validation_rejects_duplicate_nonce_and_wildcard(self):
         data = cases()
         self.assertEqual(peer.validate({"cases": data}), data)
@@ -85,32 +113,44 @@ class Batch(unittest.TestCase):
             self.assertEqual(result.stdout, "")
 
     @unittest.skipUnless(peer.BINARY.is_file() and os.geteuid() != 0, "requires built ordinary-user peer")
-    def test_four_loopback_receivers_and_senders(self):
-        data = cases()
+    def test_three_loopback_phases_reuse_destinations_with_new_flows(self):
+        endpoints = [{k: value for k, value in case.items() if k != "nonce"} for case in cases()]
         with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "endpoints.json"
             plan = Path(tmp) / "plan.json"
-            plan.write_text(json.dumps({"cases": data}))
-            args = ["/usr/bin/python3", peer.__file__, str(plan), "--ack", peer.ACK, "--role"]
-            batch = subprocess.Popen([*args, "receiver"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                with selectors.DefaultSelector() as selector:
-                    selector.register(batch.stdout, selectors.EVENT_READ)
-                    self.assertTrue(selector.select(5), "receiver batch did not report readiness")
-                    ready = json.loads(batch.stdout.readline(peer.LIMIT + 1))
-                self.assertEqual(ready["status"], "ready")
-                sent = subprocess.run([*args, "sender"], capture_output=True, timeout=37)
-                self.assertEqual(sent.returncode, 0, sent.stderr)
-                send_result = json.loads(sent.stdout)
-                self.assertEqual(send_result["status"], "completed")
-                self.assertEqual(send_result["cases"], [{**case, "result": "echo_matched"} for case in data])
-                stdout, stderr = batch.communicate(timeout=5)
-                self.assertEqual(batch.returncode, 0, stderr)
-                completed = json.loads(stdout)
-                self.assertEqual(completed["status"], "completed")
-                self.assertEqual(completed["cases"], [{**case, "result": "nonce_received_and_echoed"} for case in data])
-                self.assertEqual(completed["pf_verdict"], "not_evaluated")
-            finally:
-                batch.communicate(timeout=37)
+            spec.write_text(json.dumps({"cases": endpoints}))
+            prepared = subprocess.run(["/usr/bin/python3", peer.__file__, str(spec), "--prepare-controls"],
+                                      capture_output=True, timeout=5)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            document = json.loads(prepared.stdout)
+            plan.write_bytes(prepared.stdout)
+            for phase in peer.PHASES:
+                with self.subTest(phase=phase):
+                    args = ["/usr/bin/python3", peer.__file__, str(plan), "--phase", phase,
+                            "--ack", peer.ACK, "--role"]
+                    self.check_loopback_phase(args, document[phase]["cases"])
+
+    def check_loopback_phase(self, args, cases):
+        batch = subprocess.Popen([*args, "receiver"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(batch.stdout, selectors.EVENT_READ)
+                self.assertTrue(selector.select(5), "receiver batch did not report readiness")
+                ready = json.loads(batch.stdout.readline(peer.LIMIT + 1))
+            self.assertEqual(ready["status"], "ready")
+            sent = subprocess.run([*args, "sender"], capture_output=True, timeout=37)
+            self.assertEqual(sent.returncode, 0, sent.stderr)
+            send_result = json.loads(sent.stdout)
+            self.assertEqual(send_result["status"], "completed")
+            self.assertEqual(send_result["cases"], [{**case, "result": "echo_matched"} for case in cases])
+            stdout, stderr = batch.communicate(timeout=5)
+            self.assertEqual(batch.returncode, 0, stderr)
+            completed = json.loads(stdout)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["cases"], [{**case, "result": "nonce_received_and_echoed"} for case in cases])
+            self.assertEqual(completed["pf_verdict"], "not_evaluated")
+        finally:
+            batch.communicate(timeout=37)
 
 
 if __name__ == "__main__":

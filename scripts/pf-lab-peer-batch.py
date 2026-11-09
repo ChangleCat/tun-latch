@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import selectors
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import time
 BINARY = Path(__file__).resolve().parent.parent / "target/release/examples/pf_lab_peer"
 ACK = "RUN-CONTROLLED-PEER-BATCH"
 LIMIT = 4096
+PHASES = ("before", "blocked", "after")
 
 
 def unique_fields(pairs):
@@ -71,6 +73,49 @@ def validate(document):
         seen.add(key)
         nonces.add(nonce)
     return cases
+
+
+def generate_controls(document):
+    if not isinstance(document, dict) or set(document) != {"cases"}:
+        raise ValueError("expected four blocked flow endpoints")
+    cases = document["cases"]
+    if not isinstance(cases, list) or len(cases) != 4 or any(
+            not isinstance(case, dict) or set(case) != {"family", "protocol", "source", "destination"}
+            for case in cases):
+        raise ValueError("expected four cases without nonces")
+    blocked = {"cases": [{**case, "nonce": secrets.token_hex(16)} for case in cases]}
+    validate(blocked)
+    reserved = {int(case[field].rsplit(":", 1)[1]) for case in cases for field in ("source", "destination")}
+    # Allocation is for the plan only. Real bind availability is checked by the peer processes.
+    ports = [port for port in range(49152, 65536) if port not in reserved]
+    controls = {"blocked": blocked}
+    for phase in ("before", "after"):
+        flows = []
+        for case in cases:
+            host = case["source"].rsplit(":", 1)[0]
+            port = ports.pop(secrets.randbelow(len(ports)))
+            flows.append({**case, "source": f"{host}:{port}", "nonce": secrets.token_hex(16)})
+        controls[phase] = {"cases": flows}
+    select_phase(controls, "blocked")
+    return controls
+
+
+def select_phase(document, phase):
+    if phase is None:
+        return validate(document)
+    if not isinstance(document, dict) or set(document) != set(PHASES):
+        raise ValueError("expected complete before, blocked and after plans")
+    plans = {name: validate(document[name]) for name in PHASES}
+    if len({case["nonce"] for cases in plans.values() for case in cases}) != 12:
+        raise ValueError("repeated phase nonce")
+    by_phase = {name: {(c["family"], c["protocol"]): c for c in cases} for name, cases in plans.items()}
+    for key, blocked in by_phase["blocked"].items():
+        before, after = by_phase["before"][key], by_phase["after"][key]
+        if (len({before["source"], blocked["source"], after["source"]}) != 3
+                or any(c["source"].rsplit(":", 1)[0] != blocked["source"].rsplit(":", 1)[0]
+                       or c["destination"] != blocked["destination"] for c in (before, after))):
+            raise ValueError("phase controls must keep the same source address and destination with distinct flows")
+    return plans[phase]
 
 
 def verify(raw, case, role, status):
@@ -181,7 +226,10 @@ def run(cases, role):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan", type=Path, help="JSON file with four explicit cases")
-    parser.add_argument("--role", choices=("sender", "receiver"), required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--role", choices=("sender", "receiver"))
+    mode.add_argument("--prepare-controls", action="store_true", help="generate the three phase plans without sockets")
+    parser.add_argument("--phase", choices=PHASES)
     parser.add_argument("--ack", choices=(ACK,))
     args = parser.parse_args()
     if os.geteuid() == 0:
@@ -190,7 +238,13 @@ def main():
         data = source.read(16385)
     if len(data) > 16384:
         raise ValueError("plan too large")
-    cases = validate(json.loads(data, object_pairs_hook=unique_fields))
+    document = json.loads(data, object_pairs_hook=unique_fields)
+    if args.prepare_controls:
+        if args.phase is not None or args.ack is not None:
+            raise ValueError("control preparation accepts neither a phase nor execution acknowledgment")
+        print(json.dumps(generate_controls(document), indent=2))
+        return 0
+    cases = select_phase(document, args.phase)
     if args.ack is None:
         print(json.dumps({"status": "planned", "role": args.role, "cases": cases,
                           "pf_verdict": "not_evaluated"}))
