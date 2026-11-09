@@ -522,3 +522,137 @@ fn distinct_cases_have_distinct_controls_and_results() -> Result<()> {
     assert!(p.validate().is_err());
     Ok(())
 }
+
+#[allow(dead_code)]
+#[path = "pf_lab/exact_filter.rs"]
+mod exact_filter;
+#[path = "pf_lab/offline_capture.rs"]
+mod offline_capture;
+
+#[test]
+fn offline_batch_uses_four_cases_controls_and_direct_evidence()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use serde_json::{Value, json};
+    let mut phases = [Vec::new(), Vec::new(), Vec::new()];
+    let mut controls = [Vec::new(), Vec::new()];
+    let mut evidences = Vec::new();
+    let suffix = "0123456789abcdef0123456789abcdef";
+    let mut rules = String::new();
+    let mut labels_before = String::new();
+    let mut labels_after = String::new();
+    for (index, (ipv6, protocol)) in [
+        (false, Protocol::Tcp),
+        (false, Protocol::Udp),
+        (true, Protocol::Tcp),
+        (true, Protocol::Udp),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let family = if ipv6 { "ipv6" } else { "ipv4" };
+        let proto = if protocol == Protocol::Tcp {
+            "tcp"
+        } else {
+            "udp"
+        };
+        for (phase, cases) in phases.iter_mut().enumerate() {
+            let f = flow(ipv6, protocol, 45001 + phase as u16);
+            let byte = (index * 3 + phase + 1) as u8;
+            cases.push(json!({"family":family,"protocol":proto,"source":f.source.to_string(),"destination":f.destination.to_string(),"nonce":format!("{:02x}", byte).repeat(16)}));
+            if phase != 1 {
+                controls[if phase == 0 { 0 } else { 1 }].push(packet(f, &[byte; 16]));
+            }
+        }
+        evidences.push(json!({"family":family,"protocol":proto,"sent":true}));
+        let f = flow(ipv6, protocol, 45002);
+        let af = if ipv6 { "inet6" } else { "inet" };
+        let label = format!("tunlatch-lab:{suffix}-{index}");
+        use std::fmt::Write as _;
+        writeln!(
+            rules,
+            "block drop out quick on en0 {af} proto {proto} from {} port {} to {} port {} label \"{label}\"",
+            f.source.ip(),
+            f.source.port(),
+            f.destination.ip(),
+            f.destination.port()
+        )?;
+        writeln!(labels_before, "{label} 0 0 0 0 0 0 0")?;
+        writeln!(labels_after, "{label} 1 1 40 0 0 1 40")?;
+    }
+    let report = |phase: usize| json!({"role":"receiver", "helper_sha256":"a".repeat(64), "status":if phase == 1 {"incomplete"} else {"completed"}, "pf_verdict":"not_evaluated", "cases":phases[phase].iter().cloned().map(|mut c| { c["result"] = json!(if phase == 1 { "unavailable" } else { "nonce_received_and_echoed" }); if phase == 1 { c["stage"] = json!("accept"); c["error_kind"] = json!("TimedOut"); c["errno"] = Value::Null; } c }).collect::<Vec<_>>()});
+    let reports = json!({"before":report(0),"blocked":report(1),"after":report(2)});
+    let mut manifest = json!({"plan":{"before":{"cases":phases[0]},"blocked":{"cases":phases[1]},"after":{"cases":phases[2]}},"interface":"en0","capture_complete":true,"capture_dropped":0,"capture_start_us":1,"capture_end_us":20,"windows":{"before":{"start_us":1,"end_us":4},"blocked":{"start_us":5,"end_us":9},"after":{"start_us":10,"end_us":20}},"evidence":evidences,"reports":reports,"pf":{"anchor_suffix":suffix,"rules_before":rules,"rules_after":rules,"labels_before":labels_before,"labels_after":labels_after}});
+    let mut frames = controls[0].clone();
+    // Supply five neutral blocked-window packets on a control flow, then four post controls.
+    frames.extend((0..5).map(|_| packet(flow(false, Protocol::Tcp, 45001), &[])));
+    frames.extend(controls[1].clone());
+    let capture = pcap(&frames, 101);
+    let evaluate =
+        |v: &Value, p: &[u8]| -> std::result::Result<Value, Box<dyn std::error::Error>> {
+            Ok(offline_capture::evaluate(
+                serde_json::from_value(v.clone())?,
+                p,
+            )?)
+        };
+    assert_eq!(
+        evaluate(&manifest, &capture)?["verdict"],
+        "no_observed_leak"
+    );
+    let raw = serde_json::to_string(&manifest)?;
+    let duplicate = raw.replacen("\"helper_sha256\":", "\"helper_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"helper_sha256\":", 1);
+    assert_ne!(raw, duplicate);
+    assert!(serde_json::from_str::<offline_capture::Manifest>(&duplicate).is_err());
+    let duplicate_null = raw.replacen("\"errno\":null", "\"errno\":null,\"errno\":null", 1);
+    assert_ne!(raw, duplicate_null);
+    assert!(serde_json::from_str::<offline_capture::Manifest>(&duplicate_null).is_err());
+    let mut inconsistent = manifest.clone();
+    inconsistent["reports"]["blocked"]["status"] = json!("completed");
+    assert!(evaluate(&inconsistent, &capture).is_err());
+    inconsistent["reports"]["blocked"]["status"] = json!("incomplete");
+    inconsistent["reports"]["blocked"]["unexpected"] = json!(true);
+    assert!(evaluate(&inconsistent, &capture).is_err());
+    assert_eq!(
+        evaluate(&manifest, &capture)?["cases"][0]["pf_rule_hit_delta"],
+        1
+    );
+    manifest["pf"]["labels_after"] =
+        json!(labels_after.replacen("1 1 40 0 0 1 40", "0 0 0 0 0 0 0", 1));
+    assert_eq!(evaluate(&manifest, &capture)?["verdict"], "incomplete");
+    manifest["pf"]["labels_after"] = json!(labels_after);
+    let mut changed = manifest.clone();
+    changed["pf"]["rules_after"] = json!(rules.replacen("quick", "log", 1));
+    assert_eq!(evaluate(&changed, &capture)?["verdict"], "incomplete");
+    assert_eq!(
+        evaluate(&changed, &capture)?["cases"][0]["pf_rule_hit_delta"],
+        Value::Null
+    );
+    manifest["evidence"][0]["sent"] = json!(false);
+    assert_eq!(evaluate(&manifest, &capture)?["verdict"], "incomplete");
+    // SYN-like blocked TCP packet has no nonce: tuple alone preserves the potential leak.
+    frames[5] = packet(flow(false, Protocol::Tcp, 45002), &[]);
+    let leaked = evaluate(&manifest, &pcap(&frames, 101))?;
+    assert_eq!(leaked["verdict"], "potential_leak");
+    assert_eq!(leaked["cases"][0]["matching_blocked_packets"], 1);
+    assert_eq!(
+        evaluate(&changed, &pcap(&frames, 101))?["verdict"],
+        "potential_leak"
+    );
+    let mut bad_report = manifest.clone();
+    // Change to a value guaranteed not to match its frozen nonce.
+    bad_report["reports"]["before"]["cases"][0]["nonce"] =
+        json!("ffffffffffffffffffffffffffffffff");
+    assert!(evaluate(&bad_report, &capture).is_err());
+    let mut missing_control = frames.clone();
+    missing_control[0] = packet(flow(false, Protocol::Tcp, 45001), &[]);
+    // Restore the blocked tuple before checking missing control alone.
+    missing_control[5] = packet(flow(false, Protocol::Tcp, 45001), &[]);
+    assert_eq!(
+        evaluate(&manifest, &pcap(&missing_control, 101))?["verdict"],
+        "incomplete"
+    );
+    manifest["capture_dropped"] = json!(1);
+    assert_eq!(evaluate(&manifest, &capture)?["verdict"], "incomplete");
+    manifest["windows"]["after"]["start_us"] = json!(4);
+    assert!(evaluate(&manifest, &capture).is_err());
+    Ok(())
+}

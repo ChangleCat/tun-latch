@@ -33,10 +33,40 @@ fn canonical() -> String {
         "inet6 proto udp from 2001:db8::1 port = 50004 to 2001:db8::2 port = 51004",
     ]
     .iter()
-    .map(|part| {
-        format!("block drop out quick on en0 {part} no state label \"tunlatch-lab:{SUFFIX}\"\n")
+    .enumerate()
+    .map(|(i, part)| {
+        format!("block drop out quick on en0 {part} no state label \"tunlatch-lab:{SUFFIX}-{i}\"\n")
     })
     .collect()
+}
+
+#[test]
+fn labels_require_four_unique_complete_monotonic_counter_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let plan = ExactFilter::new(SUFFIX, "en0", flows()?)?;
+    let before: String = (0..4)
+        .map(|i| format!("tunlatch-lab:{SUFFIX}-{i} 5 2 100 0 0 2 100\n"))
+        .collect();
+    let after = before.replacen("5 2 100 0 0 2 100", "7 3 160 0 0 3 160", 1);
+    assert_eq!(
+        plan.outbound_deltas(before.as_bytes(), after.as_bytes()),
+        Some([1, 0, 0, 0])
+    );
+    for bad in [
+        after.replacen("-1 ", "-0 ", 1),
+        after.replacen("-1 ", "-9 ", 1),
+        after.replacen("7 3 160 0 0 3 160", "4 3 160 0 0 3 160", 1),
+        after.replacen("7 3 160 0 0 3 160", "7 3 160 0 0 2 160", 1),
+        after.replacen("7 3 160 0 0 3 160", "7 +3 160 0 0 3 160", 1),
+        after.replacen("7 3 160 0 0 3 160", "7 3 160 0 0 3 160 0", 1),
+        after.trim_end().to_owned(),
+    ] {
+        assert_eq!(
+            plan.outbound_deltas(before.as_bytes(), bad.as_bytes()),
+            None
+        );
+    }
+    Ok(())
 }
 #[test]
 fn builds_both_transactions_and_compares_only_exact_rules() -> Result<(), Box<dyn std::error::Error>>

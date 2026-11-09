@@ -28,6 +28,10 @@ pub(crate) struct ExactFilter {
 }
 
 impl ExactFilter {
+    fn label(&self, index: usize) -> String {
+        format!("tunlatch-lab:{}-{index}", self.suffix)
+    }
+
     /// Flow order is IPv4 TCP, IPv4 UDP, IPv6 TCP, IPv6 UDP.
     /// The caller must independently verify interface identity and the fresh random anchor.
     pub(crate) fn new(suffix: &str, interface: &str, flows: [Flow; 4]) -> Result<Self, Error> {
@@ -89,7 +93,7 @@ impl ExactFilter {
                             flow.destination.port(),
                         ))
                         .keep_state(StatePolicy::None)
-                        .label(format!("tunlatch-lab:{}", self.suffix))
+                        .label(self.label(i))
                         .build()?,
                 );
             }
@@ -119,8 +123,8 @@ impl ExactFilter {
         if lines.len() != 4 {
             return false;
         }
-        let label = format!("\"tunlatch-lab:{}\"", self.suffix);
         lines.iter().enumerate().all(|(i, line)| {
+            let label = format!("\"{}\"", self.label(i));
             let words: Vec<_> = line.split_ascii_whitespace().collect();
             let flow = self.flows[i];
             let prefix = [
@@ -156,6 +160,58 @@ impl ExactFilter {
             }
             rest == ["label", label.as_str()]
         })
+    }
+
+    /// Returns per-case outbound packet deltas only for two complete, matching snapshots.
+    /// Counter changes alone do not establish that the test packet caused the change.
+    pub(crate) fn outbound_deltas(&self, before: &[u8], after: &[u8]) -> Option<[u64; 4]> {
+        let before = self.label_counters(before)?;
+        let after = self.label_counters(after)?;
+        let mut result = [0; 4];
+        for i in 0..4 {
+            for j in 0..7 {
+                after[i][j].checked_sub(before[i][j])?;
+            }
+            result[i] = after[i][5] - before[i][5];
+        }
+        Some(result)
+    }
+
+    fn label_counters(&self, raw: &[u8]) -> Option<[[u64; 7]; 4]> {
+        if raw.len() > 4096
+            || !raw.ends_with(b"\n")
+            || !raw.is_ascii()
+            || raw
+                .iter()
+                .any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\t'))
+        {
+            return None;
+        }
+        let mut rows = [None; 4];
+        for line in std::str::from_utf8(raw).ok()?.lines() {
+            let mut fields = line.split_ascii_whitespace();
+            let label = fields.next()?;
+            let index = (0..4).find(|&i| label == self.label(i))?;
+            if rows[index].is_some() {
+                return None;
+            }
+            let mut counters = [0_u64; 7];
+            for counter in &mut counters {
+                let field = fields.next()?;
+                if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                *counter = field.parse().ok()?;
+            }
+            if fields.next().is_some()
+                || counters[1] != counters[3].checked_add(counters[5])?
+                || counters[2] != counters[4].checked_add(counters[6])?
+            {
+                return None;
+            }
+            rows[index] = Some(counters);
+        }
+        Some([rows[0]?, rows[1]?, rows[2]?, rows[3]?])
     }
 }
 
