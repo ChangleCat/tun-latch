@@ -124,6 +124,16 @@ pub(crate) struct CheckedCase {
     nonces: [[u8; 16]; 3],
 }
 
+impl CheckedCase {
+    pub(crate) fn before_control_matches(&self, packet: &super::traffic::Packet) -> bool {
+        packet.flow == self.plan.before_control
+            && packet
+                .payload
+                .windows(16)
+                .any(|bytes| bytes == self.nonces[0])
+    }
+}
+
 impl FrozenPlan {
     pub(crate) fn checked(self, interface: &str) -> Result<[CheckedCase; 4]> {
         let before = cases(self.before.cases)?;
@@ -334,39 +344,31 @@ pub(crate) fn evaluate(manifest: Manifest, bytes: &[u8]) -> Result<Value> {
     let mut results = Vec::new();
     let mut any_leak = false;
     let mut any_incomplete = false;
-    for (
-        index,
-        CheckedCase {
-            key,
-            plan,
-            nonces: [pre_nonce, negative_nonce, post_nonce],
-        },
-    ) in checked.into_iter().enumerate()
-    {
+    for (index, case) in checked.into_iter().enumerate() {
+        let key = &case.key;
+        let [pre_nonce, negative_nonce, post_nonce] = case.nonces;
         let Plan {
             before_control: pre,
             negative,
             after_control: post,
             ..
-        } = plan;
+        } = case.plan;
         let delta = deltas.map(|counts| counts[index]);
-        let e = evidence.get(&key).ok_or(Error("missing direct evidence"))?;
+        let e = evidence.get(key).ok_or(Error("missing direct evidence"))?;
         // Any packet on the unique blocked tuple within the capture is a potential leak,
         // including a TCP SYN without application bytes or a nonce.
         let leaked = packets.iter().filter(|p| p.flow == negative).count();
-        let pre_seen = packets.iter().any(|p| {
-            p.flow == pre
-                && within(p.at_us, &w.before)
-                && p.payload.windows(16).any(|v| v == pre_nonce)
-        });
+        let pre_seen = packets
+            .iter()
+            .any(|p| within(p.at_us, &w.before) && case.before_control_matches(p));
         let post_seen = packets.iter().any(|p| {
             p.flow == post
                 && within(p.at_us, &w.after)
                 && p.payload.windows(16).any(|v| v == post_nonce)
         });
-        let before_ack = receiver_ack(&manifest.reports.before, &key, pre, pre_nonce)?;
-        let after_ack = receiver_ack(&manifest.reports.after, &key, post, post_nonce)?;
-        let blocked_ack = receiver_ack(&manifest.reports.blocked, &key, negative, negative_nonce)?;
+        let before_ack = receiver_ack(&manifest.reports.before, key, pre, pre_nonce)?;
+        let after_ack = receiver_ack(&manifest.reports.after, key, post, post_nonce)?;
+        let blocked_ack = receiver_ack(&manifest.reports.blocked, key, negative, negative_nonce)?;
         let complete = manifest.capture_complete
             && manifest.capture_dropped == 0
             && pre_seen

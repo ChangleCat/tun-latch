@@ -570,6 +570,26 @@ impl Boundary<'_> {
         }
     }
 
+    fn verify_before_capture(&self, raw: &[u8]) -> Result<()> {
+        self.check_capture_ready()?;
+        let PlanInput { interface, phases } = decode(raw)?;
+        let cases = phases
+            .checked(&interface)
+            .map_err(|error| Error::Refused(error.0))?;
+        let bytes = self.storage.read("capture.pcap", 1024 * 1024)?;
+        let packets = traffic::parse_pcap(&bytes).map_err(|error| Error::Refused(error.0))?;
+        if !cases.iter().all(|case| {
+            packets
+                .iter()
+                .any(|packet| case.before_control_matches(packet))
+        }) {
+            return Err(Error::Refused(
+                "missing one or more before controls on the captured physical interface",
+            ));
+        }
+        self.check_capture_ready()
+    }
+
     fn counters(&self, filter: &ExactFilter, hook: Receipt, before: bool) -> Result<()> {
         self.check_capture_ready()?;
         if self.storage.exists("release")?
@@ -1107,7 +1127,7 @@ fn run_action(
     }
     let phase = match action {
         Action::Stage => {
-            boundary.check_capture_ready()?;
+            boundary.verify_before_capture(&raw)?;
             if now_ms()?
                 .checked_sub(session.prepared_ms)
                 .is_none_or(|age| age >= 300_000)

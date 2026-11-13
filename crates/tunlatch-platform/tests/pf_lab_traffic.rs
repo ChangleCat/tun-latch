@@ -582,6 +582,29 @@ fn offline_batch_uses_four_cases_controls_and_direct_evidence()
     let report = |phase: usize| json!({"role":"receiver", "helper_sha256":"a".repeat(64), "status":if phase == 1 {"incomplete"} else {"completed"}, "pf_verdict":"not_evaluated", "cases":phases[phase].iter().cloned().map(|mut c| { c["result"] = json!(if phase == 1 { "unavailable" } else { "nonce_received_and_echoed" }); if phase == 1 { c["stage"] = json!("accept"); c["error_kind"] = json!("TimedOut"); c["errno"] = Value::Null; } c }).collect::<Vec<_>>()});
     let reports = json!({"before":report(0),"blocked":report(1),"after":report(2)});
     let mut manifest = json!({"plan":{"before":{"cases":phases[0]},"blocked":{"cases":phases[1]},"after":{"cases":phases[2]}},"interface":"en0","capture_complete":true,"capture_dropped":0,"capture_start_us":1,"capture_end_us":20,"windows":{"before":{"start_us":1,"end_us":4},"blocked":{"start_us":5,"end_us":9},"after":{"start_us":10,"end_us":20}},"evidence":evidences,"reports":reports,"pf":{"anchor_suffix":suffix,"rules_before":rules,"rules_after":rules,"labels_before":labels_before,"labels_after":labels_after}});
+    let checked = serde_json::from_value::<offline_capture::FrozenPlan>(manifest["plan"].clone())?
+        .checked("en0")?;
+    let before_packets = traffic::parse_pcap(&pcap(&controls[0], 1))?;
+    assert!(checked.iter().all(|case| {
+        before_packets
+            .iter()
+            .any(|packet| case.before_control_matches(packet))
+    }));
+    for index in 0..before_packets.len() {
+        let mut wrong_nonce = before_packets.clone();
+        wrong_nonce[index].payload.fill(0);
+        assert!(!checked.iter().all(|case| {
+            wrong_nonce
+                .iter()
+                .any(|packet| case.before_control_matches(packet))
+        }));
+    }
+    let after_packets = traffic::parse_pcap(&pcap(&controls[1], 1))?;
+    assert!(checked.iter().all(|case| {
+        !after_packets
+            .iter()
+            .any(|packet| case.before_control_matches(packet))
+    }));
     let mut frames = controls[0].clone();
     // Supply five neutral blocked-window packets on a control flow, then four post controls.
     frames.extend((0..5).map(|_| packet(flow(false, Protocol::Tcp, 45001), &[])));
