@@ -113,8 +113,19 @@ class FirstFlowOperator(unittest.TestCase):
             op.execute(runner, "recover", DIGEST, PLAN, confirm=lambda _: "RECOVER-PF-FIRST-FLOW")
         self.assertEqual(invoke.call_args_list[-1], mock.call(runner, "recover", b"RECOVER-PF-FIRST-FLOW\n"))
         with (mock.patch.object(op.base, "inspect"), mock.patch.object(op, "invoke", return_value=status()),
-              self.assertRaises(op.Refused)):
+              self.assertRaisesRegex(op.Refused, "prepared.*recover")):
             op.execute(runner, "recover", DIGEST, PLAN, confirm=lambda _: "RECOVER-PF-FIRST-FLOW")
+
+    def test_recovery_reports_verified_restored_without_repeating_writes(self):
+        runner, confirm, writer_started = mock.Mock(), mock.Mock(), mock.Mock()
+        with (mock.patch.object(op.base, "inspect"),
+              mock.patch.object(op, "invoke", return_value=status("restored")) as invoke):
+            result = op.execute(runner, "recover", DIGEST, PLAN, confirm=confirm,
+                                writer_started=writer_started)
+        self.assertEqual(result, status("restored"))
+        invoke.assert_called_once_with(runner, "status")
+        confirm.assert_not_called()
+        writer_started.assert_not_called()
 
     def test_prepare_does_not_run_helper_when_plan_or_boot_mismatches(self):
         runner = mock.Mock()

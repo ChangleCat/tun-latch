@@ -123,7 +123,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
     obj = report(before)
     if obj["plan_sha256"] != plan_digest:
         raise Refused("受保护计划与批准不符；保留现场")
-    if action == "status":
+    if action == "status" or (action == "recover" and obj["phase"] == "restored"):
         return before
     if action in COUNTER_ACTIONS:
         if obj["phase"] != "reference_held":
@@ -136,7 +136,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
         return raw
     ack, allowed, expected_phase = CONFIRMATIONS[action]
     if obj["phase"] not in allowed:
-        raise Refused("当前阶段不允许此动作；保留现场")
+        raise Refused(f"当前阶段 {obj['phase']} 不允许执行 {action}；保留现场")
     print(before.decode("utf-8", "strict"), flush=True)
     print("确认从暂存起未中断 PF 独占窗口，其他 PF 写入者已退出且恢复条件已核对。不能确认时停止。", flush=True)
     if confirm("请输入 " + ack + "：") != ack:
