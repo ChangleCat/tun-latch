@@ -104,6 +104,13 @@ fn count_line(line: &str, suffix: &str) -> Option<u64> {
     }
     n.parse().ok()
 }
+fn packet_count(line: &str, suffix: &str) -> Option<u64> {
+    let plural = format!(" packets {suffix}");
+    let singular = format!(" packet {suffix}");
+    count_line(line, &plural)
+        .filter(|&n| n != 1)
+        .or_else(|| count_line(line, &singular).filter(|&n| n == 1))
+}
 fn diagnostics(data: &[u8], interface: &str) -> io::Result<u64> {
     let text = std::str::from_utf8(data).map_err(|_| error("non-UTF8 tcpdump diagnostics"))?;
     if !text.ends_with('\n') {
@@ -117,20 +124,27 @@ fn diagnostics(data: &[u8], interface: &str) -> io::Result<u64> {
     }
     let captured = lines
         .next()
-        .and_then(|s| count_line(s, " packets captured"))
+        .and_then(|s| packet_count(s, "captured"))
         .ok_or_else(|| error("missing captured count"))?;
     let _received = lines
         .next()
-        .and_then(|s| count_line(s, " packets received by filter"))
+        .and_then(|s| packet_count(s, "received by filter"))
         .ok_or_else(|| error("missing received count"))?;
     let dropped = lines
         .next()
-        .and_then(|s| count_line(s, " packets dropped by kernel"))
+        .and_then(|s| packet_count(s, "dropped by kernel"))
         .ok_or_else(|| error("missing drop count"))?;
+    let dropped_by_interface = match lines.next() {
+        Some(line) => packet_count(line, "dropped by interface")
+            .ok_or_else(|| error("unexpected interface diagnostics"))?,
+        None => 0,
+    };
     if lines.next().is_some() || captured >= 128 {
         return Err(error("unexpected diagnostics or packet limit reached"));
     }
-    Ok(dropped)
+    dropped
+        .checked_add(dropped_by_interface)
+        .ok_or_else(|| error("drop count overflow"))
 }
 fn signal(child: &Child, sig: Signal) -> io::Result<()> {
     let pid = i32::try_from(child.id()).map_err(|_| error("invalid child identity"))?;
@@ -412,5 +426,10 @@ mod tests {
         assert!(diagnostics(good, "en1").is_err());
         assert!(diagnostics(&good[..good.len() - 1], "en0").is_err());
         assert!(diagnostics(&good[..good.len() - 28], "en0").is_err());
+        let dropped = b"tcpdump: listening on en0, link-type EN10MB (Ethernet), snapshot length 4096 bytes\n1 packet captured\n1 packet received by filter\n1 packet dropped by kernel\n2 packets dropped by interface\n";
+        assert_eq!(diagnostics(dropped, "en0").ok(), Some(3));
+        let wrong_count =
+            String::from_utf8_lossy(dropped).replace("1 packet captured", "1 packets captured");
+        assert!(diagnostics(wrong_count.as_bytes(), "en0").is_err());
     }
 }
