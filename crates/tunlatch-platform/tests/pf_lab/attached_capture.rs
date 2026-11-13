@@ -323,6 +323,7 @@ impl Capture {
                 "-n",
                 "-p",
                 "--micro",
+                "--immediate-mode",
                 "-U",
                 "-s",
                 "4096",

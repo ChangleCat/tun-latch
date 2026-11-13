@@ -67,6 +67,7 @@ enum Action {
     CountersBefore,
     CountersAfter,
     Capture,
+    CapturePost,
     Evidence,
     Recover,
 }
@@ -81,6 +82,7 @@ impl Action {
             Some("counters-before") => Self::CountersBefore,
             Some("counters-after") => Self::CountersAfter,
             Some("capture") => Self::Capture,
+            Some("capture-post") => Self::CapturePost,
             Some("evidence") => Self::Evidence,
             Some("recover") => Self::Recover,
             _ => return Err(Error::Refused("expected one fixed batch action")),
@@ -590,6 +592,18 @@ impl Boundary<'_> {
         self.check_capture_ready()
     }
 
+    fn verify_after_capture(&self, raw: &[u8]) -> Result<()> {
+        let PlanInput { interface, phases } = decode(raw)?;
+        let cases = phases
+            .checked(&interface)
+            .map_err(|error| Error::Refused(error.0))?;
+        wait_for_after_capture(&cases, || {
+            self.check_capture_ready()?;
+            self.storage.read("capture.pcap", 1024 * 1024)
+        })?;
+        self.check_capture_ready()
+    }
+
     fn counters(&self, filter: &ExactFilter, hook: Receipt, before: bool) -> Result<()> {
         self.check_capture_ready()?;
         if self.storage.exists("release")?
@@ -884,6 +898,32 @@ fn prepare(storage: &Storage, raw: &[u8], boot: String, helper: [u8; 32]) -> Res
     Ok(session.report(&filter, "prepared"))
 }
 
+fn wait_for_after_capture(
+    cases: &[offline_capture::CheckedCase; 4],
+    mut read_pcap: impl FnMut() -> Result<Vec<u8>>,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // tcpdump may append between either length check or during a record read.
+        if let Ok(raw) = read_pcap()
+            && let Ok(packets) = traffic::parse_pcap(&raw)
+            && cases.iter().all(|case| {
+                packets
+                    .iter()
+                    .any(|packet| case.after_control_matches(packet))
+            })
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Refused(
+                "missing restored controls in physical capture",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
 fn wait_for_capture_stop(
     input: &mut (impl Read + std::os::fd::AsFd),
     capture_running: impl Fn() -> Result<()>,
@@ -1112,6 +1152,20 @@ fn run_action(
         ));
     }
     let initial = boundary.snapshot()?;
+    if matches!(action, Action::CapturePost) {
+        let directory = storage.subdir("hook", false)?;
+        if initial.root_rules != session.root
+            || !matches!(initial.leaf, Slot::Absent | Slot::Empty)
+            || !initial.states_and_sources_empty
+            || !trial.removal_verified(&directory)?
+        {
+            return Err(Error::Refused(
+                "verified recovery required before capture check",
+            ));
+        }
+        boundary.verify_after_capture(&raw)?;
+        return Ok(session.report(&filter, "capture_post_verified"));
+    }
     if matches!(action, Action::Evidence) {
         let directory = storage.subdir("hook", false)?;
         if initial.root_rules != session.root
@@ -1225,6 +1279,7 @@ fn run_action(
         | Action::CountersBefore
         | Action::CountersAfter
         | Action::Capture
+        | Action::CapturePost
         | Action::Evidence => {
             return Err(Error::Refused("unexpected batch action"));
         }

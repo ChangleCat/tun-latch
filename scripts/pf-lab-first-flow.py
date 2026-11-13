@@ -40,7 +40,7 @@ COUNTER_ACTIONS = {
     "counters-after": "counters_after_recorded",
 }
 PHASES = {"prepared", "unsettled", "hook_and_filter_verified", "reference_held", "restored",
-          "capture_ready", "capture_recorded", *COUNTER_ACTIONS.values()}
+          "capture_ready", "capture_post_verified", "capture_recorded", *COUNTER_ACTIONS.values()}
 CONFIRMATIONS = {
     "stage": ("STAGE-PF-FIRST-FLOW", {"prepared"}, "hook_and_filter_verified"),
     "activate": ("ACTIVATE-PF-FIRST-FLOW", {"hook_and_filter_verified"}, "reference_held"),
@@ -95,7 +95,7 @@ def report(raw):
 
 
 def invoke(runner, action, data=b""):
-    if action not in ("prepare", "status", *CONFIRMATIONS, *COUNTER_ACTIONS):
+    if action not in ("prepare", "status", "capture-post", *CONFIRMATIONS, *COUNTER_ACTIONS):
         raise Refused("未知动作")
     code, raw = runner.root(HELPER, action, data=data, limit=base.HELPER_OUTPUT_LIMIT,
                             allowed_codes=(0, 1), with_code=True, timeout=45)
@@ -147,7 +147,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
             raise Refused("初始化回报与批准计划不符；保留现场")
         base.inspect(runner, expected)
         return raw
-    if action not in ("status", *CONFIRMATIONS, *COUNTER_ACTIONS):
+    if action not in ("status", "capture-post", *CONFIRMATIONS, *COUNTER_ACTIONS):
         raise Refused("未知动作")
     base.inspect(runner, expected)
     before = invoke(runner, "status")
@@ -156,14 +156,16 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
         raise Refused("受保护计划与批准不符；保留现场")
     if action == "status" or (action == "recover" and obj["phase"] == "restored"):
         return before
-    if action in COUNTER_ACTIONS:
-        if obj["phase"] != "reference_held":
-            raise Refused("只在本次 PF 引用生效时记录计数")
+    if action in COUNTER_ACTIONS or action == "capture-post":
+        required, phase = (("restored", "capture_post_verified") if action == "capture-post"
+                           else ("reference_held", COUNTER_ACTIONS[action]))
+        if obj["phase"] != required:
+            raise Refused("证据采集阶段不符")
         raw = invoke(runner, action)
         result = report(raw)
-        if (result["phase"] != COUNTER_ACTIONS[action] or result["anchor"] != obj["anchor"]
+        if (result["phase"] != phase or result["anchor"] != obj["anchor"]
                 or result["plan_sha256"] != plan_digest):
-            raise Refused("计数记录与本次实验不符；保留现场")
+            raise Refused("证据回报与本次实验不符；保留现场")
         return raw
     ack, allowed, expected_phase = CONFIRMATIONS[action]
     if obj["phase"] not in allowed:
@@ -354,6 +356,11 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=input, windows
         recover()
         uncertain, active = False, False
         send("after", "restored")
+        try:
+            action("capture-post")
+        except Refused as error:
+            # Still finalize and export the capture for independent evaluation.
+            print(f"恢复后抓包实时核验未通过：{error}", file=sys.stderr, flush=True)
         capture_finishing = True
         uncertain = True
         sys.stdout.buffer.write(capture.finish())

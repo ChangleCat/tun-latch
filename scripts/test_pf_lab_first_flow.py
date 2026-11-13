@@ -128,6 +128,21 @@ class FirstFlowOperator(unittest.TestCase):
             op.execute(runner, "counters-after", DIGEST, PLAN)
         invoke.assert_called_once_with(runner, "status")
 
+    def test_post_capture_requires_restoration_and_a_matching_report(self):
+        runner = mock.Mock()
+        for before, post, succeeds in (
+                ("reference_held", status("capture_post_verified"), False),
+                ("restored", status("capture_post_verified", anchor="tunlatch-lab-" + "2" * 32), False),
+                ("restored", status("capture_post_verified"), True)):
+            with (self.subTest(before=before, succeeds=succeeds), mock.patch.object(op.base, "inspect"),
+                  mock.patch.object(op, "invoke", side_effect=[status(before), post]) as invoke):
+                if succeeds:
+                    self.assertEqual(op.execute(runner, "capture-post", DIGEST, PLAN), post)
+                else:
+                    with self.assertRaises(op.Refused):
+                        op.execute(runner, "capture-post", DIGEST, PLAN)
+                self.assertEqual(invoke.call_count, 2 if before == "restored" else 1)
+
     def test_recovery_is_separate_and_never_accepts_plan_path(self):
         runner = mock.Mock()
         with (mock.patch.object(op.base, "inspect"),
@@ -224,7 +239,8 @@ class FirstFlowOperator(unittest.TestCase):
         self.assertEqual([call.args[0] for call in send.call_args_list], ["before", "blocked", "after"])
         self.assertEqual(preflight.call_count, 3)
         self.assertEqual([action for action in actions if action != "status"],
-                         ["prepare", "stage", "activate", "counters-before", "counters-after", "recover"])
+                         ["prepare", "stage", "activate", "counters-before", "counters-after", "recover",
+                          "capture-post"])
         capture.finish.assert_called_once()
         recovery_confirmation.assert_called_once_with("确认恢复")
 
@@ -242,6 +258,8 @@ class FirstFlowOperator(unittest.TestCase):
             if action in ("stage", "activate", "recover"):
                 events.append(action)
                 kwargs["writer_started"]()
+            if action == "capture-post":
+                events.append(action)
             return status(next(states) if action == "status" else "prepared")
 
         @contextlib.contextmanager
@@ -275,7 +293,7 @@ class FirstFlowOperator(unittest.TestCase):
                             peer_session=receiver, confirm_recovery=lambda _: "RECOVER-PF-FIRST-FLOW")
         expected = []
         for phase, next_actions in (("before", ["stage", "activate"]),
-                                    ("blocked", ["recover"]), ("after", [])):
+                                    ("blocked", ["recover"]), ("after", ["capture-post"])):
             expected.extend([("ready", phase, phase), ("send", phase),
                              ("finished", phase), ("closed", phase), *next_actions])
         expected.append("capture_finished")

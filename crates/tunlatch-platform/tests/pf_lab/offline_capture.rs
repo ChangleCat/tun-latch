@@ -132,6 +132,14 @@ impl CheckedCase {
                 .windows(16)
                 .any(|bytes| bytes == self.nonces[0])
     }
+
+    pub(crate) fn after_control_matches(&self, packet: &super::traffic::Packet) -> bool {
+        packet.flow == self.plan.after_control
+            && packet
+                .payload
+                .windows(16)
+                .any(|bytes| bytes == self.nonces[2])
+    }
 }
 
 impl FrozenPlan {
@@ -361,11 +369,9 @@ pub(crate) fn evaluate(manifest: Manifest, bytes: &[u8]) -> Result<Value> {
         let pre_seen = packets
             .iter()
             .any(|p| within(p.at_us, &w.before) && case.before_control_matches(p));
-        let post_seen = packets.iter().any(|p| {
-            p.flow == post
-                && within(p.at_us, &w.after)
-                && p.payload.windows(16).any(|v| v == post_nonce)
-        });
+        let post_seen = packets
+            .iter()
+            .any(|p| within(p.at_us, &w.after) && case.after_control_matches(p));
         let before_ack = receiver_ack(&manifest.reports.before, key, pre, pre_nonce)?;
         let after_ack = receiver_ack(&manifest.reports.after, key, post, post_nonce)?;
         let blocked_ack = receiver_ack(&manifest.reports.blocked, key, negative, negative_nonce)?;
