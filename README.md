@@ -10,7 +10,7 @@ macOS 上独立于代理客户端运行的 TUN 出口保护工具，使用 Rust�
 
 需要 macOS、Rustup 和 Xcode Command Line Tools。仓库固定 Rust 1.99.1 / Edition 2024，并提交 `Cargo.lock`。当前实测环境为 Apple Silicon、macOS 26.6.2；更低系统版本和 Intel 尚未实测，不声明最低兼容系统版本。`rust-version` 暂与固定工具链一致，不承诺支持更早的 Rust。
 
-工作区其他 crate 依赖 macOS 适配层；Linux 只能构建和测试 `tunlatch-core`，以及运行文档检查和大部分 Python 单元测试，不能构建服务、CLI 或 TUI。
+工作区其他 crate 依赖 macOS 适配层；Linux 只能构建和测试 `tunlatch-core`和运行文档检查，不能构建服务、CLI 或 TUI。
 
 ```sh
 cargo build --workspace --locked
@@ -48,7 +48,7 @@ cargo run -p tunlatch -- identity inspect --pid 12345 --json
 cargo run -p tunlatch -- identity inspect --pid 12345 --fd-details --json
 ```
 
-将 PID 替换为实际选择的进程。采集前后核对 PID、UID、出生时间、FD 列表和 socket 元数据；不可读、截断、变化或不支持的结构布局均返回失败。`complete_raw` 仅表示两次有限的原始采样匹配，TUN 归属、已载入映像和实际保护仍为未知/未认证。CLI 省略内核 opaque 值和非 control socket 端点。当前已核对的采集布局限 Apple Silicon；普通观察入口仍拒绝 root。单次管理员只读诊断另有专用程序和受保护暂存流程，见 [操作者步骤](scripts/README.md#单次管理员身份只读采集)，不能直接 sudo 构建目录中的程序。
+将 PID 替换为实际选择的进程。采集前后核对 PID、UID、出生时间、FD 列表和 socket 元数据；不可读、截断、变化或不支持的结构布局均返回失败。`complete_raw` 仅表示两次有限的原始采样匹配，TUN 归属、已载入映像和实际保护仍为未知/未认证。CLI 省略内核 opaque 值和非 control socket 端点。当前已核对的采集布局限 Apple Silicon；普通观察入口仍拒绝 root。
 
 对于普通用户可读取的进程，可在一次采样中核对预先取得的 CDHash、FD 和接口候选。
 
@@ -56,7 +56,7 @@ cargo run -p tunlatch -- identity inspect --pid 12345 --fd-details --json
 cargo run -p tunlatch -- identity correlate --pid 12345 --cdhash 00112233445566778899aabbccddeeff00112233 --json
 ```
 
-请替换示例 PID 和 CDHash。命令在两次接口扫描之间核对动态代码、采集 FD、再核对动态代码。仅当唯一的 utun control 按 `unit - 1` 推导出两次都一致的接口时才返回 `candidate`。两次扫描各自独立，采样期间的变化可能漏检。该推导是诊断线索，TUN 归属和实际保护仍为未知。不可读、不一致或超出采样时限均返回非零。root 代理可另用[单次管理员同窗诊断](scripts/README.md#单次管理员同窗诊断)。
+请替换示例 PID 和 CDHash。命令在两次接口扫描之间核对动态代码、采集 FD、再核对动态代码。仅当唯一的 utun control 按 `unit - 1` 推导出两次都一致的接口时才返回 `candidate`。两次扫描各自独立，采样期间的变化可能漏检。该推导是诊断线索，TUN 归属和实际保护仍为未知。不可读、不一致或超出采样时限均返回非零。
 
 也可将明确选定的进程与预期的 40 位十六进制 CDHash 作动态核验：
 
@@ -65,8 +65,6 @@ cargo run -p tunlatch -- identity check-image --pid 12345 --cdhash 0011223344556
 ```
 
 示例 PID 和指纹均须替换。这条命令通过系统的运行代码对象检查固定 CodeDirectory 条件，不读取程序路径或将磁盘文件摘要当运行身份；匹配返回成功，不匹配或无法检查返回非零。指纹来自调用者，不代表发布者可信或管理员批准；ad-hoc 签名也没有发布者认证。检查禁止网络访问，因此不做在线撤销/公证检查。进程出生信息在前后复核，但不能排除中间 `exec` 或复用；3 秒预算在系统调用返回后检查，不能中断系统调用。结果不提供整镜像 SHA-256、TUN 归属、持续身份或放行资格，原管理员采集入口也未因此扩权。
-
-另有[受控 TUN 映射实验](scripts/README.md#受控-tun-映射实验)工具，默认仅输出计划。本机一次自持接口的名称/control unit/进程 FD 对照及关闭后点查询已通过，操作者确认联网正常。实际运行会创建一个内核可能自动启用的临时接口，必须另行具体批准；该单次样本不认证现有代理或提供出口保护。
 
 服务不会覆盖已有 `control.sock`。若服务被 `SIGKILL` 导致路径残留，先确认原服务已结束，再手动移除该临时目录内的 socket；不要删除仍在运行的服务端点。当前目录只存放开发 socket，删除它不涉及 PF 恢复或停用。
 
@@ -98,12 +96,6 @@ cargo run -p tunlatch -- config journal-status --state-dir "$TUNLATCH_JOURNAL_DI
 ```
 
 日志通过一次原子替换保存草稿与意图，记录有效载荷上限为 64 KiB。写入完成后，提交和独立读回在内存模型中进行。重新打开时会复核草稿和摘要，从未知状态开始核查。损坏或未完成的记录会保留以供检查。
-
-`config verify-capture` 读取已有的 PF 采集文件，报告捕获时的启用状态、根规则调用和可用计数，并与候选规则文本对照。结果为 `unknown` 或 `mismatch`，退出码为非零。
-
-```sh
-cargo run -p tunlatch -- config verify-capture examples/policy.toml --capture-dir /path/to/capture --anchor tunlatch --json
-```
 
 `config deployment-preview` 输出固定的系统目录、文件权限和 LaunchDaemon 模板。私有记录位于 `/private/var/db/tunlatch`，查询与控制端点拟放在同级的 `/private/var/db/tunlatch-runtime`。权限在 JSON 中以十进制整数表示。模板中的 `--system` 是预留入口，当前发布版仍为普通用户观察器。输出仅供核对部署契约。
 
@@ -154,40 +146,20 @@ crates/
 | 模拟控制闭环 | 显式启用后经真实本地通信提交、去重、核验和查询；内存后端无系统副作用 |
 | PF 候选编译 | 离线 CLI 生成未就绪时的双栈阻断候选与独立摘要。授权放行与真实提交后端待完成 |
 | 提交与恢复生命周期 | 状态机已接入普通用户私有记录、模拟提交与独立读回。系统存储部署和 PF 执行待验证 |
-| PF 采集核对 | 可读取已有采集文件并报告捕获差异、缺项与过期。实机读回与执行位置验证待完成 |
 | PF、已有连接约束、必要直连例外 | 待原型与实机验证 |
 | 绑定领域模型 | 已实现候选/关联/确认分型，明确区分 CDHash 与完整镜像摘要，确认与刷新核对类别、内容、新采集序号及 FD 实例；没有实际可信 TUN 或 PF 资格 |
 | UID 出口领域模型 | 独立候选、规范摘要、一次性确认检查、撤销替换及当前范围/UID/协议/族判定；只检查报告一致性，不产生实际管理员或 PF 权限 |
-| 实验进程监督 | 固定无 PF 子程序的启动、限量输入/输出、超时/取消和直接子进程回收已通过普通用户测试；未回收任务保留记录，另有操作者只读系统查询入口；尚未接入特权写入和 PF 变更入口 |
 | 网络观察 | 原生路由通知触发及周期重扫已接入；仅提供失效提示，不证明事件完整或接口实例持续隔离 |
 | 原始身份采集 | 选定 PID 的出生/UID、固定上限 FD/control 双采样已实现；本机 root 代理的原始 control 样本已采得，已载入映像与具体 TUN 归属仍未验证 |
 | 系统部署 | 固定资源布局和 LaunchDaemon 模板可离线预览。特权授权、实际安装卸载与离线解锁待实现 |
 
-下一步先补齐 PF 实验的安全准备，再验证 socket user 的双栈 TCP/UDP、unknown/其他 UID 对照及撤销后的旧连接，连同 anchor 实际执行顺序与共存、事务、启用引用和接口复用。确认这些机制后再接入保护启停，不以 UI 或模型测试替代内核与物理出口证据。`core::egress` 已提供独立 UID 候选和确认模型，实际受保护存储、管理员认证和应用仍待接入；文件导入不能生成批准。
+下一步：实现真实 PF 后端（本项目 anchor + root 挂接 + 引用启停 + 读回核对），再加入 UID 0 放行规则，直接用产品在本机验证。`core::egress` 的 UID 候选与确认模型届时接入。
 
 `tunlatch-core` 的配置草稿、绑定和 UID API 是无系统副作用的领域模型。普通规则的允许只返回
 `NeedsEgressAuthorization`，直连例外仅是候选；一致的采集报告不等于真实平台事实。
 UID 匹配只返回带代次、范围实例及期限的条件要求。系统维护候选参与校验和确认摘要，其报文判定尚未实现。
 `EnforcementQualifiedBinding` 和 `EnforcementAuthorization` 当前均不可安全构造。原有 CLI/IPC 未接入这些新能力，仍报告保护未知。
 
-PF 实验准备工具可用普通用户运行：
-
-```sh
-cargo run -p tunlatch-platform --example pf_lab --locked -- plan
-TUNLATCH_LAB_DIR=$(mktemp -d /tmp/tunlatch-pf-lab.XXXXXX)
-cargo run -p tunlatch-platform --example pf_lab --locked -- prepare "$TUNLATCH_LAB_DIR"
-"$TUNLATCH_LAB_DIR/pf-lab" recover
-```
-
-工具只生成候选计划、规则文本和独立准备程序；`recover` 默认也只展示计划。
-**`pf_lab` 的所有实机请求均被拒绝，即使提供两个 opt-in 标志也不会执行 PF。当前没有覆盖真实出口阻断的合格恢复包。**
-固定 anchor 名称、标签、收据或模拟测试均不证明内核资源归属；完整预检、可信程序部署、
-特权进程监督接入、接口复用、状态选择、引用和流量采集仍须补齐，实机操作另行审核。
-
 贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，仓库约定见 [AGENTS.md](AGENTS.md)，完整工程检查见 [CI 配置](.github/workflows/ci.yml)，安全边界见 [SAFETY.md](SAFETY.md)，漏洞报告见 [SECURITY.md](SECURITY.md)。需求、技术调研和编码规范见 [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)、[docs/TECH-STACK-RESEARCH.md](docs/TECH-STACK-RESEARCH.md) 和 [docs/CODING-GUIDELINES.md](docs/CODING-GUIDELINES.md)；本地开发计划、工作状态和证据按 `.gitignore` 保持未跟踪。本 README 记录可随代码交付的架构与能力边界。
 
 许可证：[GPL-3.0-only](LICENSE)。
-
-操作者在本机可运行 `./scripts/pf-lab-preflight.sh`，通过固定系统工具采集只读 PF 前态。项目程序仍用普通用户运行，不调整网络或加载规则；步骤和数据边界见 [scripts/README.md](scripts/README.md)。
-
-独立的人工实验脚本还可准备单次启用引用及未挂接规则槽的暂存/清空；这些动作需要具体实验许可，项目服务仍无PF写入能力。`pf-lab-rule.py`默认仅展示计划，不启用PF、不添加根调用，恢复只替换本次filter为空。完整当前启动回执下的人工接管不能外推成自动故障恢复、UID或出口防泄漏资格。

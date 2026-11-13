@@ -1,6 +1,5 @@
 //! Unprivileged CLI and terminal interface. Closing this program has no firewall side effects.
 
-mod capture_command;
 mod config_command;
 mod identity_command;
 mod journal_command;
@@ -176,18 +175,6 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Compare existing PF capture files with an offline candidate.
-    VerifyCapture {
-        path: PathBuf,
-        #[arg(long)]
-        capture_dir: PathBuf,
-        #[arg(long)]
-        anchor: String,
-        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=300))]
-        max_age_secs: u64,
-        #[arg(long)]
-        json: bool,
-    },
     /// Preview a configuration draft without applying it or importing approval.
     ImportPreview {
         path: PathBuf,
@@ -326,21 +313,6 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tokio::task::spawn_blocking(move || journal_command::inspect(&state_dir, json))
                 .await??;
-        }
-        Command::Config {
-            command:
-                ConfigCommand::VerifyCapture {
-                    path,
-                    capture_dir,
-                    anchor,
-                    max_age_secs,
-                    json,
-                },
-        } => {
-            tokio::task::spawn_blocking(move || {
-                capture_command::verify(&path, &capture_dir, &anchor, max_age_secs, json)
-            })
-            .await??;
         }
         Command::Config {
             command: ConfigCommand::ImportPreview { path, current },

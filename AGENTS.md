@@ -10,7 +10,7 @@ Workspace crates under `crates/` (macOS only):
 - `tunlatchd`: service orchestration, client limits, and shutdown.
 - `tunlatch`: CLI and Ratatui dashboard.
 
-Unit tests sit beside implementations; socket integration tests occupy `crates/tunlatchd/tests/`. Sample configuration: `examples/config.toml`. Shared guidance is tracked in `docs/REQUIREMENTS.md`, `docs/CODING-GUIDELINES.md`, and `docs/TECH-STACK-RESEARCH.md`; `docs/development-plan-*/`, `docs/WORK-STATUS.md`, and local evidence remain ignored. Build output: ignored `target/`.
+Unit tests sit beside implementations; socket integration tests occupy `crates/tunlatchd/tests/`. Sample configuration: `examples/config.toml`. Shared guidance is tracked in `docs/REQUIREMENTS.md`, `docs/CODING-GUIDELINES.md`, and `docs/TECH-STACK-RESEARCH.md`; the single solo-mode plan `docs/PLAN.md` (goal, cards, decisions, resume notes) remains ignored; keep no other plan, status, registry, or evidence files. Build output: ignored `target/`.
 
 ## Build, Test, and Development Commands
 
@@ -34,9 +34,9 @@ Rust 2024: four-space indentation, 100-column rustfmt width; YAML: two spaces. U
 Workspace code denies `unsafe` except for these independently reviewed adapters:
 
 - `tunlatch-platform/src/identity/native.rs` may contain the minimal read-only `proc_pidinfo` / `proc_pidfdinfo` adapter and checked kernel-control union access.
-- `tunlatch-platform/src/pf/native_hook.rs` may contain one minimal `ioctl` call site for `DIOCGETRULES`, `DIOCGETRULE`, `DIOCINSERTRULE`, and `DIOCDELETERULE` for the isolated root filter hook experiment. Require exact ABI and OS build qualification, fixed requests, a nonzero per-rule deletion ticket, and separate protected experiment authorization before any live writes.
+- `tunlatch-platform/src/pf/native_hook.rs` may contain one minimal `ioctl` call site for `DIOCGETRULES`, `DIOCGETRULE`, `DIOCINSERTRULE`, and `DIOCDELETERULE` to attach the project anchor to the root ruleset. Require exact ABI and OS build qualification, fixed requests, and a nonzero per-rule deletion ticket.
 
-Keep all other code denied. Expose only safe owned results, document each unsafe operation, and enforce exact lengths and fixed resource limits. These exceptions grant no live PF operations, privilege escalation, or service installation.
+Keep all other code denied. Expose only safe owned results, document each unsafe operation, and enforce exact lengths and fixed resource limits. Live PF changes go only through the product backend; the user runs privileged steps. Do not build separate experiment harnesses.
 
 ## Testing Guidelines
 

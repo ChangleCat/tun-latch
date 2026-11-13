@@ -8,13 +8,12 @@ Chinese and English discussion are both welcome. Please read [README.md](README.
 ## Platform support
 
 - **macOS**: the full workspace, service, CLI, and TUI.
-- **Linux**: documentation, most Python helper checks, and `tunlatch-core` only.
+- **Linux**: documentation and `tunlatch-core` only.
 
 `tunlatch-platform` contains an explicit `compile_error!` on non-macOS targets, so
 `tunlatch-ipc`, `tunlatchd`, and `tunlatch` cannot be built or tested on Linux. On Linux, use
 `cargo test -p tunlatch-core --locked`; do not run `cargo test --workspace` or workspace-wide
-Clippy. A few script tests invoke macOS tools such as `/usr/bin/script`; those are verified on
-macOS CI. CI currently runs on `macos-15` only.
+Clippy. CI currently runs on `macos-15` only.
 
 ## Before you start
 
@@ -60,12 +59,6 @@ For a targeted change, `cargo test -p <crate> --test <name> --locked` is fine du
 but the PR should be based on the full workspace result. The complete sequence, including the
 release build and pinned `cargo-deny` check, is in
 [.github/workflows/ci.yml](.github/workflows/ci.yml). CI runs on `macos-15`.
-
-Python helper tests are not yet part of CI. If you change `scripts/`, run:
-
-```sh
-python3 -m unittest discover -s scripts -p 'test_*.py'
-```
 
 ## Pull requests
 

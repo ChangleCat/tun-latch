@@ -20,13 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-clap.workspace = true
 nix = { workspace = true, features = ["fs"] }
 pfctl.workspace = true
 tempfile.workspace = true
-tun-rs.workspace = true
-socket2.workspace = true
-rustix.workspace = true
 
 [lints]
 workspace = true

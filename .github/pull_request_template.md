@@ -15,7 +15,6 @@ What is different after this change? What is intentionally unchanged?
 - [ ] `cargo test --workspace --all-targets --locked`
 - [ ] `cargo test --workspace --doc --locked`
 - [ ] New behavior has a success test and a failure test
-- [ ] Python tests were run if `scripts/` changed
 
 ## Safety
 
