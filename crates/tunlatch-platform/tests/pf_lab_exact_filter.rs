@@ -97,6 +97,71 @@ fn builds_both_transactions_and_compares_only_exact_rules() -> Result<(), Box<dy
     }
     Ok(())
 }
+
+#[test]
+fn uid_zero_rules_require_an_exact_stateless_pass_before_each_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let plan = ExactFilter::new(SUFFIX, "en0", flows()?)?;
+    drop(plan.root_uid_transaction()?);
+    let expected: String = canonical()
+        .lines()
+        .map(|block| {
+            let pass = block.replacen("block drop", "pass", 1).replacen(
+                "no state",
+                "user = 0 no state",
+                1,
+            );
+            let pass = pass.trim_end_matches('"');
+            format!("{pass}-uid0\"\n{block}\n")
+        })
+        .collect();
+    assert!(plan.matches_root_uid_rules(expected.as_bytes()));
+    assert!(!plan.matches_observed(expected.as_bytes()));
+    assert!(!plan.matches_root_uid_rules(canonical().as_bytes()));
+    let mut reversed: Vec<_> = expected.lines().collect();
+    reversed.swap(0, 1);
+    for wrong in [
+        expected.replacen("user = 0", "user != 0", 1),
+        expected.replacen("user = 0", "user = 501", 1),
+        expected.replacen("user = 0", "user = unknown", 1),
+        expected.replacen("user = 0", "group = 0", 1),
+        expected.replacen("user = 0 ", "", 1),
+        expected.replacen("no state", "keep state", 1),
+        expected.replacen("no state ", "", 1),
+        expected.replacen("quick ", "", 1),
+        format!("{}\n", reversed.join("\n")),
+    ] {
+        assert!(!plan.matches_root_uid_rules(wrong.as_bytes()));
+    }
+    Ok(())
+}
+
+#[test]
+fn uid_counters_report_pass_and_fallback_separately() -> Result<(), Box<dyn std::error::Error>> {
+    let plan = ExactFilter::new(SUFFIX, "en0", flows()?)?;
+    let zeroes = "0 0 0 0 0 0 0";
+    let before: String = (0..4)
+        .flat_map(|i| [format!("{SUFFIX}-{i}-uid0"), format!("{SUFFIX}-{i}")])
+        .map(|label| format!("tunlatch-lab:{label} {zeroes}\n"))
+        .collect();
+    let after = before
+        .replacen(&format!("-0-uid0 {zeroes}"), "-0-uid0 1 1 60 0 0 1 60", 1)
+        .replacen(&format!("-1 {zeroes}"), "-1 2 2 120 0 0 2 120", 1);
+    assert_eq!(
+        plan.root_uid_deltas(before.as_bytes(), after.as_bytes()),
+        Some([(1, 0), (0, 2), (0, 0), (0, 0)])
+    );
+    assert_eq!(
+        plan.root_uid_deltas(after.as_bytes(), before.as_bytes()),
+        None
+    );
+    let duplicate = after.replacen("-0-uid0 ", "-0 ", 1);
+    assert_eq!(
+        plan.root_uid_deltas(before.as_bytes(), duplicate.as_bytes()),
+        None
+    );
+    Ok(())
+}
 #[test]
 fn rejects_unscoped_parameters() -> Result<(), Box<dyn std::error::Error>> {
     let f = flows()?;
