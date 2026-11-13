@@ -135,10 +135,10 @@ pub(super) fn exchange(
     let mut buffer = [0; 513];
     if tcp {
         let mut stream: TcpStream = if sender {
+            let wait = at("connect_budget", remaining(deadline))?;
             at(
-                "connect",
-                remaining(deadline)
-                    .and_then(|wait| socket.connect_timeout(&destination.into(), wait)),
+                "connect_attempted",
+                socket.connect_timeout(&destination.into(), wait),
             )?;
             socket.into()
         } else {
