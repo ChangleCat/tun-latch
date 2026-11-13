@@ -91,6 +91,29 @@ class FirstFlowOperator(unittest.TestCase):
             self.assertEqual(op.invoke(runner, action), status())
             self.assertLessEqual(runner.root.call_args.kwargs["timeout"], 45)
 
+    def test_archiving_never_moves_an_unsettled_or_changed_deployment(self):
+        archive = op.DIRECTORY + "-archive.12345678"
+        for before, after, moves in (("unsettled", "unsettled", False),
+                                     ("restored", "unsettled", False),
+                                     ("restored", "restored", True)):
+            with self.subTest(before=before, after=after):
+                runner = mock.Mock()
+                runner.call.return_value = b""
+                runner.root.side_effect = lambda command, *_args, **_kw: {
+                    "/usr/bin/mktemp": (archive + "\n").encode(), "/bin/ls": b"",
+                    "/bin/mv": b"", "/bin/test": (1, b""),
+                }[command]
+                with (mock.patch.object(op.base, "inspect"),
+                      mock.patch.object(op.base, "directory_identity", return_value=(b"1", b"2")),
+                      mock.patch.object(op, "invoke", side_effect=[status(before), status(after)])):
+                    if moves:
+                        self.assertEqual(op.archive_restored(runner, DIGEST, PLAN, ANCHOR), archive)
+                    else:
+                        with self.assertRaises(op.Refused):
+                            op.archive_restored(runner, DIGEST, PLAN, ANCHOR)
+                mutations = [call.args[0] for call in runner.root.call_args_list if call.args[0] == "/bin/mv"]
+                self.assertEqual(mutations, ["/bin/mv"] if moves else [])
+
     def test_counters_require_held_reference_and_exact_session(self):
         runner = mock.Mock()
         with (mock.patch.object(op.base, "inspect"),
@@ -229,6 +252,11 @@ class FirstFlowOperator(unittest.TestCase):
 
         output = mock.Mock()
         output.buffer = io.BytesIO()
+        def finish_capture():
+            events.append("capture_finished")
+            return status("capture_recorded")
+
+        capture.finish.side_effect = finish_capture
         with (mock.patch.object(op, "execute", side_effect=execute),
               mock.patch.object(op, "Capture", return_value=capture),
               mock.patch.object(op.flow, "preflight", return_value={"boot": "boot"}),
@@ -243,6 +271,7 @@ class FirstFlowOperator(unittest.TestCase):
                                     ("blocked", ["recover"]), ("after", [])):
             expected.extend([("ready", phase, phase), ("send", phase),
                              ("finished", phase), ("closed", phase), *next_actions])
+        expected.append("capture_finished")
         self.assertEqual(events, expected)
 
     def test_capture_uses_fixed_command_and_two_checked_reports(self):

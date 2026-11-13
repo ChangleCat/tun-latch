@@ -173,14 +173,14 @@ def read_evidence(runner):
     return raw, digest
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--local', type=Path, required=True, help='local windows and receiver reports JSON')
     for phase in PHASES:
         parser.add_argument('--receiver-' + phase, type=Path, help='final receiver report for ' + phase)
     parser.add_argument('--output-dir', type=Path, required=True, help='new private evidence directory')
     parser.add_argument('--evaluate', action='store_true', help='run the prebuilt fixed offline evaluator')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if os.geteuid() == 0:
         raise Refused('请以普通用户运行')
     with args.local.open('rb') as source:

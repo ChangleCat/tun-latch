@@ -102,6 +102,37 @@ def invoke(runner, action, data=b""):
     return base.checked_helper_output(code, raw)
 
 
+def archive_restored(runner, expected, old_plan, old_anchor):
+    def verify_old():
+        base.inspect(runner, expected)
+        identity = base.directory_identity(runner, DIRECTORY)
+        processes = runner.call(["/bin/ps", "-axww", "-o", "command="], limit=256 * 1024)
+        if any(HELPER.encode() in line for line in processes.splitlines()):
+            raise Refused("旧实验助手仍在运行，保留现场")
+        observed = report(invoke(runner, "status"))
+        if (observed["phase"], observed["plan_sha256"], observed["anchor"]) != (
+                "restored", old_plan, old_anchor):
+            raise Refused("旧实验未核实恢复或身份不符，保留现场")
+        return identity
+
+    original = verify_old()
+    raw = runner.root("/usr/bin/mktemp", "-d", DIRECTORY + "-archive.XXXXXXXX", limit=256)
+    if not re.fullmatch(re.escape(DIRECTORY).encode() + rb"-archive\.[A-Za-z0-9]{8}\n", raw):
+        raise Refused("归档路径无效，保留现场")
+    archive = raw.decode("ascii").strip()
+    print("旧实验归档目录：" + archive, flush=True)
+    dest = archive + "/tunlatch-pf-first-flow"
+    if (base.directory_identity(runner, archive)[0] != original[0]
+            or runner.root("/bin/ls", "-1A", archive, limit=256) != b""
+            or verify_old() != original):
+        raise Refused("归档前目录或状态变化，保留现场")
+    runner.root("/bin/mv", "-n", DIRECTORY, dest)
+    code, _ = runner.root("/bin/test", "-e", DIRECTORY, allowed_codes=(0, 1), with_code=True)
+    if code != 1 or base.directory_identity(runner, dest) != original:
+        raise Refused("归档后目录身份不符，保留现场")
+    return archive
+
+
 def execute(runner, action, expected, plan_digest, *, data=None, boot=None, confirm=input,
             writer_started=None, fresh_runner=None):
     if action == "prepare":
@@ -141,7 +172,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
     print("确认从暂存起未中断 PF 独占窗口，其他 PF 写入者已退出且恢复条件已核对。不能确认时停止。", flush=True)
     if confirm("请输入 " + ack + "：") != ack:
         raise Refused("未确认本次动作")
-    if action == "recover" and fresh_runner is not None:
+    if fresh_runner is not None:
         runner = fresh_runner()
     base.inspect(runner, expected)
     if invoke(runner, "status") != before:
@@ -214,19 +245,7 @@ class Capture:
         return bytes(self.buffers["out"])
 
 
-def terminal_confirm(prompt):
-    print(prompt, end="", flush=True)
-    with selectors.DefaultSelector() as selector:
-        selector.register(sys.stdin, selectors.EVENT_READ)
-        if not selector.select(15):
-            raise Refused("人工确认超时")
-    line = sys.stdin.readline()
-    if not line:
-        raise EOFError
-    return line.rstrip("\n")
-
-
-def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confirm, windows_fd=None,
+def attended_run(runner, expected, digest, data, boot, *, confirm=input, windows_fd=None,
                  fresh_runner=None, peer_session=None, confirm_recovery=input):
     frozen = json.loads(data, object_pairs_hook=base.unique_fields)
     document = frozen["phases"]
@@ -253,6 +272,7 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
         uncertain = True
         capture = Capture(runner, expected, digest, prepared["anchor"])
         capture.ready()
+        print("抓包最长约 4 分 50 秒。恢复确认会继续等待；若抓包已结束，本批证据会保留为不完整。", flush=True)
         uncertain = False
 
         @contextlib.contextmanager
@@ -316,9 +336,9 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
             uncertain = True
 
         send("before", "prepared")
-        action("stage", confirm=confirm, writer_started=writer_started)
+        action("stage", confirm=confirm, writer_started=writer_started, fresh_runner=fresh_runner)
         uncertain, active = False, True
-        action("activate", confirm=confirm, writer_started=writer_started)
+        action("activate", confirm=confirm, writer_started=writer_started, fresh_runner=fresh_runner)
         uncertain = False
         action("counters-before")
         send("blocked", "reference_held")
@@ -349,7 +369,7 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
             print("进程或写入结果未知；保留现场，确认所有写入者已结束后人工检查恢复。", file=sys.stderr)
 
 
-def main(*, peer_session=None, before_run=None):
+def main(*, peer_session=None, before_run=None, after_run=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", default="plan",
                         choices=("plan", "run", "prepare", "status", *CONFIRMATIONS, *COUNTER_ACTIONS))
@@ -405,6 +425,8 @@ def main(*, peer_session=None, before_run=None):
                          peer_session=peer_session)
         finally:
             os.close(fd)
+        if after_run is not None:
+            after_run(output_path)
         return
     result = execute(stage.Runner(), args.action, expected, digest, data=data, boot=boot,
                      fresh_runner=stage.Runner)
