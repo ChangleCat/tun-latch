@@ -65,8 +65,11 @@ class FirstFlowOperator(unittest.TestCase):
         with (mock.patch.object(op.base, "inspect"),
               mock.patch.object(op, "invoke", side_effect=[status(), status("unsettled")]) as invoke,
               self.assertRaises(op.Refused)):
-            op.execute(runner, "stage", DIGEST, PLAN, confirm=lambda _: "STAGE-PF-FIRST-FLOW")
+            writer_started = mock.Mock()
+            op.execute(runner, "stage", DIGEST, PLAN, confirm=lambda _: "STAGE-PF-FIRST-FLOW",
+                       writer_started=writer_started)
         self.assertEqual(invoke.call_count, 2)
+        writer_started.assert_not_called()
 
     def test_activate_and_recover_use_the_reference_held_phase(self):
         runner = mock.Mock()
@@ -194,9 +197,10 @@ class FirstFlowOperator(unittest.TestCase):
         capture.finish.return_value = status("capture_recorded")
         actions = []
 
-        def execute(_runner, action, *_args, **_kwargs):
+        def execute(_runner, action, *_args, **kwargs):
             actions.append(action)
             if action == "stage":
+                kwargs["writer_started"]()
                 raise op.Refused("unknown writer")
             return status()
 
@@ -209,6 +213,30 @@ class FirstFlowOperator(unittest.TestCase):
             op.attended_run(mock.Mock(), DIGEST, PLAN, BATCH, "boot",
                             confirm=lambda prompt: prompt.split("请输入 ")[1].split("：")[0])
         self.assertNotIn("recover", actions)
+
+    def test_refusal_before_activation_dispatch_recovers_staged_rules(self):
+        capture = mock.Mock()
+        capture.child.poll.return_value = None
+        capture.finish.return_value = status("capture_recorded")
+        actions = []
+
+        def execute(_runner, action, *_args, **kwargs):
+            actions.append(action)
+            if action == "activate":
+                raise op.Refused("status changed before dispatch")
+            if action in ("stage", "recover"):
+                kwargs["writer_started"]()
+            return status()
+
+        with (mock.patch.object(op, "execute", side_effect=execute),
+              mock.patch.object(op, "Capture", return_value=capture),
+              mock.patch.object(op.flow, "preflight", return_value={"boot": "boot"}),
+              mock.patch.object(op.flow.peer, "select_phase", return_value=[]),
+              mock.patch.object(op.flow.peer, "run", return_value=0),
+              self.assertRaisesRegex(op.Refused, "status changed")):
+            op.attended_run(mock.Mock(), DIGEST, PLAN, BATCH, "boot",
+                            confirm=lambda prompt: prompt.split("请输入 ")[1].split("：")[0])
+        self.assertEqual(actions[-3:], ["stage", "activate", "recover"])
 
     def test_peer_prompt_interrupt_recovers_before_stopping_capture(self):
         capture = mock.Mock()

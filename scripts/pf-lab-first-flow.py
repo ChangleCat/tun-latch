@@ -102,7 +102,8 @@ def invoke(runner, action, data=b""):
     return base.checked_helper_output(code, raw)
 
 
-def execute(runner, action, expected, plan_digest, *, data=None, boot=None, confirm=input):
+def execute(runner, action, expected, plan_digest, *, data=None, boot=None, confirm=input,
+            writer_started=None):
     if action == "prepare":
         if data is None or hashlib.sha256(data).hexdigest() != plan_digest:
             raise Refused("冻结计划与本次批准不符")
@@ -143,6 +144,8 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
     base.inspect(runner, expected)
     if invoke(runner, "status") != before:
         raise Refused("确认期间状态变化；保留现场")
+    if writer_started is not None:
+        writer_started()
     raw = invoke(runner, action, (ack + "\n").encode())
     result = report(raw)
     if (result["phase"] != expected_phase or result["anchor"] != obj["anchor"]
@@ -288,26 +291,19 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
             if phase != "blocked" and result != 0:
                 raise Refused(f"{phase} 对照未完成")
 
-        def writer_confirmation(prompt):
+        def writer_started():
             nonlocal uncertain
-            uncertain = False
-            answer = confirm(prompt)
-            if answer == prompt.removeprefix("请输入 ").removesuffix("："):
-                uncertain = True
-            return answer
+            uncertain = True
 
         send("before", "prepared")
-        uncertain = True
-        action("stage", confirm=writer_confirmation)
+        action("stage", confirm=confirm, writer_started=writer_started)
         uncertain, active = False, True
-        uncertain = True
-        action("activate", confirm=writer_confirmation)
+        action("activate", confirm=confirm, writer_started=writer_started)
         uncertain = False
         action("counters-before")
         send("blocked", "reference_held")
         action("counters-after")
-        uncertain = True
-        action("recover", confirm=writer_confirmation)
+        action("recover", confirm=confirm, writer_started=writer_started)
         uncertain, active = False, False
         send("after", "restored")
         capture_finishing = True
@@ -319,7 +315,8 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
     finally:
         if active and not uncertain:
             try:
-                action("recover", confirm=confirm)
+                action("recover", confirm=confirm, writer_started=writer_started)
+                uncertain = False
             except (Refused, OSError, ValueError, KeyboardInterrupt, EOFError):
                 print("恢复未确认；保留现场并人工检查后使用 recover。", file=sys.stderr)
         if capture is not None and not capture_clean and not capture_finishing:
