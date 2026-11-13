@@ -129,6 +129,25 @@ class FirstFlowOperator(unittest.TestCase):
             op.execute(runner, "prepare", DIGEST, hashlib.sha256(data).hexdigest(), data=data, boot="boot")
         invoke.assert_not_called()
 
+    def test_recovery_refreshes_command_budget_after_human_confirmation(self):
+        before, after = mock.Mock(), mock.Mock()
+        fresh = mock.Mock(return_value=after)
+
+        def confirm(prompt):
+            self.assertIn("RECOVER-PF-FIRST-FLOW", prompt)
+            fresh.assert_not_called()
+            return "RECOVER-PF-FIRST-FLOW"
+
+        with (mock.patch.object(op.base, "inspect"),
+              mock.patch.object(op, "invoke", side_effect=[
+                  status("reference_held"), status("reference_held"), status("restored")]) as invoke):
+            result = op.execute(before, "recover", DIGEST, PLAN, confirm=confirm, fresh_runner=fresh)
+        self.assertEqual(result, status("restored"))
+        fresh.assert_called_once_with()
+        self.assertEqual(invoke.call_args_list, [
+            mock.call(before, "status"), mock.call(after, "status"),
+            mock.call(after, "recover", b"RECOVER-PF-FIRST-FLOW\n")])
+
     def test_attended_run_orders_phases_and_recovery(self):
         runner = mock.Mock()
         capture = mock.Mock()
@@ -138,8 +157,13 @@ class FirstFlowOperator(unittest.TestCase):
                        "restored", "restored"])
         actions = []
 
-        def execute(_runner, action, *_args, **_kwargs):
+        recovery_confirmation = mock.Mock(return_value="RECOVER-PF-FIRST-FLOW")
+
+        def execute(_runner, action, *_args, **kwargs):
             actions.append(action)
+            if action == "recover":
+                self.assertIs(kwargs["confirm"], recovery_confirmation)
+                self.assertEqual(kwargs["confirm"]("确认恢复"), "RECOVER-PF-FIRST-FLOW")
             return status(next(states) if action == "status" else "prepared")
 
         output = mock.Mock()
@@ -154,12 +178,14 @@ class FirstFlowOperator(unittest.TestCase):
               mock.patch.object(op.flow.peer, "run", side_effect=send_result) as send,
               mock.patch.object(op.sys, "stdout", output)):
             op.attended_run(runner, DIGEST, PLAN, BATCH, "boot",
-                            confirm=lambda prompt: prompt.split("请输入 ")[1].split("：")[0])
+                            confirm=lambda prompt: prompt.split("请输入 ")[1].split("：")[0],
+                            confirm_recovery=recovery_confirmation)
         self.assertEqual([call.args[0] for call in send.call_args_list], ["before", "blocked", "after"])
         self.assertEqual(preflight.call_count, 3)
         self.assertEqual([action for action in actions if action != "status"],
                          ["prepare", "stage", "activate", "counters-before", "counters-after", "recover"])
         capture.finish.assert_called_once()
+        recovery_confirmation.assert_called_once_with("确认恢复")
 
     def test_managed_receiver_finishes_each_phase_without_peer_prompts(self):
         import contextlib

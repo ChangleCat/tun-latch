@@ -103,7 +103,7 @@ def invoke(runner, action, data=b""):
 
 
 def execute(runner, action, expected, plan_digest, *, data=None, boot=None, confirm=input,
-            writer_started=None):
+            writer_started=None, fresh_runner=None):
     if action == "prepare":
         if data is None or hashlib.sha256(data).hexdigest() != plan_digest:
             raise Refused("冻结计划与本次批准不符")
@@ -141,6 +141,8 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
     print("确认从暂存起未中断 PF 独占窗口，其他 PF 写入者已退出且恢复条件已核对。不能确认时停止。", flush=True)
     if confirm("请输入 " + ack + "：") != ack:
         raise Refused("未确认本次动作")
+    if action == "recover" and fresh_runner is not None:
+        runner = fresh_runner()
     base.inspect(runner, expected)
     if invoke(runner, "status") != before:
         raise Refused("确认期间状态变化；保留现场")
@@ -225,7 +227,7 @@ def terminal_confirm(prompt):
 
 
 def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confirm, windows_fd=None,
-                 fresh_runner=None, peer_session=None):
+                 fresh_runner=None, peer_session=None, confirm_recovery=input):
     frozen = json.loads(data, object_pairs_hook=base.unique_fields)
     document = frozen["phases"]
     phase_bytes = json.dumps(document, separators=(",", ":")).encode()
@@ -241,6 +243,11 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
     def action(name, **kwargs):
         current_runner = runner if fresh_runner is None else fresh_runner()
         return execute(current_runner, name, expected, digest, **kwargs)
+
+    def recover():
+        raw = action("recover", confirm=confirm_recovery, writer_started=writer_started,
+                     fresh_runner=fresh_runner)
+        print(raw.decode("utf-8", "strict").rstrip("\n"), flush=True)
 
     try:
         uncertain = True
@@ -316,7 +323,7 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
         action("counters-before")
         send("blocked", "reference_held")
         action("counters-after")
-        action("recover", confirm=confirm, writer_started=writer_started)
+        recover()
         uncertain, active = False, False
         send("after", "restored")
         capture_finishing = True
@@ -328,7 +335,7 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
     finally:
         if active and not uncertain:
             try:
-                action("recover", confirm=confirm, writer_started=writer_started)
+                recover()
                 uncertain = False
             except (Refused, OSError, ValueError, KeyboardInterrupt, EOFError):
                 print("恢复未确认；保留现场并人工检查后使用 recover。", file=sys.stderr)
@@ -399,7 +406,8 @@ def main(*, peer_session=None, before_run=None):
         finally:
             os.close(fd)
         return
-    result = execute(stage.Runner(), args.action, expected, digest, data=data, boot=boot)
+    result = execute(stage.Runner(), args.action, expected, digest, data=data, boot=boot,
+                     fresh_runner=stage.Runner)
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.flush()
 
