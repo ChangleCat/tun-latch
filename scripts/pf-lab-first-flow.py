@@ -30,7 +30,12 @@ MODE = "pf-first-flow-trial"
 AUDITED_BINARY_SHA256 = None
 APPROVED_PLAN_SHA256 = None
 LIMIT = 16384
-PHASES = {"prepared", "unsettled", "hook_and_filter_verified", "reference_held", "restored"}
+COUNTER_ACTIONS = {
+    "counters-before": "counters_before_recorded",
+    "counters-after": "counters_after_recorded",
+}
+PHASES = {"prepared", "unsettled", "hook_and_filter_verified", "reference_held", "restored",
+          *COUNTER_ACTIONS.values()}
 CONFIRMATIONS = {
     "stage": ("STAGE-PF-FIRST-FLOW", {"prepared"}, "hook_and_filter_verified"),
     "activate": ("ACTIVATE-PF-FIRST-FLOW", {"hook_and_filter_verified"}, "reference_held"),
@@ -85,7 +90,7 @@ def report(raw):
 
 
 def invoke(runner, action, data=b""):
-    if action not in ("prepare", "status", *CONFIRMATIONS):
+    if action not in ("prepare", "status", *CONFIRMATIONS, *COUNTER_ACTIONS):
         raise Refused("未知动作")
     code, raw = runner.root(HELPER, action, data=data, limit=base.HELPER_OUTPUT_LIMIT,
                             allowed_codes=(0, 1), with_code=True, timeout=45)
@@ -105,7 +110,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
             raise Refused("初始化回报与批准计划不符；保留现场")
         base.inspect(runner, expected)
         return raw
-    if action not in ("status", *CONFIRMATIONS):
+    if action not in ("status", *CONFIRMATIONS, *COUNTER_ACTIONS):
         raise Refused("未知动作")
     base.inspect(runner, expected)
     before = invoke(runner, "status")
@@ -114,6 +119,15 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
         raise Refused("受保护计划与批准不符；保留现场")
     if action == "status":
         return before
+    if action in COUNTER_ACTIONS:
+        if obj["phase"] != "reference_held":
+            raise Refused("只在本次 PF 引用生效时记录计数")
+        raw = invoke(runner, action)
+        result = report(raw)
+        if (result["phase"] != COUNTER_ACTIONS[action] or result["anchor"] != obj["anchor"]
+                or result["plan_sha256"] != plan_digest):
+            raise Refused("计数记录与本次实验不符；保留现场")
+        return raw
     ack, allowed, expected_phase = CONFIRMATIONS[action]
     if obj["phase"] not in allowed:
         raise Refused("当前阶段不允许此动作；保留现场")
@@ -135,7 +149,8 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", default="plan", choices=("plan", "prepare", "status", *CONFIRMATIONS))
+    parser.add_argument("action", nargs="?", default="plan",
+                        choices=("plan", "prepare", "status", *CONFIRMATIONS, *COUNTER_ACTIONS))
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--interface")
     args = parser.parse_args()
@@ -150,7 +165,7 @@ def main():
             digest = hashlib.sha256(data).hexdigest()
         else:
             digest = None
-        print(json.dumps({"directory": DIRECTORY, "helper": HELPER, "actions": (["prepare", "status", *CONFIRMATIONS]
+        print(json.dumps({"directory": DIRECTORY, "helper": HELPER, "actions": (["prepare", "status", *CONFIRMATIONS, *COUNTER_ACTIONS]
                                       if AUDITED_BINARY_SHA256 is not None and APPROVED_PLAN_SHA256 is not None else []),
                           "digest_reviewed": AUDITED_BINARY_SHA256 is not None,
                           "plan_approved": APPROVED_PLAN_SHA256 is not None,

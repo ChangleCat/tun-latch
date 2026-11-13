@@ -85,6 +85,20 @@ class FirstFlowOperator(unittest.TestCase):
             self.assertEqual(op.invoke(runner, action), status())
             self.assertLessEqual(runner.root.call_args.kwargs["timeout"], 45)
 
+    def test_counters_require_held_reference_and_exact_session(self):
+        runner = mock.Mock()
+        with (mock.patch.object(op.base, "inspect"),
+              mock.patch.object(op, "invoke", side_effect=[
+                  status("reference_held"), status("counters_before_recorded")]) as invoke):
+            result = op.execute(runner, "counters-before", DIGEST, PLAN)
+        self.assertEqual(op.report(result)["phase"], "counters_before_recorded")
+        self.assertEqual(invoke.call_args_list[-1], mock.call(runner, "counters-before"))
+        with (mock.patch.object(op.base, "inspect"),
+              mock.patch.object(op, "invoke", return_value=status("hook_and_filter_verified")) as invoke,
+              self.assertRaises(op.Refused)):
+            op.execute(runner, "counters-after", DIGEST, PLAN)
+        invoke.assert_called_once_with(runner, "status")
+
     def test_recovery_is_separate_and_never_accepts_plan_path(self):
         runner = mock.Mock()
         with (mock.patch.object(op.base, "inspect"),

@@ -62,6 +62,8 @@ enum Action {
     Status,
     Stage,
     Activate,
+    CountersBefore,
+    CountersAfter,
     Recover,
 }
 
@@ -72,6 +74,8 @@ impl Action {
             Some("status") => Self::Status,
             Some("stage") => Self::Stage,
             Some("activate") => Self::Activate,
+            Some("counters-before") => Self::CountersBefore,
+            Some("counters-after") => Self::CountersAfter,
             Some("recover") => Self::Recover,
             _ => return Err(Error::Refused("expected one fixed batch action")),
         };
@@ -119,6 +123,15 @@ struct ReferenceReturn {
     returned: attached_reference::Return,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CounterRecord {
+    binding: [u8; 32],
+    observed_us: u64,
+    rules: String,
+    labels: String,
+}
+
 fn sha(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
@@ -139,6 +152,13 @@ fn now_ms() -> Result<u64> {
     sec.checked_mul(1000)
         .and_then(|ms| ms.checked_add(nanos / 1_000_000))
         .ok_or(Error::Refused("invalid monotonic clock"))
+}
+
+fn epoch_us() -> Result<u64> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    u64::try_from(elapsed.as_micros()).map_err(|error| io::Error::other(error).into())
 }
 
 fn birth() -> Result<u64> {
@@ -517,6 +537,86 @@ impl Boundary<'_> {
         journal.close()
     }
 
+    fn counters(&self, filter: &ExactFilter, hook: Receipt, before: bool) -> Result<()> {
+        if self.storage.exists("release")?
+            || !self
+                .journal("enable")?
+                .is_single_closed_operation(Operation::AcquireReference)?
+        {
+            return Err(Error::Refused(
+                "requires the verified active trial reference",
+            ));
+        }
+        let owner = self.recorded_reference()?;
+        let read = || -> Result<Snapshot> {
+            let snap = attached_snapshot::read_with_status(
+                &self.anchor,
+                &self.session.boot,
+                |info, refs| {
+                    info.starts_with(b"Status: Enabled ")
+                        && attached_reference::singleton(refs, owner).is_ok()
+                },
+            )?;
+            self.match_root(&snap.root_rules, hook)?;
+            if snap.foreign != self.session.foreign
+                || !snap.enable_baseline_clear
+                || !matches!(&snap.leaf, Slot::Active(raw) if filter.matches_observed(raw))
+                || !self.same_hook(hook)?
+            {
+                return Err(Error::Refused(
+                    "enabled PF rules or foreign baseline changed",
+                ));
+            }
+            Ok(snap)
+        };
+        let first = read()?;
+        let at = epoch_us()?;
+        let (labels, _) = sync_observe::execute_program(
+            "/sbin/pfctl",
+            &["-a", &self.anchor, "-s", "labels"],
+            Instant::now() + Duration::from_secs(3),
+        )?;
+        if read()? != first {
+            return Err(Error::Refused("PF changed across counter read"));
+        }
+        self.recheck()?;
+        let Slot::Active(rules) = first.leaf else {
+            return Err(Error::Refused("exact flow rules unavailable"));
+        };
+        let binding = self.session.phase_hash("active-counters");
+        if !before {
+            let old: CounterRecord = decode(&self.storage.read("counters-before.json", 16384)?)?;
+            if old.binding != binding
+                || old.observed_us >= at
+                || old.rules.as_bytes() != rules
+                || filter
+                    .outbound_deltas(old.labels.as_bytes(), &labels)
+                    .is_none()
+            {
+                return Err(Error::Refused(
+                    "counter baseline missing, changed or regressed",
+                ));
+            }
+        } else if filter.outbound_deltas(&labels, &labels).is_none() {
+            return Err(Error::Refused("initial labels do not match the four rules"));
+        }
+        let record = CounterRecord {
+            binding,
+            observed_us: at,
+            rules: String::from_utf8(rules).map_err(io::Error::other)?,
+            labels: String::from_utf8(labels).map_err(io::Error::other)?,
+        };
+        let name = if before {
+            "counters-before.json"
+        } else {
+            "counters-after.json"
+        };
+        self.storage.write(
+            name,
+            &serde_json::to_vec(&record).map_err(io::Error::other)?,
+        )
+    }
+
     fn release(&self) -> Result<()> {
         if !self.storage.exists("enable")? {
             return Ok(());
@@ -794,6 +894,20 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
     {
         return Ok(session.report(&filter, "reference_held"));
     }
+    if matches!(action, Action::CountersBefore | Action::CountersAfter) {
+        let directory = storage.subdir("hook", false)?;
+        let (_hook_stage, hook) = trial.creation_record(&directory)?;
+        let before = matches!(action, Action::CountersBefore);
+        boundary.counters(&filter, hook, before)?;
+        return Ok(session.report(
+            &filter,
+            if before {
+                "counters_before_recorded"
+            } else {
+                "counters_after_recorded"
+            },
+        ));
+    }
     let initial = boundary.snapshot()?;
     let phase = match action {
         Action::Stage => {
@@ -890,7 +1004,9 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
                 }
             }
         }
-        Action::Prepare => return Err(Error::Refused("unexpected batch action")),
+        Action::Prepare | Action::CountersBefore | Action::CountersAfter => {
+            return Err(Error::Refused("unexpected batch action"));
+        }
     };
     Ok(session.report(&filter, phase))
 }

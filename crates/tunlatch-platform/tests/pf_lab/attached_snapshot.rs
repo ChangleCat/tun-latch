@@ -1,4 +1,4 @@
-//! Disabled-PF snapshot for an isolated root-call experiment. This is not atomic and
+//! PF snapshot for an isolated root-call experiment. This is not atomic and
 //! does not establish exclusivity, rule ownership, or protection. Admission is
 //! deliberately limited to empty root and foreign table views.
 use std::collections::BTreeSet;
@@ -149,8 +149,26 @@ fn remove_own_inventory(raw: &[u8], own: &str) -> Vec<u8> {
 pub(crate) fn collect<B, Q>(
     anchor: &str,
     expected_boot: &str,
+    boot: B,
+    query: Q,
+) -> io::Result<Snapshot>
+where
+    B: FnMut() -> io::Result<String>,
+    Q: FnMut(&[&str]) -> io::Result<Vec<u8>>,
+{
+    collect_with_status(anchor, expected_boot, boot, query, disabled)
+}
+
+fn disabled(info: &[u8], refs: &[u8]) -> bool {
+    info.starts_with(b"Status: Disabled ") && refs == b"No pf starter references held\n"
+}
+
+fn collect_with_status<B, Q>(
+    anchor: &str,
+    expected_boot: &str,
     mut boot: B,
     mut query: Q,
+    status_matches: impl Fn(&[u8], &[u8]) -> bool,
 ) -> io::Result<Snapshot>
 where
     B: FnMut() -> io::Result<String>,
@@ -177,13 +195,12 @@ where
         Ok(out)
     };
     let status = |info: &[u8], refs: &[u8]| {
-        info.starts_with(b"Status: Disabled ")
-            && info.ends_with(b"\n")
+        info.ends_with(b"\n")
             && info.is_ascii()
             && !info
                 .iter()
                 .any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\t'))
-            && refs == b"No pf starter references held\n"
+            && status_matches(info, refs)
     };
     let info_before = query(&["-s", "info"])?;
     if !status(&info_before, &query(&["-s", "References"])?) {
@@ -313,9 +330,17 @@ where
 
 /// Reads fixed PF views only; callers must separately establish exclusive coordination.
 pub(crate) fn read(anchor: &str, expected_boot: &str) -> io::Result<Snapshot> {
+    read_with_status(anchor, expected_boot, disabled)
+}
+
+pub(crate) fn read_with_status(
+    anchor: &str,
+    expected_boot: &str,
+    status_matches: impl Fn(&[u8], &[u8]) -> bool,
+) -> io::Result<Snapshot> {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut captured = 0_usize;
-    let result = collect(
+    let result = collect_with_status(
         anchor,
         expected_boot,
         || sync_observe::boot_until(deadline),
@@ -329,6 +354,7 @@ pub(crate) fn read(anchor: &str, expected_boot: &str) -> io::Result<Snapshot> {
             }
             Ok(out)
         },
+        status_matches,
     )?;
     if Instant::now() >= deadline {
         return Err(refused("observation deadline exceeded"));
@@ -521,6 +547,42 @@ mod tests {
                     "{failure}"
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_snapshot_checks_reference_before_and_after() -> io::Result<()> {
+        for drift in [false, true] {
+            let mut references = 0;
+            let result = collect_with_status(
+                OWN,
+                BOOT,
+                || Ok(BOOT.into()),
+                |args| {
+                    Ok(match args {
+                        ["-s", "info"] => DISABLED.replace("Disabled", "Enabled").into_bytes(),
+                        ["-s", "References"] => {
+                            references += 1;
+                            if drift && references > 1 {
+                                b"other\n".to_vec()
+                            } else {
+                                b"owned\n".to_vec()
+                            }
+                        }
+                        ["-v", "-s", "Interfaces"] => INTERFACES.to_vec(),
+                        [
+                            "-s",
+                            "states" | "Sources" | "rules" | "nat" | "Tables" | "Anchors",
+                        ]
+                        | ["-v", "-s", "Anchors"] => Vec::new(),
+                        _ => return Err(refused("unexpected fixture query")),
+                    })
+                },
+                |info, refs| info.starts_with(b"Status: Enabled ") && refs == b"owned\n",
+            );
+            assert_eq!(references, 2);
+            assert_eq!(result.is_err(), drift);
         }
         Ok(())
     }

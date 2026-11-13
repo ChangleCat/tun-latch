@@ -46,7 +46,11 @@ fn record_name(name: &str, layout: Layout) -> Result<()> {
         || (layout == Layout::Flow
             && matches!(
                 name,
-                "flow-plan.json" | "enable-return.json" | "release-return.json"
+                "flow-plan.json"
+                    | "enable-return.json"
+                    | "release-return.json"
+                    | "counters-before.json"
+                    | "counters-after.json"
             ))
     {
         Ok(())
