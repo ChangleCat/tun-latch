@@ -182,6 +182,13 @@ class FirstFlowOperator(unittest.TestCase):
             mock.call(before, "status"), mock.call(after, "status"),
             mock.call(after, "recover", b"RECOVER-PF-FIRST-FLOW\n")])
 
+    def test_recovery_confirmation_allows_a_typo_to_be_corrected(self):
+        with mock.patch("builtins.input", side_effect=["W", "RECOVER-PF-FIRST-FLOW"]) as confirm:
+            self.assertEqual(op.terminal_recovery_confirm("确认恢复"), "RECOVER-PF-FIRST-FLOW")
+        self.assertEqual(confirm.call_count, 2)
+        with mock.patch("builtins.input", side_effect=EOFError), self.assertRaises(EOFError):
+            op.terminal_recovery_confirm("确认恢复")
+
     def test_attended_run_orders_phases_and_recovery(self):
         runner = mock.Mock()
         capture = mock.Mock()
@@ -265,7 +272,7 @@ class FirstFlowOperator(unittest.TestCase):
               mock.patch.object(op.sys, "stdout", output)):
             op.attended_run(mock.Mock(), DIGEST, PLAN, BATCH, "boot",
                             confirm=mock.Mock(side_effect=AssertionError("unexpected peer prompt")),
-                            peer_session=receiver)
+                            peer_session=receiver, confirm_recovery=lambda _: "RECOVER-PF-FIRST-FLOW")
         expected = []
         for phase, next_actions in (("before", ["stage", "activate"]),
                                     ("blocked", ["recover"]), ("after", [])):

@@ -245,8 +245,16 @@ class Capture:
         return bytes(self.buffers["out"])
 
 
+def terminal_recovery_confirm(prompt):
+    ack = CONFIRMATIONS["recover"][0]
+    while True:
+        if input(prompt) == ack:
+            return ack
+        print("确认词不匹配。请重输；如果无法确认，请按 Ctrl-D 退出并保留现场。", flush=True)
+
+
 def attended_run(runner, expected, digest, data, boot, *, confirm=input, windows_fd=None,
-                 fresh_runner=None, peer_session=None, confirm_recovery=input):
+                 fresh_runner=None, peer_session=None, confirm_recovery=terminal_recovery_confirm):
     frozen = json.loads(data, object_pairs_hook=base.unique_fields)
     document = frozen["phases"]
     phase_bytes = json.dumps(document, separators=(",", ":")).encode()
@@ -428,7 +436,8 @@ def main(*, peer_session=None, before_run=None, after_run=None):
         if after_run is not None:
             after_run(output_path)
         return
-    result = execute(stage.Runner(), args.action, expected, digest, data=data, boot=boot,
+    confirm = terminal_recovery_confirm if args.action == "recover" else input
+    result = execute(stage.Runner(), args.action, expected, digest, data=data, boot=boot, confirm=confirm,
                      fresh_runner=stage.Runner)
     sys.stdout.buffer.write(result)
     sys.stdout.buffer.flush()
