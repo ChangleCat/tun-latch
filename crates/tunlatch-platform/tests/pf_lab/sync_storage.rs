@@ -51,6 +51,9 @@ fn record_name(name: &str, layout: Layout) -> Result<()> {
                     | "release-return.json"
                     | "counters-before.json"
                     | "counters-after.json"
+                    | "capture.json"
+                    | "capture-ready.json"
+                    | "capture.pcap"
             ))
     {
         Ok(())
@@ -268,6 +271,26 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn create_capture(&self) -> Result<File> {
+        if self.layout != Layout::Flow {
+            return Err(Error::Refused("capture requires the physical flow layout"));
+        }
+        self.recheck()?;
+        let dir = self.chain.directory()?;
+        let file = open_file(
+            dir,
+            "capture.pcap",
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+            0o600,
+        )?;
+        fchmod(&file, Mode::from_bits_truncate(0o600))?;
+        checked(&file, 0o600, false)?;
+        dir.sync_all()?;
+        self.recheck()?;
+        Ok(file)
+    }
+
     pub(crate) fn subdir(&self, name: &str, create: bool) -> Result<File> {
         if !self.subdirectory_name(name) {
             return Err(Error::Refused("unsupported subdirectory"));
@@ -301,6 +324,9 @@ impl Storage {
         matches!(name, "stage" | "recovery")
             || self.is_fault() && name == "fault-ready"
             || self.layout == Layout::Flow
-                && matches!(name, "hook" | "flow-lock" | "enable" | "release")
+                && matches!(
+                    name,
+                    "hook" | "flow-lock" | "enable" | "release" | "capture-lock"
+                )
     }
 }

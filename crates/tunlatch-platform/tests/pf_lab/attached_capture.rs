@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const TCPDUMP: &str = "/usr/sbin/tcpdump";
 const MAX_PCAP: u64 = 1024 * 1024;
 const MAX_ERR: usize = 16 * 1024;
-const MAX_RUN: Duration = Duration::from_secs(120);
+const MAX_RUN: Duration = Duration::from_secs(300);
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 fn error(s: &'static str) -> io::Error {
@@ -285,6 +285,14 @@ fn worker(
     }
 }
 impl Capture {
+    pub(crate) fn wait_result(&self, timeout: Duration) -> io::Result<Option<CaptureEvidence>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => result.map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(error("capture result unavailable")),
+        }
+    }
+
     /// The file must be a new, empty, root-owned 0600 regular file already opened for read/write.
     /// Its parent and exclusive ownership remain the privileged caller's responsibility.
     pub(crate) fn start(plan: CapturePlan, mut file: File) -> io::Result<Self> {
@@ -313,6 +321,7 @@ impl Capture {
                 "-i",
                 &plan.interface,
                 "-n",
+                "-p",
                 "--micro",
                 "-U",
                 "-s",
@@ -352,12 +361,9 @@ impl Capture {
         }
     }
     pub(crate) fn finish(self) -> io::Result<CaptureEvidence> {
-        self.stop
-            .send(())
-            .map_err(|_| error("capture already stopped"))?;
-        self.result
-            .recv_timeout(STOP_TIMEOUT + Duration::from_secs(1))
-            .map_err(|_| error("capture reaping unconfirmed"))?
+        let _ = self.stop.send(());
+        self.wait_result(STOP_TIMEOUT + Duration::from_secs(1))?
+            .ok_or_else(|| error("capture reaping unconfirmed"))
     }
 }
 impl Drop for Capture {

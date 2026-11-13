@@ -1,6 +1,8 @@
 import hashlib
+import io
 import importlib.util
 import json
+import os
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -12,6 +14,7 @@ spec.loader.exec_module(op)
 DIGEST = "a" * 64
 PLAN = "b" * 64
 ANCHOR = "tunlatch-lab-" + "1" * 32
+BATCH = b'{"interface":"en0","phases":{}}'
 
 
 def status(phase="prepared", **changes):
@@ -122,6 +125,116 @@ class FirstFlowOperator(unittest.TestCase):
               mock.patch.object(op, "invoke") as invoke, self.assertRaises(op.Refused)):
             op.execute(runner, "prepare", DIGEST, hashlib.sha256(data).hexdigest(), data=data, boot="boot")
         invoke.assert_not_called()
+
+    def test_attended_run_orders_phases_and_recovery(self):
+        runner = mock.Mock()
+        capture = mock.Mock()
+        capture.child.poll.return_value = None
+        capture.finish.return_value = status("capture_recorded")
+        states = iter(["prepared", "prepared", "reference_held", "reference_held",
+                       "restored", "restored"])
+        actions = []
+
+        def execute(_runner, action, *_args, **_kwargs):
+            actions.append(action)
+            return status(next(states) if action == "status" else "prepared")
+
+        output = mock.Mock()
+        output.buffer = io.BytesIO()
+        def send_result(phase, _role):
+            print(json.dumps({"role": "sender", "phase": phase}))
+            return 1 if phase == "blocked" else 0
+        with (mock.patch.object(op, "execute", side_effect=execute),
+              mock.patch.object(op, "Capture", return_value=capture),
+              mock.patch.object(op.flow, "preflight", return_value={"boot": "boot"}) as preflight,
+              mock.patch.object(op.flow.peer, "select_phase", side_effect=lambda _doc, phase: phase),
+              mock.patch.object(op.flow.peer, "run", side_effect=send_result) as send,
+              mock.patch.object(op.sys, "stdout", output)):
+            op.attended_run(runner, DIGEST, PLAN, BATCH, "boot",
+                            confirm=lambda prompt: prompt.split("请输入 ")[1].split("：")[0])
+        self.assertEqual([call.args[0] for call in send.call_args_list], ["before", "blocked", "after"])
+        self.assertEqual(preflight.call_count, 3)
+        self.assertEqual([action for action in actions if action != "status"],
+                         ["prepare", "stage", "activate", "counters-before", "counters-after", "recover"])
+        capture.finish.assert_called_once()
+
+    def test_capture_uses_fixed_command_and_two_checked_reports(self):
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        child = mock.Mock()
+        child.stdin = io.BytesIO()
+        child.stdout = os.fdopen(out_read, "rb", buffering=0)
+        child.stderr = os.fdopen(err_read, "rb", buffering=0)
+        child.wait.return_value = 0
+        try:
+            os.write(out_write, status("capture_ready"))
+            with (mock.patch.object(op.base, "inspect"),
+                  mock.patch.object(op.subprocess, "Popen", return_value=child) as popen):
+                capture = op.Capture(mock.Mock(), DIGEST, PLAN, ANCHOR)
+                capture.ready()
+                os.write(out_write, status("capture_recorded"))
+                os.close(out_write)
+                out_write = None
+                os.close(err_write)
+                err_write = None
+                self.assertEqual(op.report(capture.finish())["phase"], "capture_recorded")
+            self.assertEqual(popen.call_args.args[0], op.stage.ROOT + [op.HELPER, "capture"])
+            self.assertTrue(child.stdin.closed)
+        finally:
+            child.stdout.close()
+            child.stderr.close()
+            if out_write is not None:
+                os.close(out_write)
+            if err_write is not None:
+                os.close(err_write)
+
+    def test_uncertain_writer_does_not_trigger_recovery(self):
+        capture = mock.Mock()
+        capture.child.poll.return_value = None
+        capture.finish.return_value = status("capture_recorded")
+        actions = []
+
+        def execute(_runner, action, *_args, **_kwargs):
+            actions.append(action)
+            if action == "stage":
+                raise op.Refused("unknown writer")
+            return status()
+
+        with (mock.patch.object(op, "execute", side_effect=execute),
+              mock.patch.object(op, "Capture", return_value=capture),
+              mock.patch.object(op.flow, "preflight", return_value={"boot": "boot"}),
+              mock.patch.object(op.flow.peer, "select_phase", return_value=[]),
+              mock.patch.object(op.flow.peer, "run", return_value=0),
+              self.assertRaises(op.Refused)):
+            op.attended_run(mock.Mock(), DIGEST, PLAN, BATCH, "boot",
+                            confirm=lambda prompt: prompt.split("请输入 ")[1].split("：")[0])
+        self.assertNotIn("recover", actions)
+
+    def test_peer_prompt_interrupt_recovers_before_stopping_capture(self):
+        capture = mock.Mock()
+        capture.child.poll.return_value = None
+        capture.finish.return_value = status("capture_recorded")
+        actions = []
+        states = iter(["prepared", "prepared", "reference_held"])
+
+        def execute(_runner, action, *_args, **_kwargs):
+            actions.append(action)
+            return status(next(states) if action == "status" else "prepared")
+
+        def confirm(prompt):
+            if "PEER-READY-BLOCKED" in prompt:
+                raise EOFError
+            return prompt.split("请输入 ")[1].split("：")[0]
+
+        capture.finish.side_effect = lambda: (actions.append("finish"), status("capture_recorded"))[1]
+        with (mock.patch.object(op, "execute", side_effect=execute),
+              mock.patch.object(op, "Capture", return_value=capture),
+              mock.patch.object(op.flow, "preflight", return_value={"boot": "boot"}),
+              mock.patch.object(op.flow.peer, "select_phase", return_value=[]),
+              mock.patch.object(op.flow.peer, "run", return_value=0),
+              self.assertRaises(EOFError)):
+            op.attended_run(mock.Mock(), DIGEST, PLAN, BATCH, "boot", confirm=confirm)
+        self.assertLess(actions.index("recover"), actions.index("finish"))
 
 
 if __name__ == "__main__":

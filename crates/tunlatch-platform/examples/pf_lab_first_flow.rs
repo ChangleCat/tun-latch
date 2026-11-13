@@ -1,5 +1,7 @@
-//! Protected controller for the disabled-PF setup and cleanup of the first physical flow batch.
+//! Protected controller for the first physical flow batch.
 #![allow(dead_code)]
+#[path = "../tests/pf_lab/attached_capture.rs"]
+mod attached_capture;
 #[path = "../tests/pf_lab/attached_reference.rs"]
 mod attached_reference;
 #[path = "../tests/pf_lab/attached_snapshot.rs"]
@@ -43,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt;
 use std::process::ExitCode;
@@ -64,6 +66,8 @@ enum Action {
     Activate,
     CountersBefore,
     CountersAfter,
+    Capture,
+    Evidence,
     Recover,
 }
 
@@ -76,6 +80,8 @@ impl Action {
             Some("activate") => Self::Activate,
             Some("counters-before") => Self::CountersBefore,
             Some("counters-after") => Self::CountersAfter,
+            Some("capture") => Self::Capture,
+            Some("evidence") => Self::Evidence,
             Some("recover") => Self::Recover,
             _ => return Err(Error::Refused("expected one fixed batch action")),
         };
@@ -130,6 +136,16 @@ struct CounterRecord {
     observed_us: u64,
     rules: String,
     labels: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureRecord {
+    binding: [u8; 32],
+    started_us: u64,
+    ended_us: u64,
+    dropped: u64,
+    sha256: String,
 }
 
 fn sha(data: &[u8]) -> [u8; 32] {
@@ -489,6 +505,7 @@ impl Boundary<'_> {
 
     fn activate(&self, filter: &ExactFilter, hook: Receipt) -> Result<()> {
         self.attended()?;
+        self.check_capture_ready()?;
         if self.storage.exists("enable")? || self.storage.exists("release")? {
             return Err(Error::Refused("enable already attempted"));
         }
@@ -520,6 +537,7 @@ impl Boundary<'_> {
                     ));
                 }
                 stage.check_named_objects().map_err(io::Error::other)?;
+                self.check_capture_ready().map_err(io::Error::other)?;
                 self.attended().map_err(io::Error::other)?;
                 journal
                     .begin(Operation::AcquireReference)
@@ -537,7 +555,23 @@ impl Boundary<'_> {
         journal.close()
     }
 
+    fn check_capture_ready(&self) -> Result<()> {
+        let binding: [u8; 32] = decode(&self.storage.read("capture-ready.json", 256)?)?;
+        if binding != self.session.phase_hash("capture") || self.storage.exists("capture.json")? {
+            return Err(Error::Refused(
+                "capture is missing, closed or from another batch",
+            ));
+        }
+        let lock = self.storage.subdir("capture-lock", false)?;
+        match Flock::lock(lock, FlockArg::LockExclusiveNonblock) {
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(()),
+            Ok(_) => Err(Error::Refused("capture controller has exited")),
+            Err((_, error)) => Err(error.into()),
+        }
+    }
+
     fn counters(&self, filter: &ExactFilter, hook: Receipt, before: bool) -> Result<()> {
+        self.check_capture_ready()?;
         if self.storage.exists("release")?
             || !self
                 .journal("enable")?
@@ -730,6 +764,7 @@ impl root_hook_recovery::Boundary for Boundary<'_> {
 
     fn insert(&mut self, anchor: &str) -> Result<NonZeroU64> {
         self.attended()?;
+        self.check_capture_ready()?;
         self.recheck()?;
         if anchor != self.anchor {
             return Err(Error::Refused("unexpected hook scope"));
@@ -829,7 +864,135 @@ fn prepare(storage: &Storage, raw: &[u8], boot: String, helper: [u8; 32]) -> Res
     Ok(session.report(&filter, "prepared"))
 }
 
-fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Value> {
+fn wait_for_capture_stop(
+    input: &mut (impl Read + std::os::fd::AsFd),
+    capture_running: impl Fn() -> Result<()>,
+) -> Result<()> {
+    use nix::poll::{PollFd, PollFlags, poll};
+
+    let mut descriptors = [PollFd::new(input.as_fd(), PollFlags::POLLIN)];
+    let deadline = Instant::now() + Duration::from_secs(290);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(Error::Refused("capture stop deadline expired"));
+        }
+        capture_running()?;
+        let event = match poll(&mut descriptors, 100_u16) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+            Ok(_) => descriptors[0].revents().unwrap_or_else(PollFlags::empty),
+            Err(error) => return Err(error.into()),
+        };
+        if !event.intersects(PollFlags::POLLHUP | PollFlags::POLLIN)
+            || event.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL)
+        {
+            return Err(Error::Refused("capture control pipe failed"));
+        }
+        // Darwin can report POLLIN together with POLLHUP for an empty closed pipe.
+        if input.read(&mut [0])? == 0 {
+            return Ok(());
+        }
+        return Err(Error::Refused("capture expects a closed control pipe"));
+    }
+}
+
+fn capture(
+    storage: &Storage,
+    session: &Session,
+    filter: &ExactFilter,
+    raw: &[u8],
+    input: &mut (impl Read + std::os::fd::AsFd),
+    ready: impl FnOnce(Value) -> Result<()>,
+) -> Result<Value> {
+    let PlanInput { interface, phases } = decode(raw)?;
+    let cases = phases
+        .checked(&interface)
+        .map_err(|error| Error::Refused(error.0))?;
+    let plan = attached_capture::CapturePlan::new(&interface, cases.map(|case| case.plan))?;
+    let capture_lock = storage.subdir("capture-lock", true)?;
+    let _held = Flock::lock(capture_lock, FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, error)| Error::System(error))?;
+    let file = storage.create_capture()?;
+    let collector = attached_capture::Capture::start(plan, file.try_clone()?)?;
+    let stop = storage
+        .write(
+            "capture-ready.json",
+            &serde_json::to_vec(&session.phase_hash("capture")).map_err(io::Error::other)?,
+        )
+        .and_then(|()| ready(session.report(filter, "capture_ready")))
+        .and_then(|()| {
+            wait_for_capture_stop(input, || {
+                if collector.wait_result(Duration::ZERO)?.is_some() {
+                    return Err(Error::Refused(
+                        "collector stopped before capture control closed",
+                    ));
+                }
+                Ok(())
+            })
+        });
+    let evidence = collector.finish();
+    stop?;
+    let evidence = evidence?;
+    file.sync_all()?;
+    if storage.read("capture.pcap", 1024 * 1024)? != evidence.pcap {
+        return Err(Error::Refused("capture changed before persistence"));
+    }
+    let record = CaptureRecord {
+        binding: session.phase_hash("capture"),
+        started_us: evidence.start_us,
+        ended_us: evidence.end_us,
+        dropped: evidence.dropped,
+        sha256: hex(&sha(&evidence.pcap)),
+    };
+    storage.write(
+        "capture.json",
+        &serde_json::to_vec(&record).map_err(io::Error::other)?,
+    )?;
+    Ok(session.report(filter, "capture_recorded"))
+}
+
+fn evidence(
+    storage: &Storage,
+    session: &Session,
+    filter: &ExactFilter,
+    raw: &[u8],
+) -> Result<Value> {
+    let capture: CaptureRecord = decode(&storage.read("capture.json", 4096)?)?;
+    let pcap = storage.read("capture.pcap", 1024 * 1024)?;
+    let before: CounterRecord = decode(&storage.read("counters-before.json", 16384)?)?;
+    let after: CounterRecord = decode(&storage.read("counters-after.json", 16384)?)?;
+    let binding = session.phase_hash("active-counters");
+    if capture.binding != session.phase_hash("capture")
+        || capture.sha256 != hex(&sha(&pcap))
+        || !(capture.started_us <= before.observed_us
+            && before.observed_us < after.observed_us
+            && after.observed_us <= capture.ended_us)
+        || before.binding != binding
+        || after.binding != binding
+        || !filter.matches_observed(before.rules.as_bytes())
+        || before.rules != after.rules
+        || filter
+            .outbound_deltas(before.labels.as_bytes(), after.labels.as_bytes())
+            .is_none()
+    {
+        return Err(Error::Refused(
+            "capture or counter evidence does not match the batch",
+        ));
+    }
+    let plan: Value = decode(raw)?;
+    let mut output = session.report(filter, "evidence_recorded");
+    output["plan"] = plan;
+    output["capture"] = json!(capture);
+    output["pcap_hex"] = json!(hex(&pcap));
+    output["counters_before"] = json!(before);
+    output["counters_after"] = json!(after);
+    Ok(output)
+}
+
+fn run_action(
+    storage: &Storage,
+    action: Action,
+    mut input: impl Read + std::os::fd::AsFd,
+) -> Result<Value> {
     let (boot, helper) = operator(storage)?;
     if matches!(action, Action::Prepare) {
         return prepare(storage, &read_input(input, PLAN_LIMIT)?, boot, helper);
@@ -843,7 +1006,7 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
     let attended_until_ms = if confirm.is_empty() {
         None
     } else {
-        if read_input(input, confirm.len())? != confirm {
+        if read_input(&mut input, confirm.len())? != confirm {
             return Err(Error::Refused("missing attended batch confirmation"));
         }
         Some(
@@ -864,6 +1027,26 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
     }
     let suffix = session.suffix();
     let filter = plan(&raw, &suffix)?;
+    if matches!(action, Action::Capture) {
+        if storage.exists("hook")? || storage.exists("enable")? || storage.exists("capture-lock")? {
+            return Err(Error::Refused("capture must start before PF changes"));
+        }
+        let first = Host::open()?.read(&filter.anchor(), &session.boot)?;
+        if first.root_rules != session.root
+            || first.foreign != session.foreign
+            || first.leaf != Slot::Absent
+            || !first.enable_baseline_clear
+        {
+            return Err(Error::Refused("capture baseline changed"));
+        }
+        return capture(storage, &session, &filter, &raw, &mut input, |report| {
+            drop(held);
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{report}")?;
+            stdout.flush()?;
+            Ok(())
+        });
+    }
     let host = Host::open()?;
     let mut boundary = Boundary {
         storage,
@@ -909,8 +1092,22 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
         ));
     }
     let initial = boundary.snapshot()?;
+    if matches!(action, Action::Evidence) {
+        let directory = storage.subdir("hook", false)?;
+        if initial.root_rules != session.root
+            || !matches!(initial.leaf, Slot::Absent | Slot::Empty)
+            || !initial.states_and_sources_empty
+            || !trial.removal_verified(&directory)?
+        {
+            return Err(Error::Refused(
+                "verified recovery required before evidence export",
+            ));
+        }
+        return evidence(storage, &session, &filter, &raw);
+    }
     let phase = match action {
         Action::Stage => {
+            boundary.check_capture_ready()?;
             if now_ms()?
                 .checked_sub(session.prepared_ms)
                 .is_none_or(|age| age >= 300_000)
@@ -1004,7 +1201,11 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
                 }
             }
         }
-        Action::Prepare | Action::CountersBefore | Action::CountersAfter => {
+        Action::Prepare
+        | Action::CountersBefore
+        | Action::CountersAfter
+        | Action::Capture
+        | Action::Evidence => {
             return Err(Error::Refused("unexpected batch action"));
         }
     };
@@ -1032,5 +1233,25 @@ fn main() -> ExitCode {
             println!("{}", json!({"result":"refused","reason":reason}));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_capture_stop;
+    use std::io::Write;
+
+    #[test]
+    fn capture_control_pipe_accepts_only_end_of_stream() -> std::io::Result<()> {
+        let (read, write) = nix::unistd::pipe()?;
+        drop(write);
+        assert!(wait_for_capture_stop(&mut std::fs::File::from(read), || Ok(())).is_ok());
+        let (read, write) = nix::unistd::pipe()?;
+        std::fs::File::from(write).write_all(b"stop")?;
+        assert!(wait_for_capture_stop(&mut std::fs::File::from(read), || Ok(())).is_err());
+        let (read, _write) = nix::unistd::pipe()?;
+        let ended = || Err(super::Error::Refused("collector ended"));
+        assert!(wait_for_capture_stop(&mut std::fs::File::from(read), ended).is_err());
+        Ok(())
     }
 }

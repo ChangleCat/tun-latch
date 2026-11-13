@@ -18,7 +18,9 @@ cargo run -p tunlatch-platform --locked --example pf_lab_capture_eval -- manifes
 
 `potential_leak` 表示捕获到待阻断流的五元组，包含无应用载荷的 TCP SYN。只有每项都有前后正向对照、完整的无丢包采集、发送证据及对应规则的出站计数增长，才得到 `no_observed_leak`。输出范围为 `offline_unverified_input`，取决于提供的采集和记录来源。
 
-`pf-lab-first-flow.py plan` 可查看首批受保护操作入口是否已开放。当前候选 helper 已接入挂接、规则暂存、单次启用引用和独立恢复，仍需连接采集与三阶段探针。构建审阅摘要及具体批准计划缺失时，脚本拒绝全部管理员动作。
+`pf-lab-first-flow.py plan` 可查看首批受保护入口的准备状态。一次 `run` 在本机终端串起限域抓包、三阶段发送、挂接、单次启用、计数和恢复。对端按同一冻结计划逐阶段启动便携接收器。操作脚本仅在构建和计划获批后允许管理员动作，完整实机步骤保存在本地实验文档。
+
+`pf-lab-first-flow-evidence.py` 在恢复读回通过后导出抓包和规则计数。它使用本机阶段记录以及对端三个最终 JSON 回报生成离线清单。TCP 报告中的 `connect_attempted` 记录实际调用，离线判定还要求对应五元组的规则命中和完整前后对照。
 
 ## 单次管理员身份只读采集
 
