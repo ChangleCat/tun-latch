@@ -161,6 +161,53 @@ class FirstFlowOperator(unittest.TestCase):
                          ["prepare", "stage", "activate", "counters-before", "counters-after", "recover"])
         capture.finish.assert_called_once()
 
+    def test_managed_receiver_finishes_each_phase_without_peer_prompts(self):
+        import contextlib
+
+        capture = mock.Mock()
+        capture.child.poll.return_value = None
+        capture.finish.return_value = status("capture_recorded")
+        states = iter(["prepared", "prepared", "reference_held", "reference_held",
+                       "restored", "restored"])
+        events = []
+
+        def execute(_runner, action, *_args, **kwargs):
+            if action in ("stage", "activate", "recover"):
+                events.append(action)
+                kwargs["writer_started"]()
+            return status(next(states) if action == "status" else "prepared")
+
+        @contextlib.contextmanager
+        def receiver(phase, cases):
+            events.append(("ready", phase, cases))
+            try:
+                yield lambda: events.append(("finished", phase))
+            finally:
+                events.append(("closed", phase))
+
+        def send_result(phase, _role):
+            events.append(("send", phase))
+            print(json.dumps({"role": "sender"}))
+            return 0
+
+        output = mock.Mock()
+        output.buffer = io.BytesIO()
+        with (mock.patch.object(op, "execute", side_effect=execute),
+              mock.patch.object(op, "Capture", return_value=capture),
+              mock.patch.object(op.flow, "preflight", return_value={"boot": "boot"}),
+              mock.patch.object(op.flow.peer, "select_phase", side_effect=lambda _doc, phase: phase),
+              mock.patch.object(op.flow.peer, "run", side_effect=send_result),
+              mock.patch.object(op.sys, "stdout", output)):
+            op.attended_run(mock.Mock(), DIGEST, PLAN, BATCH, "boot",
+                            confirm=mock.Mock(side_effect=AssertionError("unexpected peer prompt")),
+                            peer_session=receiver)
+        expected = []
+        for phase, next_actions in (("before", ["stage", "activate"]),
+                                    ("blocked", ["recover"]), ("after", [])):
+            expected.extend([("ready", phase, phase), ("send", phase),
+                             ("finished", phase), ("closed", phase), *next_actions])
+        self.assertEqual(events, expected)
+
     def test_capture_uses_fixed_command_and_two_checked_reports(self):
         out_read, out_write = os.pipe()
         err_read, err_write = os.pipe()

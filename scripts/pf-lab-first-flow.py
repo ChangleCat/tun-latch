@@ -225,7 +225,7 @@ def terminal_confirm(prompt):
 
 
 def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confirm, windows_fd=None,
-                 fresh_runner=None):
+                 fresh_runner=None, peer_session=None):
     frozen = json.loads(data, object_pairs_hook=base.unique_fields)
     document = frozen["phases"]
     phase_bytes = json.dumps(document, separators=(",", ":")).encode()
@@ -248,24 +248,39 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
         capture.ready()
         uncertain = False
 
+        @contextlib.contextmanager
+        def manual_peer(phase, cases):
+            print(f"请在对端启动 {phase} 接收批次，确认四个接收器均已就绪。", flush=True)
+            if confirm(f"请输入 PEER-READY-{phase.upper()}：") != f"PEER-READY-{phase.upper()}":
+                raise Refused("未确认对端就绪")
+
+            def finish():
+                print(f"请确认对端 {phase} 接收批次已经结束并保留其结果。", flush=True)
+                if confirm(f"请输入 PEER-FINISHED-{phase.upper()}：") != f"PEER-FINISHED-{phase.upper()}":
+                    raise Refused("未确认对端批次结束")
+
+            yield finish
+
         def send(phase, required):
-            nonlocal uncertain
             current = report(action("status"))
             if current["anchor"] != prepared["anchor"] or current["phase"] != required:
                 raise Refused("发送前实验状态变化；保留现场")
             if flow.preflight(phase_bytes, frozen["interface"], flow.system.Runner())["boot"] != boot:
                 raise Refused("发送前本机启动标识变化")
-            print(f"请在对端启动 {phase} 接收批次，确认四个接收器均已就绪。", flush=True)
-            if confirm(f"请输入 PEER-READY-{phase.upper()}：") != f"PEER-READY-{phase.upper()}":
-                raise Refused("未确认对端就绪")
+            cases = flow.peer.select_phase(document, phase)
+            with (peer_session or manual_peer)(phase, cases) as finish:
+                exchange(phase, current, cases, finish)
+
+        def exchange(phase, current, cases, finish):
+            nonlocal uncertain
             if report(action("status")) != current or capture.child.poll() is not None:
-                raise Refused("确认期间状态或采集进程变化；保留现场")
+                raise Refused("对端就绪后状态或采集进程变化；保留现场")
             # Any exceptional batch exit might leave a child unaccounted for.
             uncertain = True
             started = time.time_ns() // 1000
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                result = flow.peer.run(flow.peer.select_phase(document, phase), "sender")
+                result = flow.peer.run(cases, "sender")
             uncertain = False
             raw = output.getvalue()
             if len(raw.encode()) > LIMIT:
@@ -279,9 +294,7 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
                 evidence["sender_report"] = sender_report
                 if windows_fd is not None:
                     stage.write_output(windows_fd, evidence)
-            print(f"请确认对端 {phase} 接收批次已经结束并保留其结果。", flush=True)
-            if confirm(f"请输入 PEER-FINISHED-{phase.upper()}：") != f"PEER-FINISHED-{phase.upper()}":
-                raise Refused("未确认对端批次结束")
+            finish()
             ended = time.time_ns() // 1000
             if ended <= started:
                 raise Refused("系统时间回退；阶段时间不可信")
@@ -329,7 +342,7 @@ def attended_run(runner, expected, digest, data, boot, *, confirm=terminal_confi
             print("进程或写入结果未知；保留现场，确认所有写入者已结束后人工检查恢复。", file=sys.stderr)
 
 
-def main():
+def main(*, peer_session=None, before_run=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", default="plan",
                         choices=("plan", "run", "prepare", "status", *CONFIRMATIONS, *COUNTER_ACTIONS))
@@ -375,11 +388,14 @@ def main():
         raise Refused("写入及恢复必须在本机终端人工确认")
     if args.action == "run":
         runner = stage.Runner()
+        if before_run is not None:
+            before_run(runner, expected, digest)
         fd, output_path = stage.open_output(runner)
         print("阶段时间文件：" + output_path, file=sys.stderr, flush=True)
         try:
             stage.write_output(fd, {"windows": {}})
-            attended_run(runner, expected, digest, data, boot, windows_fd=fd, fresh_runner=stage.Runner)
+            attended_run(runner, expected, digest, data, boot, windows_fd=fd, fresh_runner=stage.Runner,
+                         peer_session=peer_session)
         finally:
             os.close(fd)
         return
