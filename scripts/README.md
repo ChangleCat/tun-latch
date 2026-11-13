@@ -18,6 +18,8 @@ cargo run -p tunlatch-platform --locked --example pf_lab_capture_eval -- manifes
 
 `potential_leak` 表示捕获到待阻断流的五元组，包含无应用载荷的 TCP SYN。只有每项都有前后正向对照、完整的无丢包采集、发送证据及对应规则的出站计数增长，才得到 `no_observed_leak`。输出范围为 `offline_unverified_input`，取决于提供的采集和记录来源。
 
+`pf-lab-first-flow.py plan` 可查看首批受保护操作入口是否已开放。当前候选 helper 已接入挂接、规则暂存、单次启用引用和独立恢复，仍需连接采集与三阶段探针。构建审阅摘要及具体批准计划缺失时，脚本拒绝全部管理员动作。
+
 ## 单次管理员身份只读采集
 
 `identity-readonly.py` 用于当前机器上一项受审查的开发诊断：读取一个明确选择的进程的 PID、UID、出生时间、FD 类型及 kernel-control 注册信息。它不会更改 PF、网络、代理或启动项，也不会读取进程命令行、环境、配置、连接端点或输出内核 opaque 值。结果仍是原始采样，不能据此授信 TUN 或宣称已保护。

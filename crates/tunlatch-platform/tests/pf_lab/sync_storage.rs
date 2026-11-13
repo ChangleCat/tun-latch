@@ -43,7 +43,11 @@ fn record_name(name: &str, layout: Layout) -> Result<()> {
             name,
             "fault-launch.json" | "fault-before-signal.json" | "fault-reaped.json"
         ))
-        || (layout == Layout::Flow && name == "flow-plan.json")
+        || (layout == Layout::Flow
+            && matches!(
+                name,
+                "flow-plan.json" | "enable-return.json" | "release-return.json"
+            ))
     {
         Ok(())
     } else {
@@ -292,6 +296,7 @@ impl Storage {
     fn subdirectory_name(&self, name: &str) -> bool {
         matches!(name, "stage" | "recovery")
             || self.is_fault() && name == "fault-ready"
-            || self.layout == Layout::Flow && matches!(name, "hook" | "flow-lock")
+            || self.layout == Layout::Flow
+                && matches!(name, "hook" | "flow-lock" | "enable" | "release")
     }
 }

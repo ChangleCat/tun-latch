@@ -16,7 +16,8 @@ fn refused(message: &'static str) -> io::Error {
 }
 
 /// Complete child return; the caller must durably persist these exact bytes and PID.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Return {
     pub(crate) pid: u32,
     pub(crate) stdout: Vec<u8>,
@@ -33,7 +34,7 @@ impl Owned {
     /// Only after authenticating a durable return for this current-boot experiment. This parser
     /// alone does not prove that the process or reference still belongs to the caller.
     pub(crate) fn from_return(value: &Return) -> io::Result<Self> {
-        if value.pid == 0 {
+        if value.pid == 0 || value.stdout.len().saturating_add(value.stderr.len()) > LIMIT {
             return Err(refused("missing creator PID"));
         }
         let mut stderr = value.stderr.as_slice();
@@ -56,6 +57,10 @@ impl Owned {
     pub(crate) fn token(self) -> u64 {
         self.token.value()
     }
+}
+
+pub(crate) fn read_owned(owner: Owned) -> io::Result<()> {
+    singleton(&query(&mut run)?, owner)
 }
 
 /// Strict singleton output based on the installed pfctl format. No inference from token alone.

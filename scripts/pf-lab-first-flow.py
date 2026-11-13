@@ -30,7 +30,12 @@ MODE = "pf-first-flow-trial"
 AUDITED_BINARY_SHA256 = None
 APPROVED_PLAN_SHA256 = None
 LIMIT = 16384
-PHASES = {"prepared", "unsettled", "hook_and_filter_verified", "restored"}
+PHASES = {"prepared", "unsettled", "hook_and_filter_verified", "reference_held", "restored"}
+CONFIRMATIONS = {
+    "stage": ("STAGE-PF-FIRST-FLOW", {"prepared"}, "hook_and_filter_verified"),
+    "activate": ("ACTIVATE-PF-FIRST-FLOW", {"hook_and_filter_verified"}, "reference_held"),
+    "recover": ("RECOVER-PF-FIRST-FLOW", {"hook_and_filter_verified", "reference_held", "unsettled"}, "restored"),
+}
 
 base.SESSION = DIRECTORY
 base.HELPER = HELPER
@@ -80,10 +85,10 @@ def report(raw):
 
 
 def invoke(runner, action, data=b""):
-    if action not in ("prepare", "status", "stage", "recover"):
+    if action not in ("prepare", "status", *CONFIRMATIONS):
         raise Refused("未知动作")
     code, raw = runner.root(HELPER, action, data=data, limit=base.HELPER_OUTPUT_LIMIT,
-                            allowed_codes=(0, 1), with_code=True, timeout=105)
+                            allowed_codes=(0, 1), with_code=True, timeout=45)
     return base.checked_helper_output(code, raw)
 
 
@@ -100,7 +105,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
             raise Refused("初始化回报与批准计划不符；保留现场")
         base.inspect(runner, expected)
         return raw
-    if action not in ("status", "stage", "recover"):
+    if action not in ("status", *CONFIRMATIONS):
         raise Refused("未知动作")
     base.inspect(runner, expected)
     before = invoke(runner, "status")
@@ -109,12 +114,11 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
         raise Refused("受保护计划与批准不符；保留现场")
     if action == "status":
         return before
-    allowed = {"stage": {"prepared"}, "recover": {"hook_and_filter_verified", "unsettled"}}
-    if obj["phase"] not in allowed[action]:
+    ack, allowed, expected_phase = CONFIRMATIONS[action]
+    if obj["phase"] not in allowed:
         raise Refused("当前阶段不允许此动作；保留现场")
     print(before.decode("utf-8", "strict"), flush=True)
     print("确认从暂存起未中断 PF 独占窗口，其他 PF 写入者已退出且恢复条件已核对。不能确认时停止。", flush=True)
-    ack = "STAGE-PF-FIRST-FLOW" if action == "stage" else "RECOVER-PF-FIRST-FLOW"
     if confirm("请输入 " + ack + "：") != ack:
         raise Refused("未确认本次动作")
     base.inspect(runner, expected)
@@ -122,7 +126,6 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
         raise Refused("确认期间状态变化；保留现场")
     raw = invoke(runner, action, (ack + "\n").encode())
     result = report(raw)
-    expected_phase = "hook_and_filter_verified" if action == "stage" else "restored"
     if (result["phase"] != expected_phase or result["anchor"] != obj["anchor"]
             or result["plan_sha256"] != plan_digest):
         raise Refused("动作结果与现场不符；保留现场")
@@ -132,7 +135,7 @@ def execute(runner, action, expected, plan_digest, *, data=None, boot=None, conf
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", default="plan", choices=("plan", "prepare", "status", "stage", "recover"))
+    parser.add_argument("action", nargs="?", default="plan", choices=("plan", "prepare", "status", *CONFIRMATIONS))
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--interface")
     args = parser.parse_args()
@@ -147,7 +150,7 @@ def main():
             digest = hashlib.sha256(data).hexdigest()
         else:
             digest = None
-        print(json.dumps({"directory": DIRECTORY, "helper": HELPER, "actions": (["prepare", "status", "stage", "recover"]
+        print(json.dumps({"directory": DIRECTORY, "helper": HELPER, "actions": (["prepare", "status", *CONFIRMATIONS]
                                       if AUDITED_BINARY_SHA256 is not None and APPROVED_PLAN_SHA256 is not None else []),
                           "digest_reviewed": AUDITED_BINARY_SHA256 is not None,
                           "plan_approved": APPROVED_PLAN_SHA256 is not None,
@@ -171,7 +174,7 @@ def main():
             raise Refused("预检后系统启动标识变化")
     elif args.plan is not None or args.interface is not None:
         raise Refused("此动作不接受计划路径或接口")
-    if args.action in ("stage", "recover") and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+    if args.action in CONFIRMATIONS and (not sys.stdin.isatty() or not sys.stdout.isatty()):
         raise Refused("写入及恢复必须在本机终端人工确认")
     result = execute(stage.Runner(), args.action, expected, digest, data=data, boot=boot)
     sys.stdout.buffer.write(result)

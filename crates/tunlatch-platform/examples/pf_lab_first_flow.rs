@@ -1,5 +1,7 @@
 //! Protected controller for the disabled-PF setup and cleanup of the first physical flow batch.
 #![allow(dead_code)]
+#[path = "../tests/pf_lab/attached_reference.rs"]
+mod attached_reference;
 #[path = "../tests/pf_lab/attached_snapshot.rs"]
 mod attached_snapshot;
 #[path = "../tests/pf_lab/bootstrap.rs"]
@@ -16,6 +18,8 @@ mod native_files;
 mod native_hook;
 #[path = "../tests/pf_lab/offline_capture.rs"]
 mod offline_capture;
+#[path = "../tests/pf_lab/references.rs"]
+mod references;
 #[path = "../tests/pf_lab/root_hook_readback.rs"]
 mod root_hook_readback;
 #[path = "../tests/pf_lab/root_hook_recovery.rs"]
@@ -57,6 +61,7 @@ enum Action {
     Prepare,
     Status,
     Stage,
+    Activate,
     Recover,
 }
 
@@ -66,6 +71,7 @@ impl Action {
             Some("prepare") => Self::Prepare,
             Some("status") => Self::Status,
             Some("stage") => Self::Stage,
+            Some("activate") => Self::Activate,
             Some("recover") => Self::Recover,
             _ => return Err(Error::Refused("expected one fixed batch action")),
         };
@@ -104,6 +110,13 @@ struct Session {
     root: Vec<u8>,
     index: u32,
     foreign: [u8; 32],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceReturn {
+    binding: [u8; 32],
+    returned: attached_reference::Return,
 }
 
 fn sha(data: &[u8]) -> [u8; 32] {
@@ -268,6 +281,8 @@ impl Session {
     fn phase_hash(&self, name: &str) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"tunlatch-first-flow\0");
+        hash.update(self.boot.as_bytes());
+        hash.update(self.nonce);
         hash.update(self.plan);
         hash.update(self.helper);
         hash.update(self.foreign);
@@ -415,6 +430,148 @@ impl Boundary<'_> {
         };
         root_hook_readback::verify(baseline, current, &self.anchor, hook.index as usize)
             .map_err(Error::Refused)
+    }
+
+    fn persist_reference(
+        &self,
+        phase: &str,
+        name: &str,
+        returned: &attached_reference::Return,
+    ) -> io::Result<()> {
+        let record = ReferenceReturn {
+            binding: self.session.phase_hash(phase),
+            returned: returned.clone(),
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        self.storage.write(name, &bytes).map_err(io::Error::other)
+    }
+
+    fn recorded_reference(&self) -> Result<attached_reference::Owned> {
+        let record: ReferenceReturn = decode(&self.storage.read("enable-return.json", 8192)?)?;
+        if record.binding != self.session.phase_hash("enable") {
+            return Err(Error::Refused(
+                "enable return belongs to a different session",
+            ));
+        }
+        Ok(attached_reference::Owned::from_return(&record.returned)?)
+    }
+
+    fn enabled(&self, owner: attached_reference::Owned) -> Result<()> {
+        self.recheck()?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (info, _) = sync_observe::execute_program("/sbin/pfctl", &["-s", "info"], deadline)?;
+        if !info.starts_with(b"Status: Enabled ") || sync_observe::boot()? != self.session.boot {
+            return Err(Error::Refused("enabled status or boot is unconfirmed"));
+        }
+        attached_reference::read_owned(owner)?;
+        self.recheck()
+    }
+
+    fn activate(&self, filter: &ExactFilter, hook: Receipt) -> Result<()> {
+        self.attended()?;
+        if self.storage.exists("enable")? || self.storage.exists("release")? {
+            return Err(Error::Refused("enable already attempted"));
+        }
+        let stage = self.journal("stage")?;
+        if !stage.is_single_closed_operation(Operation::WriteFilter)? {
+            return Err(Error::Refused("filter staging is unconfirmed"));
+        }
+        let snap = self.snapshot()?;
+        self.match_root(&snap.root_rules, hook)?;
+        if !snap.enable_baseline_clear
+            || !self.same_hook(hook)?
+            || !matches!(&snap.leaf, Slot::Active(rules) if filter.matches_observed(rules))
+        {
+            return Err(Error::Refused("PF activation baseline changed"));
+        }
+        let mut journal = Ledger::create(
+            self.storage.subdir("enable", true)?,
+            self.session.nonce,
+            self.session.phase_hash("enable"),
+        )?;
+        let result = attached_reference::acquire_once(
+            || {
+                self.attended().map_err(io::Error::other)?;
+                if self.snapshot().map_err(io::Error::other)? != snap
+                    || !self.same_hook(hook).map_err(io::Error::other)?
+                {
+                    return Err(io::Error::other(
+                        "activation baseline changed before acquire",
+                    ));
+                }
+                stage.check_named_objects().map_err(io::Error::other)?;
+                self.attended().map_err(io::Error::other)?;
+                journal
+                    .begin(Operation::AcquireReference)
+                    .map_err(io::Error::other)
+            },
+            |returned| self.persist_reference("enable", "enable-return.json", returned),
+        )
+        .map_err(Error::from)
+        .and_then(|owner| self.enabled(owner));
+        if let Err(error) = result {
+            let _ = journal.unknown();
+            return Err(error);
+        }
+        journal.observed()?;
+        journal.close()
+    }
+
+    fn release(&self) -> Result<()> {
+        if !self.storage.exists("enable")? {
+            return Ok(());
+        }
+        if self.storage.exists("release")? {
+            let previous = self.journal("release")?;
+            if previous.is_single_closed_operation(Operation::ReleaseReference)? {
+                self.snapshot()?;
+                return Ok(());
+            }
+            return Err(Error::Refused("previous reference release is unconfirmed"));
+        }
+        let enable = self.journal("enable")?;
+        if enable.state() == State::Ready && !self.storage.exists("enable-return.json")? {
+            // A fresh journal with no mutation intent cannot have started pfctl.
+            self.snapshot()?;
+            return Ok(());
+        }
+        if !matches!(
+            enable.state(),
+            State::Intent(Operation::AcquireReference)
+                | State::Unknown(Operation::AcquireReference)
+        ) && !enable.is_single_closed_operation(Operation::AcquireReference)?
+        {
+            return Err(Error::Refused(
+                "reference acquisition journal is unconfirmed",
+            ));
+        }
+        let owner = self.recorded_reference()?;
+        self.enabled(owner)?;
+        let mut journal = Ledger::create(
+            self.storage.subdir("release", true)?,
+            self.session.nonce,
+            self.session.phase_hash("release"),
+        )?;
+        let result = attached_reference::release_once(
+            owner,
+            || {
+                self.attended().map_err(io::Error::other)?;
+                self.recheck().map_err(io::Error::other)?;
+                enable.check_named_objects().map_err(io::Error::other)?;
+                journal
+                    .begin(Operation::ReleaseReference)
+                    .map_err(io::Error::other)
+            },
+            |returned| self.persist_reference("release", "release-return.json", returned),
+        )
+        .map_err(Error::from)
+        .and_then(|()| self.snapshot().map(|_| ()));
+        if let Err(error) = result {
+            let _ = journal.unknown();
+            return Err(error);
+        }
+        journal.observed()?;
+        journal.close()
     }
 }
 
@@ -579,6 +736,7 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
     }
     let confirm: &[u8] = match action {
         Action::Stage => b"STAGE-PF-FIRST-FLOW\n",
+        Action::Activate => b"ACTIVATE-PF-FIRST-FLOW\n",
         Action::Recover => b"RECOVER-PF-FIRST-FLOW\n",
         _ => b"",
     };
@@ -625,6 +783,17 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
         session.index,
         session.foreign,
     )?;
+    if matches!(action, Action::Recover) {
+        boundary.release()?;
+    }
+    if matches!(action, Action::Status)
+        && storage.exists("enable")?
+        && !storage.exists("release")?
+        && let Ok(owner) = boundary.recorded_reference()
+        && boundary.enabled(owner).is_ok()
+    {
+        return Ok(session.report(&filter, "reference_held"));
+    }
     let initial = boundary.snapshot()?;
     let phase = match action {
         Action::Stage => {
@@ -647,6 +816,12 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
             boundary.filter_change("stage", &filter, hook, true)?;
             hook_stage.check_named_objects()?;
             "hook_and_filter_verified"
+        }
+        Action::Activate => {
+            let directory = storage.subdir("hook", false)?;
+            let (_hook_stage, hook) = trial.creation_record(&directory)?;
+            boundary.activate(&filter, hook)?;
+            "reference_held"
         }
         Action::Recover => {
             let directory = storage.subdir("hook", false)?;
@@ -689,6 +864,7 @@ fn run_action(storage: &Storage, action: Action, input: impl Read) -> Result<Val
                 let directory = storage.subdir("hook", false)?;
                 if initial.root_rules == session.root
                     && matches!(initial.leaf, Slot::Absent | Slot::Empty)
+                    && initial.states_and_sources_empty
                     && trial.removal_verified(&directory)?
                 {
                     "restored"
@@ -731,7 +907,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("{error}");
+            let reason: String = error
+                .to_string()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect();
+            println!("{}", json!({"result":"refused","reason":reason}));
             ExitCode::FAILURE
         }
     }
