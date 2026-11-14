@@ -4,6 +4,7 @@ use tunlatch_core::status::{ObservedProtection, UnknownReason};
 
 pub mod reference;
 pub mod rules;
+pub mod snapshot;
 
 #[cfg(test)]
 mod native_hook;

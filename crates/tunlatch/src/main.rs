@@ -1,10 +1,11 @@
-//! Unprivileged CLI and terminal interface. Closing this program has no firewall side effects.
+//! CLI and terminal interface. PF inspection requires root and is read-only.
 
 mod config_command;
 mod identity_command;
 mod journal_command;
 mod tui;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -65,6 +66,47 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Read bounded PF observations as root; this does not change protection.
+    Pf {
+        #[command(subcommand)]
+        command: PfCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PfCommand {
+    /// Read PF status, starter references, or filter rules.
+    Inspect {
+        #[arg(value_enum)]
+        what: PfInspection,
+        /// Session ID for an anchor-rules query.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PfInspection {
+    Info,
+    References,
+    RootRules,
+    AnchorRules,
+}
+
+fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()> {
+    use tunlatch_platform::pf::snapshot::{Query, query};
+
+    let choice = match (what, session.as_deref()) {
+        (PfInspection::Info, None) => Query::Info,
+        (PfInspection::References, None) => Query::References,
+        (PfInspection::RootRules, None) => Query::RootRules,
+        (PfInspection::AnchorRules, Some(session)) => Query::AnchorRules { session },
+        (PfInspection::AnchorRules, None) => anyhow::bail!("anchor-rules requires --session"),
+        (_, Some(_)) => anyhow::bail!("--session is only valid with anchor-rules"),
+    };
+    let output = query(choice).context("cannot read PF; protection remains unknown")?;
+    std::io::stdout().lock().write_all(&output)?;
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -258,6 +300,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Identity {
             command: IdentityCommand::Correlate { pid, cdhash, json },
         } => identity_command::correlate(pid, cdhash, json).await?,
+        Command::Pf {
+            command: PfCommand::Inspect { what, session },
+        } => tokio::task::spawn_blocking(move || inspect_pf(what, session)).await??,
         Command::Simulate {
             runtime_dir,
             json,

@@ -6,6 +6,17 @@ macOS 上独立于代理客户端运行的 TUN 出口保护工具，使用 Rust�
 
 **当前交付是可运行的观察服务、离线配置工具和可选模拟控制，尚未提供防泄漏保护。** `tunlatchd` 始终报告实际保护未知；不会访问 `/dev/pf`、调用 `pfctl`、更改路由或安装启动项。请使用普通用户运行。
 
+CLI 另提供需要 root 的只读 PF 检查，读取系统状态、引用或规则，不会启用或修改 PF：
+
+```sh
+cargo build -p tunlatch --locked
+sudo ./target/debug/tunlatch pf inspect info
+sudo ./target/debug/tunlatch pf inspect references
+sudo ./target/debug/tunlatch pf inspect root-rules
+```
+
+这些分别是非原子的观察，不能证明保护生效；引用输出可能包含系统中其他 PF 使用者的信息。
+
 ## 构建与试运行
 
 需要 macOS、Rustup 和 Xcode Command Line Tools。仓库固定 Rust 1.99.1 / Edition 2024，并提交 `Cargo.lock`。当前实测环境为 Apple Silicon、macOS 26.6.2；更低系统版本和 Intel 尚未实测，不声明最低兼容系统版本。`rust-version` 暂与固定工具链一致，不承诺支持更早的 Rust。
