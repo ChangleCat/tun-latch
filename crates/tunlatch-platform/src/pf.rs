@@ -5,6 +5,7 @@ use tunlatch_core::status::{ObservedProtection, UnknownReason};
 pub mod anchor;
 pub mod hook_readback;
 pub mod qualification;
+pub mod recovery;
 pub mod reference;
 pub mod reference_acquire;
 pub mod rules;

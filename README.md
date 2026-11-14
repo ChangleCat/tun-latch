@@ -20,6 +20,8 @@ sudo ./target/debug/tunlatch pf inspect native-root
 
 如果已准备固定的 root 保护记录目录，可用 `sudo ./target/debug/tunlatch pf inspect reference-record` 检查引用回执和当前引用清单的对应情况。该检查不显示 token、不改变 PF；它需要取得记录目录的写锁，不能证明资源归属或授权释放引用。
 
+`sudo ./target/debug/tunlatch pf inspect recovery` 可检查各操作的持久记录，并在同一启动周期内对照当前引用、根 hook 和 anchor 规则。返回值仅供诊断，不能当作保护状态或清理授权。
+
 ## 构建与试运行
 
 需要 macOS、Rustup 和 Xcode Command Line Tools。仓库固定 Rust 1.99.1 / Edition 2024，并提交 `Cargo.lock`。当前实测环境为 Apple Silicon、macOS 26.6.2；更低系统版本和 Intel 尚未实测，不声明最低兼容系统版本。`rust-version` 暂与固定工具链一致，不承诺支持更早的 Rust。

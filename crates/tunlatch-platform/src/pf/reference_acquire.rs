@@ -42,7 +42,7 @@ pub struct AcquiredReference {
     creator_pid: u32,
     pub(super) boot_session: String,
     pub(super) session: [u8; 16],
-    acquisition_identity: RecordIdentity,
+    pub(super) acquisition_identity: RecordIdentity,
     // Keep the protected store's cooperating-writer lock for the entire live handle.
     // Dropping it never releases the PF reference or removes its durable receipt.
     pub(super) store: SystemRecordStore,
@@ -232,6 +232,16 @@ pub enum ReferenceRecordStatus {
 /// protection. No PF change, cleanup, or retry is performed.
 pub fn inspect_record() -> Result<ReferenceRecordStatus, AcquireError> {
     let store = SystemRecordStore::open()?;
+    for kind in [
+        RecordKind::PfReference,
+        RecordKind::PfAnchorStage,
+        RecordKind::PfHook,
+        RecordKind::PfHookRemoval,
+        RecordKind::PfAnchorClear,
+        RecordKind::PfReferenceRelease,
+    ] {
+        store.require_no_pending(kind)?;
+    }
     if store.read(RecordKind::PfReferenceRelease)?.is_some() {
         return Ok(ReferenceRecordStatus::ReleaseRecordPresent);
     }

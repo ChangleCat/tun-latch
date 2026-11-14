@@ -557,6 +557,7 @@ impl StagedAnchor {
             boot: &boot,
             session: self.session,
             index,
+            stage_identity: self.stage_identity,
             baseline: &baseline,
         };
         let (ticket, hook_identity) = attach_with(
@@ -646,20 +647,28 @@ impl AcquiredReference {
             snapshot::query(snapshot::Query::AnchorRules { session: &suffix })
                 .map_err(|_| StageError::Unconfirmed)
         };
-        let stage_identity = stage_with(&mut self.store, &boot, session, &interface, read, || {
-            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot {
-                return Err(StageError::Unconfirmed);
-            }
-            let listing = snapshot::query(snapshot::Query::References)
-                .map_err(|_| StageError::Unconfirmed)?;
-            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot
-                || !reference::contains_reference(&listing, token, pid)
-                    .map_err(|_| StageError::Unconfirmed)?
-            {
-                return Err(StageError::Unconfirmed);
-            }
-            transaction.commit().map_err(|_| StageError::Unconfirmed)
-        })?;
+        let stage_identity = stage_with(
+            &mut self.store,
+            &boot,
+            session,
+            &interface,
+            self.acquisition_identity,
+            read,
+            || {
+                if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot {
+                    return Err(StageError::Unconfirmed);
+                }
+                let listing = snapshot::query(snapshot::Query::References)
+                    .map_err(|_| StageError::Unconfirmed)?;
+                if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot
+                    || !reference::contains_reference(&listing, token, pid)
+                        .map_err(|_| StageError::Unconfirmed)?
+                {
+                    return Err(StageError::Unconfirmed);
+                }
+                transaction.commit().map_err(|_| StageError::Unconfirmed)
+            },
+        )?;
         self.recheck_current()
             .map_err(|_| StageError::Unconfirmed)?;
         Ok(StagedAnchor {
@@ -670,11 +679,11 @@ impl AcquiredReference {
     }
 }
 
-fn suffix(session: [u8; 16]) -> String {
+pub(super) fn suffix(session: [u8; 16]) -> String {
     session.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn anchor_name(session: [u8; 16]) -> String {
+pub(super) fn anchor_name(session: [u8; 16]) -> String {
     format!("tunlatch-lab-{}", suffix(session))
 }
 
@@ -684,6 +693,7 @@ struct StageRecord<'a> {
     boot_session: &'a str,
     session: [u8; 16],
     interface: &'a str,
+    acquisition_identity: String,
     stage: &'static str,
 }
 
@@ -720,6 +730,7 @@ fn stage_with(
     boot: &str,
     session: [u8; 16],
     interface: &str,
+    acquisition_identity: RecordIdentity,
     read: impl Fn() -> Result<Vec<u8>, StageError>,
     submit: impl FnOnce() -> Result<(), StageError>,
 ) -> Result<RecordIdentity, StageError> {
@@ -734,6 +745,7 @@ fn stage_with(
         boot_session: boot,
         session,
         interface,
+        acquisition_identity: acquisition_identity.to_string(),
         stage: "intent",
     };
     save(records, &record)?;
@@ -751,6 +763,7 @@ struct HookContext<'a> {
     boot: &'a str,
     session: [u8; 16],
     index: u32,
+    stage_identity: RecordIdentity,
     baseline: &'a [u8],
 }
 
@@ -760,6 +773,7 @@ struct HookRecord<'a> {
     boot_session: &'a str,
     session: [u8; 16],
     index: u32,
+    stage_identity: String,
     root_before: &'a str,
     ticket: Option<u64>,
 }
@@ -808,6 +822,7 @@ fn attach_with(
         boot_session: context.boot,
         session: context.session,
         index: context.index,
+        stage_identity: context.stage_identity.to_string(),
         root_before: baseline,
         ticket: None,
     };
@@ -968,7 +983,7 @@ fn clear_with(
     Ok(identity)
 }
 
-fn matches_block(raw: &[u8], interface: &str) -> bool {
+pub(super) fn matches_block(raw: &[u8], interface: &str) -> bool {
     if raw.len() > 512
         || !raw.is_ascii()
         || !raw.ends_with(b"\n")
@@ -1054,6 +1069,7 @@ mod tests {
             "boot",
             [1; 16],
             "en0",
+            RecordIdentity::new([2; 32])?,
             || {
                 let n = reads.get();
                 reads.set(n + 1);
@@ -1075,7 +1091,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn failure_retains_intent_and_prevents_replay() {
+    fn failure_retains_intent_and_prevents_replay() -> Result<(), StageError> {
         let state = RefCell::new(Memory {
             records: vec![],
             fail_at: Some(1),
@@ -1087,6 +1103,7 @@ mod tests {
             "boot",
             [1; 16],
             "en0",
+            RecordIdentity::new([2; 32])?,
             || {
                 reads.set(reads.get() + 1);
                 Ok(vec![])
@@ -1096,7 +1113,19 @@ mod tests {
         assert!(matches!(result, Err(StageError::Unconfirmed)));
         assert_eq!(reads.get(), 1);
         assert_eq!(state.borrow().records.len(), 1);
-        assert!(stage_with(&mut store, "boot", [1; 16], "en0", || Ok(vec![]), || Ok(())).is_err());
+        assert!(
+            stage_with(
+                &mut store,
+                "boot",
+                [1; 16],
+                "en0",
+                RecordIdentity::new([2; 32])?,
+                || Ok(vec![]),
+                || Ok(())
+            )
+            .is_err()
+        );
+        Ok(())
     }
     #[test]
     fn rule_reader_rejects_broader_or_changed_rules() {
@@ -1126,6 +1155,7 @@ mod tests {
             boot: "boot",
             session: [1; 16],
             index: 1,
+            stage_identity: RecordIdentity::new([1; 32])?,
             baseline: b"pass all\n",
         };
         let ticket = NonZeroU64::new(42).ok_or(StageError::Unconfirmed)?;
@@ -1161,6 +1191,7 @@ mod tests {
             boot: "boot",
             session: [1; 16],
             index: 1,
+            stage_identity: RecordIdentity::new([1; 32])?,
             baseline: b"pass all\n",
         };
         let ticket = NonZeroU64::new(42).ok_or(StageError::Unconfirmed)?;

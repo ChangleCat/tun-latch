@@ -15,8 +15,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, OFlag, fcntl, open, openat, renameat};
-use nix::sys::stat::{Mode, fchmod};
+use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, open, openat, renameat};
+use nix::sys::stat::{Mode, fchmod, fstatat};
 use nix::unistd::{Uid, UnlinkatFlags, unlinkat};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -189,6 +189,9 @@ pub enum StoreError {
     /// Another cooperating writer holds the fixed lock, or locking was unavailable.
     #[error("record store exclusive writer lock is unavailable")]
     WriterBusy,
+    /// A prior record replacement left a pending file that requires investigation.
+    #[error("unresolved pending record: {0:?}")]
+    PendingRecord(RecordKind),
     /// The bounded envelope was corrupt, truncated, extended or unsupported.
     #[error("record envelope rejected: {0}")]
     InvalidRecord(&'static str),
@@ -278,6 +281,11 @@ impl SystemRecordStore {
         self.inner.read(kind)
     }
 
+    // Recovery must not mistake an unresolved temporary write for an absent record.
+    pub(crate) fn require_no_pending(&self, kind: RecordKind) -> Result<(), StoreError> {
+        self.inner.require_no_pending(kind)
+    }
+
     /// Replace fixed record data only; this operation never changes PF or system services.
     pub fn replace(&mut self, kind: RecordKind, record: &StoredRecord) -> Result<(), StoreError> {
         self.inner.replace(kind, record, |_| Ok(()))
@@ -290,6 +298,19 @@ struct Store {
 }
 
 impl Store {
+    fn require_no_pending(&self, kind: RecordKind) -> Result<(), StoreError> {
+        self.recheck()?;
+        match fstatat(
+            self.chain.directory()?,
+            kind.temporary_name(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Err(Errno::ENOENT) => self.recheck(),
+            Ok(_) => Err(StoreError::PendingRecord(kind)),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn open(path: &Path, owner: u32, system: bool) -> Result<Self, StoreError> {
         let chain = DirectoryChain::open(path, owner, system)?;
         let lock = create_or_open_lock(chain.directory()?)?;
@@ -792,6 +813,26 @@ mod tests {
         let store = UserRecordStore::open(&directory.path().canonicalize()?)?;
         let record = StoredRecord::new(RecordIdentity::new([1; 32])?, b"enabled".to_vec())?;
         Ok((directory, store, record))
+    }
+
+    #[test]
+    fn recovery_refuses_pending_files_including_symlinks() -> TestResult {
+        let (directory, store, _) = fixture()?;
+        let kind = RecordKind::PfHook;
+        store.inner.require_no_pending(kind)?;
+        let pending = directory.path().join(kind.temporary_name());
+        std::fs::write(&pending, b"unresolved")?;
+        assert!(matches!(
+            store.inner.require_no_pending(kind),
+            Err(StoreError::PendingRecord(RecordKind::PfHook))
+        ));
+        std::fs::remove_file(&pending)?;
+        std::os::unix::fs::symlink("missing", &pending)?;
+        assert!(matches!(
+            store.inner.require_no_pending(kind),
+            Err(StoreError::PendingRecord(RecordKind::PfHook))
+        ));
+        Ok(())
     }
 
     #[test]

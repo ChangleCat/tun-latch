@@ -95,6 +95,8 @@ enum PfInspection {
     NativeRoot,
     /// Inspect the protected PF reference receipt and current inventory.
     ReferenceRecord,
+    /// Inspect recovery records and compare them with current PF observations.
+    Recovery,
 }
 
 fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()> {
@@ -138,6 +140,26 @@ fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()>
                 }
             };
             println!("{description}; protection remains unknown");
+            return Ok(());
+        }
+        (PfInspection::Recovery, None) => {
+            let report = tunlatch_platform::pf::recovery::inspect()
+                .context("cannot inspect PF recovery state; protection remains unknown")?;
+            println!("boot: {:?}", report.boot);
+            println!(
+                "records: acquire={:?}, stage={:?}, hook={:?}, removal={:?}, clear={:?}, release={:?}",
+                report.acquisition,
+                report.stage,
+                report.hook,
+                report.removal,
+                report.clear,
+                report.release
+            );
+            println!(
+                "observed: reference={:?}, hook={:?}, anchor={:?}",
+                report.reference_observation, report.hook_observation, report.anchor_observation
+            );
+            println!("diagnostic only; protection remains unknown");
             return Ok(());
         }
     };

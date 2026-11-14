@@ -430,6 +430,17 @@ pub(crate) fn readonly_rules(
     enumerate(|request| ioctl(device, build, kernel, request))
 }
 
+/// Observe one project hook through the read-only transport; no write authority is created.
+pub(crate) fn readonly_hook(
+    device: &File,
+    build: &str,
+    kernel: &str,
+    session: &str,
+) -> Result<Option<Hook>> {
+    let name = RootName::new(session)?;
+    observe(&name, |request| ioctl(device, build, kernel, request))
+}
+
 pub(crate) fn readonly_layout() -> (usize, usize, libc::c_ulong, libc::c_ulong) {
     (
         std::mem::size_of::<Frame>(),
