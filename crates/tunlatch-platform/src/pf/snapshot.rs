@@ -99,6 +99,35 @@ fn valid_output(output: &[u8]) -> bool {
             .any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\t'))
 }
 
+// Fixed host-identity queries used to qualify the private PF ABI. Do not accept a path or
+// arguments from a caller: these identifiers are part of the trust boundary for native reads.
+pub(super) fn host_identity() -> Result<(String, String), SnapshotError> {
+    fn line(program: &str, argument: &[&str]) -> Result<String, SnapshotError> {
+        let mut command = Command::new(program);
+        command
+            .args(argument)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .current_dir("/");
+        let result = run(command, TIMEOUT)?;
+        if !result.status.success() || !result.stderr.is_empty() || !valid_output(&result.stdout) {
+            return Err(SnapshotError::Incomplete);
+        }
+        let value = std::str::from_utf8(&result.stdout)
+            .map_err(|_| SnapshotError::Incomplete)?
+            .strip_suffix('\n')
+            .ok_or(SnapshotError::Incomplete)?;
+        if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(SnapshotError::Incomplete);
+        }
+        Ok(value.to_owned())
+    }
+    Ok((
+        line("/usr/bin/sw_vers", &["-buildVersion"])?,
+        line("/usr/sbin/sysctl", &["-n", "kern.version"])?,
+    ))
+}
+
 fn anchor_name(session: &str) -> Result<String, SnapshotError> {
     if session.len() != 32
         || session.bytes().all(|byte| byte == b'0')

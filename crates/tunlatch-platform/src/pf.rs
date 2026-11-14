@@ -1,12 +1,16 @@
-//! PF adapter and offline rule construction. No device is opened and no command is executed.
+//! Read-only PF inspection and offline rule construction; enforcement is not implemented.
 
 use tunlatch_core::status::{ObservedProtection, UnknownReason};
 
+pub mod hook_readback;
+pub mod qualification;
 pub mod reference;
 pub mod rules;
 pub mod snapshot;
 
-#[cfg(test)]
+// The retained writer remains restricted to the removed lab executable until a protected
+// product session and recovery protocol are in place. Only reads are connected here.
+#[allow(dead_code)]
 mod native_hook;
 
 /// Query the capabilities implemented by this framework, without guessing the global PF state.

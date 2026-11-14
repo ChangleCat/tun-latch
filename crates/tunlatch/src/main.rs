@@ -91,6 +91,8 @@ enum PfInspection {
     References,
     RootRules,
     AnchorRules,
+    /// Cross-check native root filter reads against independent pfctl output.
+    NativeRoot,
 }
 
 fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()> {
@@ -103,6 +105,15 @@ fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()>
         (PfInspection::AnchorRules, Some(session)) => Query::AnchorRules { session },
         (PfInspection::AnchorRules, None) => anyhow::bail!("anchor-rules requires --session"),
         (_, Some(_)) => anyhow::bail!("--session is only valid with anchor-rules"),
+        (PfInspection::NativeRoot, None) => {
+            let result = tunlatch_platform::pf::qualification::check_root_filter()
+                .context("native PF qualification failed; protection remains unknown")?;
+            println!(
+                "native and pfctl root filter reads agree: {} rules; protection remains unknown",
+                result.filter_rules
+            );
+            return Ok(());
+        }
     };
     let output = query(choice).context("cannot read PF; protection remains unknown")?;
     std::io::stdout().lock().write_all(&output)?;

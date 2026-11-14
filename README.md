@@ -13,6 +13,7 @@ cargo build -p tunlatch --locked
 sudo ./target/debug/tunlatch pf inspect info
 sudo ./target/debug/tunlatch pf inspect references
 sudo ./target/debug/tunlatch pf inspect root-rules
+sudo ./target/debug/tunlatch pf inspect native-root
 ```
 
 这些分别是非原子的观察，不能证明保护生效；引用输出可能包含系统中其他 PF 使用者的信息。
