@@ -93,6 +93,8 @@ enum PfInspection {
     AnchorRules,
     /// Cross-check native root filter reads against independent pfctl output.
     NativeRoot,
+    /// Inspect the protected PF reference receipt and current inventory.
+    ReferenceRecord,
 }
 
 fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()> {
@@ -112,6 +114,27 @@ fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()>
                 "native and pfctl root filter reads agree: {} rules; protection remains unknown",
                 result.filter_rules
             );
+            return Ok(());
+        }
+        (PfInspection::ReferenceRecord, None) => {
+            use tunlatch_platform::pf::reference_acquire::{ReferenceRecordStatus, inspect_record};
+            let status = inspect_record()
+                .context("cannot inspect PF reference record; protection remains unknown")?;
+            let description = match status {
+                ReferenceRecordStatus::ReleaseRecordPresent => {
+                    "release record exists; outcome requires reconciliation"
+                }
+                ReferenceRecordStatus::Missing => "no reference acquisition record",
+                ReferenceRecordStatus::AcquisitionUnconfirmed => "acquisition outcome unconfirmed",
+                ReferenceRecordStatus::RecordedBootDiffers => "record belongs to a different boot",
+                ReferenceRecordStatus::ReferencePresent => {
+                    "recorded reference appears in current inventory"
+                }
+                ReferenceRecordStatus::ReferenceAbsent => {
+                    "recorded reference is absent from current inventory"
+                }
+            };
+            println!("{description}; protection remains unknown");
             return Ok(());
         }
     };

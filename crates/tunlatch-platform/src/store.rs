@@ -40,6 +40,8 @@ pub enum RecordKind {
     Recovery,
     /// Private PF reference acquisition receipt and unresolved-operation record.
     PfReference,
+    /// Private PF reference release receipt and unresolved-operation record.
+    PfReferenceRelease,
 }
 
 impl RecordKind {
@@ -49,6 +51,7 @@ impl RecordKind {
             Self::Policy => "policy.record",
             Self::Recovery => "recovery.record",
             Self::PfReference => "pf-reference.record",
+            Self::PfReferenceRelease => "pf-reference-release.record",
         }
     }
 
@@ -57,6 +60,7 @@ impl RecordKind {
             Self::Policy => "policy.pending",
             Self::Recovery => "recovery.pending",
             Self::PfReference => "pf-reference.pending",
+            Self::PfReferenceRelease => "pf-reference-release.pending",
         }
     }
 
@@ -65,6 +69,7 @@ impl RecordKind {
             Self::Policy => 1,
             Self::Recovery => 2,
             Self::PfReference => 3,
+            Self::PfReferenceRelease => 4,
         }
     }
 }

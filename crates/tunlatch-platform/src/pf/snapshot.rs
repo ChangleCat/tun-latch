@@ -134,7 +134,7 @@ pub(super) fn boot_session() -> Result<String, SnapshotError> {
     parse_boot_session(&value)
 }
 
-fn parse_boot_session(value: &str) -> Result<String, SnapshotError> {
+pub(super) fn parse_boot_session(value: &str) -> Result<String, SnapshotError> {
     if value.len() != 36
         || !value.bytes().enumerate().all(|(i, b)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -158,6 +158,19 @@ pub(super) fn acquire_reference() -> Result<Return, SnapshotError> {
     let mut command = Command::new("/sbin/pfctl");
     command
         .arg("-E")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .current_dir("/");
+    run(command, TIMEOUT)
+}
+
+// Only a successfully acquired token can be supplied; no global disable is supported.
+pub(super) fn release_reference(
+    token: super::reference::ReferenceToken,
+) -> Result<Return, SnapshotError> {
+    let mut command = Command::new("/sbin/pfctl");
+    command
+        .args(["-X", &token.get().to_string()])
         .env_clear()
         .env("LC_ALL", "C")
         .current_dir("/");

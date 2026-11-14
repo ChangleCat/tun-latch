@@ -106,6 +106,14 @@ pub fn deployment_preview() -> DeploymentPreview {
             File,
             0o600,
         ),
+        resource(
+            format!(
+                "{SYSTEM_STORE_DIRECTORY}/{}",
+                RecordKind::PfReferenceRelease.file_name()
+            ),
+            File,
+            0o600,
+        ),
         resource(format!("{SYSTEM_STORE_DIRECTORY}/{LOCK_NAME}"), File, 0o600),
         resource(SYSTEM_RUNTIME_DIRECTORY, Directory, 0o755),
         resource(

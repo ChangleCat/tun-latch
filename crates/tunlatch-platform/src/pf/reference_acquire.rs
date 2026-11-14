@@ -3,7 +3,7 @@
 //! There is deliberately no automatic retry or release. A saved receipt is a recovery hint,
 //! not authorization to release a reference or evidence that traffic is protected.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{qualification, reference, snapshot};
@@ -40,9 +40,12 @@ pub enum AcquireError {
 pub struct AcquiredReference {
     token: reference::ReferenceToken,
     creator_pid: u32,
+    boot_session: String,
+    session: [u8; 16],
+    acquisition_identity: RecordIdentity,
     // Keep the protected store's cooperating-writer lock for the entire live handle.
     // Dropping it never releases the PF reference or removes its durable receipt.
-    _store: SystemRecordStore,
+    store: SystemRecordStore,
 }
 
 impl std::fmt::Debug for AcquiredReference {
@@ -65,10 +68,95 @@ impl AcquiredReference {
     pub fn token(&self) -> reference::ReferenceToken {
         self.token
     }
+
+    /// Release this exact reference after a separately authorized protection shutdown.
+    ///
+    /// The authorization has no constructor in the current product. The operation records its
+    /// intent before the fixed `pfctl -X` call and retains both acquisition and release records.
+    /// An uncertain outcome is never retried automatically. Other PF references are untouched.
+    pub fn release(mut self, authorization: ReleaseAuthorization) -> Result<(), ReleaseError> {
+        if authorization.session != self.session {
+            return Err(ReleaseError::Refused("release session mismatch"));
+        }
+        let current = self
+            .store
+            .read(RecordKind::PfReference)?
+            .ok_or(ReleaseError::Refused("acquisition record missing"))?;
+        if current.identity() != self.acquisition_identity {
+            return Err(ReleaseError::Refused("acquisition record changed"));
+        }
+        let token = self.token;
+        let pid = self.creator_pid;
+        let boot = &self.boot_session;
+        let read = || {
+            if snapshot::boot_session().map_err(|_| ReleaseError::Unconfirmed)? != *boot {
+                return Err(ReleaseError::Unconfirmed);
+            }
+            let bytes = snapshot::query(snapshot::Query::References)
+                .map_err(|_| ReleaseError::Unconfirmed)?;
+            if snapshot::boot_session().map_err(|_| ReleaseError::Unconfirmed)? != *boot {
+                return Err(ReleaseError::Unconfirmed);
+            }
+            Ok(bytes)
+        };
+        release_with(
+            &mut self.store,
+            boot,
+            self.session,
+            token,
+            pid,
+            read,
+            || {
+                let listing = read()?;
+                if !reference::contains_reference(&listing, token, pid)
+                    .map_err(|_| ReleaseError::Unconfirmed)?
+                {
+                    return Err(ReleaseError::Unconfirmed);
+                }
+                let result =
+                    snapshot::release_reference(token).map_err(|_| ReleaseError::Unconfirmed)?;
+                Ok(ChildReturn {
+                    pid: result.pid,
+                    exit_code: result.status.code(),
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                })
+            },
+        )
+    }
 }
 
-#[derive(Serialize)]
-#[serde(tag = "stage", rename_all = "snake_case")]
+/// Authority to release a session after its protection shutdown is independently verified.
+///
+/// This capability has no constructor until the real backend can verify shutdown, resource
+/// ownership, and writer coordination. An observed record cannot be converted into it.
+///
+/// ```compile_fail
+/// use tunlatch_platform::pf::reference_acquire::ReleaseAuthorization;
+/// let _ = ReleaseAuthorization { session: [1; 16] };
+/// ```
+pub struct ReleaseAuthorization {
+    session: [u8; 16],
+}
+
+/// A failure while releasing an acquired PF reference.
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseError {
+    /// A protected record failed before the release attempt began.
+    #[error("PF reference release record error: {0}")]
+    Store(#[from] StoreError),
+    /// Authorization, session or prior-release checks refused the operation.
+    #[error("PF reference release refused: {0}")]
+    Refused(&'static str),
+    /// A reliable release outcome could not be established; do not retry automatically.
+    #[error(
+        "PF reference release outcome is unconfirmed; inspect protected records before recovery"
+    )]
+    Unconfirmed,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
 enum Receipt {
     Intent,
     ChildReturn {
@@ -87,6 +175,107 @@ struct Record<'a> {
     receipt: Receipt,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRecord {
+    version: u8,
+    boot_session: String,
+    session: [u8; 16],
+    receipt: Receipt,
+}
+
+/// Read-only interpretation of the protected acquisition record and current PF inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceRecordStatus {
+    /// A release record exists and requires separate reconciliation.
+    ReleaseRecordPresent,
+    /// No reference acquisition record exists in the fixed protected slot.
+    Missing,
+    /// An intent or a child return cannot establish a successful acquisition.
+    AcquisitionUnconfirmed,
+    /// The recorded reference belongs to a different boot session.
+    RecordedBootDiffers,
+    /// The complete current reference listing contains the recorded token and PID.
+    ReferencePresent,
+    /// The complete current reference listing does not contain the recorded token.
+    ReferenceAbsent,
+}
+
+/// Inspect the protected acquisition record without returning its sensitive token.
+///
+/// Requires root and the provisioned system store. It holds the store's cooperating-writer
+/// lock while reading; the store may create its fixed lock file if absent. Observations are
+/// not atomic and none of the results establish ownership, authorize release, or prove traffic
+/// protection. No PF change, cleanup, or retry is performed.
+pub fn inspect_record() -> Result<ReferenceRecordStatus, AcquireError> {
+    let store = SystemRecordStore::open()?;
+    if store.read(RecordKind::PfReferenceRelease)?.is_some() {
+        return Ok(ReferenceRecordStatus::ReleaseRecordPresent);
+    }
+    let Some(record) = store.read(RecordKind::PfReference)? else {
+        return Ok(ReferenceRecordStatus::Missing);
+    };
+    let boot = snapshot::boot_session()?;
+    let status = inspect_saved(&record, &boot, || {
+        snapshot::query(snapshot::Query::References).map_err(AcquireError::from)
+    })?;
+    if snapshot::boot_session()? != boot {
+        return Err(AcquireError::Unconfirmed);
+    }
+    Ok(status)
+}
+
+fn inspect_saved(
+    stored: &StoredRecord,
+    boot: &str,
+    read_references: impl FnOnce() -> Result<Vec<u8>, AcquireError>,
+) -> Result<ReferenceRecordStatus, AcquireError> {
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-reference-v1\0");
+    hash.update(stored.payload());
+    let expected: [u8; 32] = hash.finalize().into();
+    if stored.identity().as_bytes() != &expected {
+        return Err(AcquireError::Refused("reference record identity mismatch"));
+    }
+    let record: ReadRecord = serde_json::from_slice(stored.payload())
+        .map_err(|_| AcquireError::Refused("invalid reference record"))?;
+    if record.version != 1
+        || record.session == [0; 16]
+        || snapshot::parse_boot_session(&record.boot_session)
+            .ok()
+            .as_deref()
+            != Some(record.boot_session.as_str())
+    {
+        return Err(AcquireError::Refused("invalid reference record identity"));
+    }
+    if record.boot_session != boot {
+        return Ok(ReferenceRecordStatus::RecordedBootDiffers);
+    }
+    let Receipt::ChildReturn {
+        pid,
+        exit_code,
+        stdout,
+        stderr,
+    } = record.receipt
+    else {
+        return Ok(ReferenceRecordStatus::AcquisitionUnconfirmed);
+    };
+    if pid == 0 || stdout.len().saturating_add(stderr.len()) > MAX_RETURN_BYTES {
+        return Err(AcquireError::Refused("invalid reference child return"));
+    }
+    let Ok(token) = reference::parse_acquisition(exit_code == Some(0), &stdout, &stderr) else {
+        return Ok(ReferenceRecordStatus::AcquisitionUnconfirmed);
+    };
+    let listing = read_references()?;
+    let present = reference::contains_reference(&listing, token, pid)
+        .map_err(|_| AcquireError::Unconfirmed)?;
+    Ok(if present {
+        ReferenceRecordStatus::ReferencePresent
+    } else {
+        ReferenceRecordStatus::ReferenceAbsent
+    })
+}
+
 struct ChildReturn {
     pid: u32,
     exit_code: Option<i32>,
@@ -97,6 +286,7 @@ struct ChildReturn {
 struct ObservedReference {
     token: reference::ReferenceToken,
     creator_pid: u32,
+    acquisition_identity: RecordIdentity,
 }
 
 trait Records {
@@ -114,7 +304,129 @@ impl Records for SystemRecordStore {
     }
 }
 
-fn save(records: &mut impl Records, record: &Record<'_>) -> Result<(), AcquireError> {
+#[derive(Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+enum ReleaseReceipt {
+    Intent,
+    ChildReturn {
+        pid: u32,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+}
+
+#[derive(Serialize)]
+struct ReleaseRecord<'a> {
+    version: u8,
+    boot_session: &'a str,
+    session: [u8; 16],
+    acquisition_pid: u32,
+    token: u64,
+    receipt: ReleaseReceipt,
+}
+
+trait ReleaseRecords {
+    fn release_exists(&self) -> Result<bool, StoreError>;
+    fn save_release(&mut self, record: &StoredRecord) -> Result<(), StoreError>;
+}
+
+impl ReleaseRecords for SystemRecordStore {
+    fn release_exists(&self) -> Result<bool, StoreError> {
+        Ok(self.read(RecordKind::PfReferenceRelease)?.is_some())
+    }
+    fn save_release(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
+        self.replace(RecordKind::PfReferenceRelease, record)
+    }
+}
+
+fn save_release(
+    records: &mut impl ReleaseRecords,
+    record: &ReleaseRecord<'_>,
+) -> Result<(), ReleaseError> {
+    let payload = serde_json::to_vec(record)
+        .map_err(|_| ReleaseError::Refused("cannot encode release record"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-release-v1\0");
+    hash.update(&payload);
+    let identity = RecordIdentity::new(hash.finalize().into())?;
+    records.save_release(&StoredRecord::new(identity, payload)?)?;
+    Ok(())
+}
+
+fn release_with(
+    records: &mut impl ReleaseRecords,
+    boot: &str,
+    session: [u8; 16],
+    token: reference::ReferenceToken,
+    acquisition_pid: u32,
+    read_references: impl Fn() -> Result<Vec<u8>, ReleaseError>,
+    execute: impl FnOnce() -> Result<ChildReturn, ReleaseError>,
+) -> Result<(), ReleaseError> {
+    if boot.is_empty() || session == [0; 16] || acquisition_pid == 0 || records.release_exists()? {
+        return Err(ReleaseError::Refused(
+            "invalid session or existing release record",
+        ));
+    }
+    let before = read_references()?;
+    if !reference::contains_reference(&before, token, acquisition_pid)
+        .map_err(|_| ReleaseError::Unconfirmed)?
+    {
+        return Err(ReleaseError::Refused("acquired reference not present"));
+    }
+    let mut record = ReleaseRecord {
+        version: 1,
+        boot_session: boot,
+        session,
+        acquisition_pid,
+        token: token.get(),
+        receipt: ReleaseReceipt::Intent,
+    };
+    save_release(records, &record)?;
+    let result = execute().map_err(|_| ReleaseError::Unconfirmed)?;
+    if result.pid == 0 || result.stdout.len().saturating_add(result.stderr.len()) > MAX_RETURN_BYTES
+    {
+        return Err(ReleaseError::Unconfirmed);
+    }
+    record.receipt = ReleaseReceipt::ChildReturn {
+        pid: result.pid,
+        exit_code: result.exit_code,
+        stdout: result.stdout,
+        stderr: result.stderr,
+    };
+    save_release(records, &record).map_err(|_| ReleaseError::Unconfirmed)?;
+    let ReleaseReceipt::ChildReturn {
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    } = &record.receipt
+    else {
+        return Err(ReleaseError::Unconfirmed);
+    };
+    if !valid_release_return(*exit_code, stdout, stderr) {
+        return Err(ReleaseError::Unconfirmed);
+    }
+    let after = read_references().map_err(|_| ReleaseError::Unconfirmed)?;
+    if reference::contains_reference(&after, token, acquisition_pid)
+        .map_err(|_| ReleaseError::Unconfirmed)?
+    {
+        return Err(ReleaseError::Unconfirmed);
+    }
+    Ok(())
+}
+
+fn valid_release_return(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> bool {
+    const NOTICE: &[u8] = b"No ALTQ support in kernel\nALTQ related functions disabled\n";
+    const DISABLED: &[u8] = b"pf disabled\n";
+    if exit_code != Some(0) || !(stdout.is_empty() || stdout == DISABLED) {
+        return false;
+    }
+    let rest = stderr.strip_prefix(NOTICE).unwrap_or(stderr);
+    (rest.is_empty() || rest == DISABLED) && !(stdout == DISABLED && rest == DISABLED)
+}
+
+fn save(records: &mut impl Records, record: &Record<'_>) -> Result<RecordIdentity, AcquireError> {
     let payload = serde_json::to_vec(record)
         .map_err(|_| AcquireError::Refused("cannot encode reference record"))?;
     let mut hash = Sha256::new();
@@ -122,7 +434,7 @@ fn save(records: &mut impl Records, record: &Record<'_>) -> Result<(), AcquireEr
     hash.update(&payload);
     let identity = RecordIdentity::new(hash.finalize().into())?;
     records.save(&StoredRecord::new(identity, payload)?)?;
-    Ok(())
+    Ok(identity)
 }
 
 /// Acquire one PF enable reference, recording intent before starting `/sbin/pfctl -E`.
@@ -135,8 +447,10 @@ fn save(records: &mut impl Records, record: &Record<'_>) -> Result<(), AcquireEr
 /// The synchronous OS calls and child reaping can block beyond the nominal query deadline.
 pub fn acquire_once() -> Result<AcquiredReference, AcquireError> {
     let mut store = SystemRecordStore::open()?;
-    if store.existing()? {
-        return Err(AcquireError::Refused("reference record already exists"));
+    if store.existing()? || store.read(RecordKind::PfReferenceRelease)?.is_some() {
+        return Err(AcquireError::Refused(
+            "reference or release record already exists",
+        ));
     }
     qualification::check_root_filter()?;
     let boot = snapshot::boot_session()?;
@@ -175,7 +489,10 @@ pub fn acquire_once() -> Result<AcquiredReference, AcquireError> {
     Ok(AcquiredReference {
         token: observed.token,
         creator_pid: observed.creator_pid,
-        _store: store,
+        acquisition_identity: observed.acquisition_identity,
+        boot_session: boot,
+        session,
+        store,
     })
 }
 
@@ -224,7 +541,7 @@ fn acquire_with(
         },
     };
     // Save the complete child return before interpreting its contents or querying PF again.
-    save(records, &receipt).map_err(|_| AcquireError::Unconfirmed)?;
+    let acquisition_identity = save(records, &receipt).map_err(|_| AcquireError::Unconfirmed)?;
     let Receipt::ChildReturn { stdout, stderr, .. } = &receipt.receipt else {
         return Err(AcquireError::Unconfirmed);
     };
@@ -239,6 +556,7 @@ fn acquire_with(
     Ok(ObservedReference {
         token,
         creator_pid: pid,
+        acquisition_identity,
     })
 }
 
@@ -262,6 +580,14 @@ mod tests {
             }
             self.saved.push(record.payload().to_vec());
             Ok(())
+        }
+    }
+    impl ReleaseRecords for Memory {
+        fn release_exists(&self) -> Result<bool, StoreError> {
+            self.existing()
+        }
+        fn save_release(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
+            self.save(record)
         }
     }
     fn child() -> ChildReturn {
@@ -306,6 +632,14 @@ mod tests {
         }
         fn save(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
             self.0.borrow_mut().save(record)
+        }
+    }
+    impl ReleaseRecords for TestRecords<'_> {
+        fn release_exists(&self) -> Result<bool, StoreError> {
+            self.0.borrow().release_exists()
+        }
+        fn save_release(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
+            self.0.borrow_mut().save_release(record)
         }
     }
 
@@ -394,5 +728,257 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    const BOOT: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+
+    fn stored(receipt: Receipt) -> Result<StoredRecord, AcquireError> {
+        let mut records = Memory::default();
+        save(
+            &mut records,
+            &Record {
+                version: 1,
+                boot_session: BOOT,
+                session: [1; 16],
+                receipt,
+            },
+        )?;
+        let payload = records.saved.remove(0);
+        let mut hash = Sha256::new();
+        hash.update(b"tunlatch-pf-reference-v1\0");
+        hash.update(&payload);
+        Ok(StoredRecord::new(
+            RecordIdentity::new(hash.finalize().into())?,
+            payload,
+        )?)
+    }
+
+    #[test]
+    fn inspection_reports_pending_and_old_boot_without_querying_pf() -> Result<(), AcquireError> {
+        let record = stored(Receipt::Intent)?;
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            inspect_saved(&record, BOOT, || {
+                called.set(true);
+                Ok(vec![])
+            })?,
+            ReferenceRecordStatus::AcquisitionUnconfirmed
+        );
+        assert_eq!(
+            inspect_saved(&record, "different boot", || {
+                called.set(true);
+                Ok(vec![])
+            })?,
+            ReferenceRecordStatus::RecordedBootDiffers
+        );
+        assert!(!called.get());
+        Ok(())
+    }
+
+    #[test]
+    fn inspection_requires_complete_matching_inventory_and_rejects_corruption()
+    -> Result<(), AcquireError> {
+        let record = stored(Receipt::ChildReturn {
+            pid: 123,
+            exit_code: Some(0),
+            stdout: b"Token : 42\n".to_vec(),
+            stderr: vec![],
+        })?;
+        assert_eq!(
+            inspect_saved(&record, BOOT, || Ok(LISTING.to_vec()))?,
+            ReferenceRecordStatus::ReferencePresent
+        );
+        assert_eq!(
+            inspect_saved(&record, BOOT, || Ok(
+                b"No pf starter references held\n".to_vec()
+            ))?,
+            ReferenceRecordStatus::ReferenceAbsent
+        );
+        assert!(inspect_saved(&record, BOOT, || Ok(b"incomplete".to_vec())).is_err());
+        let changed = StoredRecord::new(RecordIdentity::new([3; 32])?, record.payload().to_vec())?;
+        assert!(inspect_saved(&changed, BOOT, || Ok(LISTING.to_vec())).is_err());
+        let failed = stored(Receipt::ChildReturn {
+            pid: 123,
+            exit_code: Some(1),
+            stdout: b"Token : 42\n".to_vec(),
+            stderr: vec![],
+        })?;
+        assert_eq!(
+            inspect_saved(&failed, BOOT, || Ok(LISTING.to_vec()))?,
+            ReferenceRecordStatus::AcquisitionUnconfirmed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_records_intent_and_return_and_allows_foreign_references() -> Result<(), ReleaseError>
+    {
+        let records = RefCell::new(Memory::default());
+        let mut adapter = TestRecords(&records);
+        let token = reference::parse_acquisition(true, b"Token : 42\n", b"")
+            .map_err(|_| ReleaseError::Unconfirmed)?;
+        let reads = std::cell::Cell::new(0);
+        release_with(
+            &mut adapter,
+            BOOT,
+            [1; 16],
+            token,
+            123,
+            || {
+                let count = reads.get();
+                reads.set(count + 1);
+                if count == 0 {
+                    Ok(LISTING.to_vec())
+                } else {
+                    assert!(
+                        String::from_utf8_lossy(&records.borrow().saved[1])
+                            .contains("child_return")
+                    );
+                    Ok(
+                        b"TOKENS:\nPID Process Name TOKEN TIMESTAMP\n99 pfctl 43 0 days 00:00:01\n"
+                            .to_vec(),
+                    )
+                }
+            },
+            || {
+                assert!(String::from_utf8_lossy(&records.borrow().saved[0]).contains("intent"));
+                Ok(ChildReturn {
+                    pid: 124,
+                    exit_code: Some(0),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            },
+        )?;
+        assert_eq!(reads.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn release_never_retries_or_proceeds_without_a_valid_durable_intent() -> Result<(), ReleaseError>
+    {
+        let token = reference::parse_acquisition(true, b"Token : 42\n", b"")
+            .map_err(|_| ReleaseError::Unconfirmed)?;
+        for failure in [0, 1] {
+            let mut records = Memory {
+                saved: vec![],
+                fail_at: Some(failure),
+            };
+            let invoked = std::cell::Cell::new(false);
+            let result = release_with(
+                &mut records,
+                BOOT,
+                [1; 16],
+                token,
+                123,
+                || Ok(LISTING.to_vec()),
+                || {
+                    invoked.set(true);
+                    Err(ReleaseError::Unconfirmed)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(invoked.get(), failure == 1);
+            assert_eq!(records.saved.len(), failure);
+            if failure == 1 {
+                assert!(
+                    release_with(
+                        &mut records,
+                        BOOT,
+                        [1; 16],
+                        token,
+                        123,
+                        || Ok(LISTING.to_vec()),
+                        || Err(ReleaseError::Unconfirmed)
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let mut records = Memory::default();
+        let invoked = std::cell::Cell::new(false);
+        assert!(
+            release_with(
+                &mut records,
+                BOOT,
+                [1; 16],
+                token,
+                123,
+                || Ok(b"No pf starter references held\n".to_vec()),
+                || {
+                    invoked.set(true);
+                    Err(ReleaseError::Unconfirmed)
+                }
+            )
+            .is_err()
+        );
+        assert!(!invoked.get());
+        assert!(records.saved.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn release_return_requires_complete_successful_known_output() {
+        assert!(valid_release_return(Some(0), b"", b""));
+        assert!(valid_release_return(Some(0), b"", b"pf disabled\n"));
+        assert!(!valid_release_return(Some(1), b"", b""));
+        assert!(!valid_release_return(
+            Some(0),
+            b"pf disabled\n",
+            b"pf disabled\n"
+        ));
+        assert!(!valid_release_return(Some(0), b"unknown\n", b""));
+    }
+
+    #[test]
+    fn release_persists_child_before_postcheck_and_preserves_uncertainty()
+    -> Result<(), ReleaseError> {
+        let token = reference::parse_acquisition(true, b"Token : 42\n", b"")
+            .map_err(|_| ReleaseError::Unconfirmed)?;
+        let child_return = || {
+            Ok(ChildReturn {
+                pid: 124,
+                exit_code: Some(0),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        };
+        let reads = std::cell::Cell::new(0);
+        let mut records = Memory {
+            saved: vec![],
+            fail_at: Some(1),
+        };
+        assert!(matches!(
+            release_with(
+                &mut records,
+                BOOT,
+                [1; 16],
+                token,
+                123,
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok(LISTING.to_vec())
+                },
+                child_return
+            ),
+            Err(ReleaseError::Unconfirmed)
+        ));
+        assert_eq!(reads.get(), 1);
+        assert_eq!(records.saved.len(), 1);
+        let mut records = Memory::default();
+        assert!(matches!(
+            release_with(
+                &mut records,
+                BOOT,
+                [1; 16],
+                token,
+                123,
+                || Ok(LISTING.to_vec()),
+                child_return
+            ),
+            Err(ReleaseError::Unconfirmed)
+        ));
+        assert_eq!(records.saved.len(), 2);
+        Ok(())
     }
 }
