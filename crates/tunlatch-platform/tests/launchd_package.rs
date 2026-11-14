@@ -20,7 +20,11 @@ fn preview_has_fixed_private_resources_and_no_deployment_authority() {
             .all(|r| r.owner == "root" && r.group == "wheel")
     );
     let resource = |path: &str| preview.resources.iter().find(|r| r.path == path);
-    for kind in [RecordKind::Policy, RecordKind::Recovery] {
+    for kind in [
+        RecordKind::Policy,
+        RecordKind::Recovery,
+        RecordKind::PfReference,
+    ] {
         let path = format!("{SYSTEM_STORE_DIRECTORY}/{}", kind.file_name());
         assert!(resource(&path).is_some_and(|r| r.kind == ResourceKind::File && r.mode == 0o600));
     }
@@ -88,7 +92,7 @@ fn preview_has_fixed_private_resources_and_no_deployment_authority() {
             "{path}"
         );
     }
-    assert_eq!(preview.resources.len(), 15);
+    assert_eq!(preview.resources.len(), 16);
 }
 
 #[test]

@@ -102,30 +102,66 @@ fn valid_output(output: &[u8]) -> bool {
 // Fixed host-identity queries used to qualify the private PF ABI. Do not accept a path or
 // arguments from a caller: these identifiers are part of the trust boundary for native reads.
 pub(super) fn host_identity() -> Result<(String, String), SnapshotError> {
-    fn line(program: &str, argument: &[&str]) -> Result<String, SnapshotError> {
-        let mut command = Command::new(program);
-        command
-            .args(argument)
-            .env_clear()
-            .env("LC_ALL", "C")
-            .current_dir("/");
-        let result = run(command, TIMEOUT)?;
-        if !result.status.success() || !result.stderr.is_empty() || !valid_output(&result.stdout) {
-            return Err(SnapshotError::Incomplete);
-        }
-        let value = std::str::from_utf8(&result.stdout)
-            .map_err(|_| SnapshotError::Incomplete)?
-            .strip_suffix('\n')
-            .ok_or(SnapshotError::Incomplete)?;
-        if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
-            return Err(SnapshotError::Incomplete);
-        }
-        Ok(value.to_owned())
-    }
     Ok((
-        line("/usr/bin/sw_vers", &["-buildVersion"])?,
-        line("/usr/sbin/sysctl", &["-n", "kern.version"])?,
+        system_line("/usr/bin/sw_vers", &["-buildVersion"])?,
+        system_line("/usr/sbin/sysctl", &["-n", "kern.version"])?,
     ))
+}
+
+fn system_line(program: &str, argument: &[&str]) -> Result<String, SnapshotError> {
+    let mut command = Command::new(program);
+    command
+        .args(argument)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .current_dir("/");
+    let result = run(command, TIMEOUT)?;
+    if !result.status.success() || !result.stderr.is_empty() || !valid_output(&result.stdout) {
+        return Err(SnapshotError::Incomplete);
+    }
+    let value = std::str::from_utf8(&result.stdout)
+        .map_err(|_| SnapshotError::Incomplete)?
+        .strip_suffix('\n')
+        .ok_or(SnapshotError::Incomplete)?;
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(SnapshotError::Incomplete);
+    }
+    Ok(value.to_owned())
+}
+
+pub(super) fn boot_session() -> Result<String, SnapshotError> {
+    let value = system_line("/usr/sbin/sysctl", &["-n", "kern.bootsessionuuid"])?;
+    parse_boot_session(&value)
+}
+
+fn parse_boot_session(value: &str) -> Result<String, SnapshotError> {
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+        || value
+            .bytes()
+            .filter(|b| b.is_ascii_hexdigit())
+            .all(|b| b == b'0')
+    {
+        return Err(SnapshotError::Incomplete);
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+// This fixed mutating command is only available to the guarded reference acquisition path.
+pub(super) fn acquire_reference() -> Result<Return, SnapshotError> {
+    let mut command = Command::new("/sbin/pfctl");
+    command
+        .arg("-E")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .current_dir("/");
+    run(command, TIMEOUT)
 }
 
 fn anchor_name(session: &str) -> Result<String, SnapshotError> {
@@ -140,10 +176,11 @@ fn anchor_name(session: &str) -> Result<String, SnapshotError> {
     Ok(format!("tunlatch-lab-{session}"))
 }
 
-struct Return {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(super) struct Return {
+    pub(super) pid: u32,
+    pub(super) status: ExitStatus,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
 }
 
 enum Message {
@@ -215,6 +252,7 @@ fn run(mut command: Command, timeout: Duration) -> Result<Return, SnapshotError>
             && let Some(status) = status
         {
             break Ok(Return {
+                pid: child.id(),
                 status,
                 stdout: out,
                 stderr: err,
@@ -314,6 +352,24 @@ mod tests {
         assert!(valid_output(b""));
         for bad in [&b"pass out all"[..], b"\x1b[31m\n", b"\xff\n", b"line\r\n"] {
             assert!(!valid_output(bad));
+        }
+    }
+
+    #[test]
+    fn boot_session_requires_a_nonzero_canonical_uuid() {
+        assert_eq!(
+            parse_boot_session("ABCDEF01-2345-6789-ABCD-EF0123456789")
+                .ok()
+                .as_deref(),
+            Some("abcdef01-2345-6789-abcd-ef0123456789")
+        );
+        for invalid in [
+            "00000000-0000-0000-0000-000000000000",
+            "abcdef012345-6789-abcd-ef0123456789",
+            "abcdef01-2345-6789-abcd-ef012345678z",
+            "abcdef01-2345-6789-abcd-ef0123456789\n",
+        ] {
+            assert!(parse_boot_session(invalid).is_err());
         }
     }
 }

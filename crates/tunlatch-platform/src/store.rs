@@ -38,6 +38,8 @@ pub enum RecordKind {
     Policy,
     /// Recovery hints, not evidence that any policy is installed or verified.
     Recovery,
+    /// Private PF reference acquisition receipt and unresolved-operation record.
+    PfReference,
 }
 
 impl RecordKind {
@@ -46,6 +48,7 @@ impl RecordKind {
         match self {
             Self::Policy => "policy.record",
             Self::Recovery => "recovery.record",
+            Self::PfReference => "pf-reference.record",
         }
     }
 
@@ -53,6 +56,7 @@ impl RecordKind {
         match self {
             Self::Policy => "policy.pending",
             Self::Recovery => "recovery.pending",
+            Self::PfReference => "pf-reference.pending",
         }
     }
 
@@ -60,6 +64,7 @@ impl RecordKind {
         match self {
             Self::Policy => 1,
             Self::Recovery => 2,
+            Self::PfReference => 3,
         }
     }
 }

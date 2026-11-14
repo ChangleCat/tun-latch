@@ -1,10 +1,11 @@
-//! Read-only PF inspection and offline rule construction; enforcement is not implemented.
+//! PF inspection, rule construction and a guarded reference primitive; enforcement is incomplete.
 
 use tunlatch_core::status::{ObservedProtection, UnknownReason};
 
 pub mod hook_readback;
 pub mod qualification;
 pub mod reference;
+pub mod reference_acquire;
 pub mod rules;
 pub mod snapshot;
 

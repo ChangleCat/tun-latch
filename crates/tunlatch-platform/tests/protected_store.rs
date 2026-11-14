@@ -115,21 +115,32 @@ fn refuses_substituted_lock_files_and_preserves_an_existing_pending_file() -> Te
 }
 
 #[test]
-fn policy_and_recovery_slots_preserve_identity_and_reject_cross_slot_copies() -> TestResult {
+fn record_slots_preserve_identity_and_reject_cross_slot_copies() -> TestResult {
     let (_directory, path) = directory()?;
     let mut store = UserRecordStore::open(&path)?;
     let policy = record(1, b"opaque draft")?;
     let recovery = record(1, b"opaque recovery intent")?;
+    let reference = record(1, b"opaque PF reference intent")?;
     store.replace(RecordKind::Policy, &policy)?;
     store.replace(RecordKind::Recovery, &recovery)?;
+    store.replace(RecordKind::PfReference, &reference)?;
     assert_eq!(store.read(RecordKind::Policy)?, Some(policy));
     assert_eq!(store.read(RecordKind::Recovery)?, Some(recovery));
+    assert_eq!(store.read(RecordKind::PfReference)?, Some(reference));
     fs::copy(
         path.join(RecordKind::Policy.file_name()),
         path.join(RecordKind::Recovery.file_name()),
     )?;
     assert!(matches!(
         store.read(RecordKind::Recovery),
+        Err(StoreError::InvalidRecord(_))
+    ));
+    fs::copy(
+        path.join(RecordKind::Policy.file_name()),
+        path.join(RecordKind::PfReference.file_name()),
+    )?;
+    assert!(matches!(
+        store.read(RecordKind::PfReference),
         Err(StoreError::InvalidRecord(_))
     ));
     Ok(())
