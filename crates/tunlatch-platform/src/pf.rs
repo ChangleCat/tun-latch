@@ -1,6 +1,9 @@
-//! Explicitly unavailable PF adapter. No device is opened and no command is executed.
+//! PF adapter and offline rule construction. No device is opened and no command is executed.
 
 use tunlatch_core::status::{ObservedProtection, UnknownReason};
+
+pub mod reference;
+pub mod rules;
 
 #[cfg(test)]
 mod native_hook;
