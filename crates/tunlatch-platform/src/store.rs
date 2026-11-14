@@ -46,6 +46,10 @@ pub enum RecordKind {
     PfAnchorStage,
     /// Private PF root-hook insertion intent and receipt.
     PfHook,
+    /// Private PF root-hook removal intent and receipt.
+    PfHookRemoval,
+    /// Private PF anchor clearing intent and receipt.
+    PfAnchorClear,
 }
 
 impl RecordKind {
@@ -58,6 +62,8 @@ impl RecordKind {
             Self::PfReferenceRelease => "pf-reference-release.record",
             Self::PfAnchorStage => "pf-anchor-stage.record",
             Self::PfHook => "pf-hook.record",
+            Self::PfHookRemoval => "pf-hook-removal.record",
+            Self::PfAnchorClear => "pf-anchor-clear.record",
         }
     }
 
@@ -69,6 +75,8 @@ impl RecordKind {
             Self::PfReferenceRelease => "pf-reference-release.pending",
             Self::PfAnchorStage => "pf-anchor-stage.pending",
             Self::PfHook => "pf-hook.pending",
+            Self::PfHookRemoval => "pf-hook-removal.pending",
+            Self::PfAnchorClear => "pf-anchor-clear.pending",
         }
     }
 
@@ -80,6 +88,8 @@ impl RecordKind {
             Self::PfReferenceRelease => 4,
             Self::PfAnchorStage => 5,
             Self::PfHook => 6,
+            Self::PfHookRemoval => 7,
+            Self::PfAnchorClear => 8,
         }
     }
 }

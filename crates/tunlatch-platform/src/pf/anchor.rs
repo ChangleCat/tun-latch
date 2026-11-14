@@ -65,12 +65,224 @@ pub struct HookAuthorization {
     session: [u8; 16],
 }
 
+/// Authority to remove the exact hook after an explicit, verified shutdown decision.
+/// There is no constructor until the privileged control and resource-ownership checks exist.
+///
+/// ```compile_fail
+/// use tunlatch_platform::pf::anchor::DetachAuthorization;
+/// let _ = DetachAuthorization { session: [1; 16] };
+/// ```
+pub struct DetachAuthorization {
+    session: [u8; 16],
+}
+
+/// Authority to clear a detached, exclusively owned session anchor.
+/// The product currently provides no constructor for this authority.
+///
+/// ```compile_fail
+/// use tunlatch_platform::pf::anchor::ClearAuthorization;
+/// let _ = ClearAuthorization { session: [1; 16] };
+/// ```
+pub struct ClearAuthorization {
+    session: [u8; 16],
+}
+
 /// A root hook observed after insertion, without a claim of effective packet protection.
-#[derive(Debug)]
 pub struct AttachedAnchor {
     session: [u8; 16],
     index: u32,
     ticket: NonZeroU64,
+    interface: String,
+    stage_identity: RecordIdentity,
+    hook_identity: RecordIdentity,
+    root_before: Vec<u8>,
+}
+
+impl std::fmt::Debug for AttachedAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachedAnchor")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A verified removal of the session hook; its anchor rules may still exist.
+pub struct DetachedAnchor {
+    session: [u8; 16],
+    interface: String,
+    stage_identity: RecordIdentity,
+    removal_identity: RecordIdentity,
+    root_before: Vec<u8>,
+}
+
+impl std::fmt::Debug for DetachedAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DetachedAnchor")
+            .field("interface", &self.interface)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A cleared session anchor observed after the transaction; this is not release authority.
+#[derive(Debug)]
+pub struct ClearedAnchor {
+    session: [u8; 16],
+    clear_identity: RecordIdentity,
+}
+
+impl ClearedAnchor {
+    /// Name of the project anchor whose filter rules were cleared.
+    pub fn name(&self) -> String {
+        anchor_name(self.session)
+    }
+    /// Identity of the durable clear receipt; not an ownership or release capability.
+    pub fn record_identity(&self) -> RecordIdentity {
+        self.clear_identity
+    }
+}
+
+impl DetachedAnchor {
+    /// Name of the previously attached project anchor.
+    pub fn name(&self) -> String {
+        anchor_name(self.session)
+    }
+    /// Interface of the still-staged rule.
+    pub fn interface(&self) -> &str {
+        &self.interface
+    }
+
+    /// Clear only the detached session anchor's filter rules.
+    ///
+    /// The authority is currently unconstructible. Existing stage and removal receipts,
+    /// current root rules, hook absence, anchor contents and PF reference are checked first.
+    /// The transaction is recorded before submission; failures are never retried or cleaned up
+    /// here. This does not release the PF reference or prove ownership against foreign writers.
+    pub fn clear(
+        self,
+        owner: &mut AcquiredReference,
+        authorization: ClearAuthorization,
+    ) -> Result<ClearedAnchor, StageError> {
+        if self.session != owner.session || authorization.session != self.session {
+            return Err(StageError::Refused("anchor session mismatch"));
+        }
+        owner
+            .recheck_current()
+            .map_err(|_| StageError::Refused("PF reference session unavailable"))?;
+        for (kind, identity) in [
+            (RecordKind::PfAnchorStage, self.stage_identity),
+            (RecordKind::PfHookRemoval, self.removal_identity),
+        ] {
+            let record = owner
+                .store
+                .read(kind)?
+                .ok_or(StageError::Refused("original anchor record missing"))?;
+            if record.identity() != identity {
+                return Err(StageError::Refused("original anchor record changed"));
+            }
+        }
+        qualification::check_root_filter()
+            .map_err(|_| StageError::Refused("root filter qualification failed"))?;
+        let (build, kernel) = snapshot::host_identity()
+            .map_err(|_| StageError::Refused("host identity unavailable"))?;
+        let device: File = open(
+            "/dev/pf",
+            OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| StageError::Refused("cannot open PF device"))?
+        .into();
+        let suffix = suffix(self.session);
+        let name = self.name();
+        let writer = native_hook::Writer::new(&device, &build, &kernel, &suffix)
+            .map_err(|_| StageError::Refused("protected root writer unavailable"))?;
+        let leaf = || {
+            snapshot::query(snapshot::Query::AnchorRules { session: &suffix })
+                .map_err(|_| StageError::Unconfirmed)
+        };
+        let boot = owner.boot_session.clone();
+        let token = owner.token();
+        let pid = owner.creator_pid();
+        let check_reference = || -> Result<(), StageError> {
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot {
+                return Err(StageError::Unconfirmed);
+            }
+            let refs = snapshot::query(snapshot::Query::References)
+                .map_err(|_| StageError::Unconfirmed)?;
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot
+                || !reference::contains_reference(&refs, token, pid)
+                    .map_err(|_| StageError::Unconfirmed)?
+            {
+                return Err(StageError::Unconfirmed);
+            }
+            Ok(())
+        };
+        let verify_detached = || -> Result<(), StageError> {
+            check_reference()?;
+            if writer
+                .observe()
+                .map_err(|_| StageError::Unconfirmed)?
+                .is_some()
+            {
+                return Err(StageError::Unconfirmed);
+            }
+            let current =
+                snapshot::query(snapshot::Query::RootRules).map_err(|_| StageError::Unconfirmed)?;
+            hook_readback::verify_detached(
+                hook_readback::Observation {
+                    bytes: &self.root_before,
+                    complete: true,
+                },
+                hook_readback::Observation {
+                    bytes: &current,
+                    complete: true,
+                },
+                &name,
+            )
+            .map_err(|_| StageError::Unconfirmed)
+        };
+        verify_detached().map_err(|_| StageError::Refused("root hook or rules changed"))?;
+        if !matches_block(&leaf()?, &self.interface) {
+            return Err(StageError::Refused("staged anchor changed"));
+        }
+        let mut change = AnchorChange::new();
+        change.set_filter_rules(Vec::new());
+        let mut transaction = Transaction::new();
+        transaction.add_change(&name, change);
+        let context = ClearContext {
+            boot: &boot,
+            session: self.session,
+            interface: &self.interface,
+            stage_identity: self.stage_identity,
+            removal_identity: self.removal_identity,
+        };
+        let clear_identity = clear_with(
+            &mut owner.store,
+            &context,
+            || {
+                verify_detached()?;
+                if !matches_block(&leaf()?, &self.interface) {
+                    return Err(StageError::Unconfirmed);
+                }
+                transaction.commit().map_err(|_| StageError::Unconfirmed)
+            },
+            || {
+                verify_detached()?;
+                if !leaf()?.is_empty() {
+                    return Err(StageError::Unconfirmed);
+                }
+                Ok(())
+            },
+        )?;
+        owner
+            .recheck_current()
+            .map_err(|_| StageError::Unconfirmed)?;
+        Ok(ClearedAnchor {
+            session: self.session,
+            clear_identity,
+        })
+    }
 }
 
 impl AttachedAnchor {
@@ -85,6 +297,154 @@ impl AttachedAnchor {
     /// The nonzero per-rule ticket returned by the native insertion.
     pub fn ticket(&self) -> NonZeroU64 {
         self.ticket
+    }
+
+    /// Remove this exact root hook after an explicit, independently authorized shutdown.
+    ///
+    /// The authorization is currently unconstructible. The original session lock and
+    /// records must still match; intent is durable before deletion and the returned state
+    /// is independently checked. An uncertain result is never retried or cleaned up here.
+    /// This removes the hook but does not clear its anchor or release the PF reference.
+    pub fn detach(
+        self,
+        owner: &mut AcquiredReference,
+        authorization: DetachAuthorization,
+    ) -> Result<DetachedAnchor, StageError> {
+        if self.session != owner.session || authorization.session != self.session {
+            return Err(StageError::Refused("hook session mismatch"));
+        }
+        owner
+            .recheck_current()
+            .map_err(|_| StageError::Refused("PF reference session unavailable"))?;
+        for (kind, identity) in [
+            (RecordKind::PfAnchorStage, self.stage_identity),
+            (RecordKind::PfHook, self.hook_identity),
+        ] {
+            let record = owner
+                .store
+                .read(kind)?
+                .ok_or(StageError::Refused("original anchor record missing"))?;
+            if record.identity() != identity {
+                return Err(StageError::Refused("original anchor record changed"));
+            }
+        }
+        qualification::check_root_filter()
+            .map_err(|_| StageError::Refused("root filter qualification failed"))?;
+        let (build, kernel) = snapshot::host_identity()
+            .map_err(|_| StageError::Refused("host identity unavailable"))?;
+        let device: File = open(
+            "/dev/pf",
+            OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| StageError::Refused("cannot open PF device"))?
+        .into();
+        let suffix = suffix(self.session);
+        let name = self.name();
+        let writer = native_hook::Writer::new(&device, &build, &kernel, &suffix)
+            .map_err(|_| StageError::Refused("protected root writer unavailable"))?;
+        let leaf = || {
+            snapshot::query(snapshot::Query::AnchorRules { session: &suffix })
+                .map_err(|_| StageError::Unconfirmed)
+        };
+        let boot = owner.boot_session.clone();
+        let token = owner.token();
+        let pid = owner.creator_pid();
+        let check_reference = || -> Result<(), StageError> {
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot {
+                return Err(StageError::Unconfirmed);
+            }
+            let refs = snapshot::query(snapshot::Query::References)
+                .map_err(|_| StageError::Unconfirmed)?;
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot
+                || !reference::contains_reference(&refs, token, pid)
+                    .map_err(|_| StageError::Unconfirmed)?
+            {
+                return Err(StageError::Unconfirmed);
+            }
+            Ok(())
+        };
+        let verify_attached = || -> Result<(), StageError> {
+            check_reference()?;
+            if writer.observe().map_err(|_| StageError::Unconfirmed)?
+                != Some(native_hook::Hook {
+                    index: self.index,
+                    ticket: self.ticket,
+                })
+                || !matches_block(&leaf()?, &self.interface)
+            {
+                return Err(StageError::Unconfirmed);
+            }
+            let current =
+                snapshot::query(snapshot::Query::RootRules).map_err(|_| StageError::Unconfirmed)?;
+            hook_readback::verify(
+                hook_readback::Observation {
+                    bytes: &self.root_before,
+                    complete: true,
+                },
+                hook_readback::Observation {
+                    bytes: &current,
+                    complete: true,
+                },
+                &name,
+                self.index as usize,
+            )
+            .map_err(|_| StageError::Unconfirmed)
+        };
+        verify_attached().map_err(|_| StageError::Refused("original hook or rules changed"))?;
+        let context = RemovalContext {
+            boot: &boot,
+            session: self.session,
+            index: self.index,
+            ticket: self.ticket,
+            stage_identity: self.stage_identity,
+            hook_identity: self.hook_identity,
+        };
+        let removal_identity = remove_with(
+            &mut owner.store,
+            &context,
+            || {
+                verify_attached()?;
+                writer
+                    .remove(self.index, self.ticket)
+                    .map_err(|_| StageError::Unconfirmed)
+            },
+            || {
+                check_reference()?;
+                if writer
+                    .observe()
+                    .map_err(|_| StageError::Unconfirmed)?
+                    .is_some()
+                    || !matches_block(&leaf()?, &self.interface)
+                {
+                    return Err(StageError::Unconfirmed);
+                }
+                let current = snapshot::query(snapshot::Query::RootRules)
+                    .map_err(|_| StageError::Unconfirmed)?;
+                hook_readback::verify_detached(
+                    hook_readback::Observation {
+                        bytes: &self.root_before,
+                        complete: true,
+                    },
+                    hook_readback::Observation {
+                        bytes: &current,
+                        complete: true,
+                    },
+                    &name,
+                )
+                .map_err(|_| StageError::Unconfirmed)
+            },
+        )?;
+        owner
+            .recheck_current()
+            .map_err(|_| StageError::Unconfirmed)?;
+        Ok(DetachedAnchor {
+            session: self.session,
+            interface: self.interface,
+            stage_identity: self.stage_identity,
+            removal_identity,
+            root_before: self.root_before,
+        })
     }
 }
 
@@ -199,7 +559,7 @@ impl StagedAnchor {
             index,
             baseline: &baseline,
         };
-        let ticket = attach_with(
+        let (ticket, hook_identity) = attach_with(
             &mut owner.store,
             &context,
             || {
@@ -246,6 +606,10 @@ impl StagedAnchor {
             session: self.session,
             index,
             ticket,
+            interface: self.interface,
+            stage_identity: self.stage_identity,
+            hook_identity,
+            root_before: baseline,
         })
     }
 }
@@ -414,7 +778,10 @@ impl HookRecords for SystemRecordStore {
     }
 }
 
-fn save_hook(records: &mut impl HookRecords, record: &HookRecord<'_>) -> Result<(), StageError> {
+fn save_hook(
+    records: &mut impl HookRecords,
+    record: &HookRecord<'_>,
+) -> Result<RecordIdentity, StageError> {
     let payload =
         serde_json::to_vec(record).map_err(|_| StageError::Refused("cannot encode hook record"))?;
     let mut hash = Sha256::new();
@@ -422,7 +789,7 @@ fn save_hook(records: &mut impl HookRecords, record: &HookRecord<'_>) -> Result<
     hash.update(&payload);
     let identity = RecordIdentity::new(hash.finalize().into())?;
     records.save_hook(&StoredRecord::new(identity, payload)?)?;
-    Ok(())
+    Ok(identity)
 }
 
 fn attach_with(
@@ -430,7 +797,7 @@ fn attach_with(
     context: &HookContext<'_>,
     insert: impl FnOnce() -> Result<NonZeroU64, StageError>,
     observe: impl FnOnce(NonZeroU64) -> Result<(), StageError>,
-) -> Result<NonZeroU64, StageError> {
+) -> Result<(NonZeroU64, RecordIdentity), StageError> {
     if context.session == [0; 16] || context.boot.is_empty() || records.hook_exists()? {
         return Err(StageError::Refused("existing or invalid hook session"));
     }
@@ -447,9 +814,158 @@ fn attach_with(
     save_hook(records, &record)?;
     let ticket = insert().map_err(|_| StageError::Unconfirmed)?;
     record.ticket = Some(ticket.get());
-    save_hook(records, &record).map_err(|_| StageError::Unconfirmed)?;
+    let identity = save_hook(records, &record).map_err(|_| StageError::Unconfirmed)?;
     observe(ticket).map_err(|_| StageError::Unconfirmed)?;
-    Ok(ticket)
+    Ok((ticket, identity))
+}
+
+struct RemovalContext<'a> {
+    boot: &'a str,
+    session: [u8; 16],
+    index: u32,
+    ticket: NonZeroU64,
+    stage_identity: RecordIdentity,
+    hook_identity: RecordIdentity,
+}
+
+#[derive(Serialize)]
+struct RemovalRecord<'a> {
+    version: u8,
+    boot_session: &'a str,
+    session: [u8; 16],
+    index: u32,
+    ticket: u64,
+    stage_identity: String,
+    hook_identity: String,
+    stage: &'static str,
+}
+
+trait RemovalRecords {
+    fn removal_exists(&self) -> Result<bool, StoreError>;
+    fn save_removal(&mut self, value: &StoredRecord) -> Result<(), StoreError>;
+}
+
+impl RemovalRecords for SystemRecordStore {
+    fn removal_exists(&self) -> Result<bool, StoreError> {
+        Ok(self.read(RecordKind::PfHookRemoval)?.is_some())
+    }
+    fn save_removal(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+        self.replace(RecordKind::PfHookRemoval, value)
+    }
+}
+
+fn save_removal(
+    records: &mut impl RemovalRecords,
+    record: &RemovalRecord<'_>,
+) -> Result<RecordIdentity, StageError> {
+    let payload = serde_json::to_vec(record)
+        .map_err(|_| StageError::Refused("cannot encode hook removal record"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-hook-removal-v1\0");
+    hash.update(&payload);
+    let identity = RecordIdentity::new(hash.finalize().into())?;
+    records.save_removal(&StoredRecord::new(identity, payload)?)?;
+    Ok(identity)
+}
+
+fn remove_with(
+    records: &mut impl RemovalRecords,
+    context: &RemovalContext<'_>,
+    remove: impl FnOnce() -> Result<(), StageError>,
+    observe: impl FnOnce() -> Result<(), StageError>,
+) -> Result<RecordIdentity, StageError> {
+    if context.session == [0; 16] || context.boot.is_empty() || records.removal_exists()? {
+        return Err(StageError::Refused("existing or invalid hook removal"));
+    }
+    let mut record = RemovalRecord {
+        version: 1,
+        boot_session: context.boot,
+        session: context.session,
+        index: context.index,
+        ticket: context.ticket.get(),
+        stage_identity: context.stage_identity.to_string(),
+        hook_identity: context.hook_identity.to_string(),
+        stage: "intent",
+    };
+    save_removal(records, &record)?;
+    remove().map_err(|_| StageError::Unconfirmed)?;
+    record.stage = "returned";
+    let identity = save_removal(records, &record).map_err(|_| StageError::Unconfirmed)?;
+    observe().map_err(|_| StageError::Unconfirmed)?;
+    Ok(identity)
+}
+
+struct ClearContext<'a> {
+    boot: &'a str,
+    session: [u8; 16],
+    interface: &'a str,
+    stage_identity: RecordIdentity,
+    removal_identity: RecordIdentity,
+}
+
+#[derive(Serialize)]
+struct ClearRecord<'a> {
+    version: u8,
+    boot_session: &'a str,
+    session: [u8; 16],
+    interface: &'a str,
+    stage_identity: String,
+    removal_identity: String,
+    stage: &'static str,
+}
+
+trait ClearRecords {
+    fn clear_exists(&self) -> Result<bool, StoreError>;
+    fn save_clear(&mut self, value: &StoredRecord) -> Result<(), StoreError>;
+}
+
+impl ClearRecords for SystemRecordStore {
+    fn clear_exists(&self) -> Result<bool, StoreError> {
+        Ok(self.read(RecordKind::PfAnchorClear)?.is_some())
+    }
+    fn save_clear(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+        self.replace(RecordKind::PfAnchorClear, value)
+    }
+}
+
+fn save_clear(
+    records: &mut impl ClearRecords,
+    record: &ClearRecord<'_>,
+) -> Result<RecordIdentity, StageError> {
+    let payload = serde_json::to_vec(record)
+        .map_err(|_| StageError::Refused("cannot encode anchor clear record"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-anchor-clear-v1\0");
+    hash.update(&payload);
+    let identity = RecordIdentity::new(hash.finalize().into())?;
+    records.save_clear(&StoredRecord::new(identity, payload)?)?;
+    Ok(identity)
+}
+
+fn clear_with(
+    records: &mut impl ClearRecords,
+    context: &ClearContext<'_>,
+    submit: impl FnOnce() -> Result<(), StageError>,
+    observe: impl FnOnce() -> Result<(), StageError>,
+) -> Result<RecordIdentity, StageError> {
+    if context.session == [0; 16] || context.boot.is_empty() || records.clear_exists()? {
+        return Err(StageError::Refused("existing or invalid anchor clear"));
+    }
+    let mut record = ClearRecord {
+        version: 1,
+        boot_session: context.boot,
+        session: context.session,
+        interface: context.interface,
+        stage_identity: context.stage_identity.to_string(),
+        removal_identity: context.removal_identity.to_string(),
+        stage: "intent",
+    };
+    save_clear(records, &record)?;
+    submit().map_err(|_| StageError::Unconfirmed)?;
+    record.stage = "committed";
+    let identity = save_clear(records, &record).map_err(|_| StageError::Unconfirmed)?;
+    observe().map_err(|_| StageError::Unconfirmed)?;
+    Ok(identity)
 }
 
 fn matches_block(raw: &[u8], interface: &str) -> bool {
@@ -509,6 +1025,22 @@ mod tests {
             self.stage_exists()
         }
         fn save_hook(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+            self.save_stage(value)
+        }
+    }
+    impl RemovalRecords for Store<'_> {
+        fn removal_exists(&self) -> Result<bool, StoreError> {
+            self.stage_exists()
+        }
+        fn save_removal(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+            self.save_stage(value)
+        }
+    }
+    impl ClearRecords for Store<'_> {
+        fn clear_exists(&self) -> Result<bool, StoreError> {
+            self.stage_exists()
+        }
+        fn save_clear(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
             self.save_stage(value)
         }
     }
@@ -614,7 +1146,7 @@ mod tests {
                 Ok(())
             },
         )?;
-        assert_eq!(result, ticket);
+        assert_eq!(result.0, ticket);
         Ok(())
     }
 
@@ -648,6 +1180,176 @@ mod tests {
         assert!(!observed.get());
         assert_eq!(state.borrow().records.len(), 1);
         assert!(attach_with(&mut store, &context, || Ok(ticket), |_| Ok(())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_records_intents_before_mutations_and_receipts_before_reads()
+    -> Result<(), StageError> {
+        let stage_identity = RecordIdentity::new([1; 32])?;
+        let hook_identity = RecordIdentity::new([2; 32])?;
+        let ticket = NonZeroU64::new(42).ok_or(StageError::Unconfirmed)?;
+        let state = RefCell::new(Memory::default());
+        let mut store = Store(&state);
+        let removal = RemovalContext {
+            boot: "boot",
+            session: [3; 16],
+            index: 1,
+            ticket,
+            stage_identity,
+            hook_identity,
+        };
+        let removal_identity = remove_with(
+            &mut store,
+            &removal,
+            || {
+                assert!(String::from_utf8_lossy(&state.borrow().records[0]).contains("intent"));
+                Ok(())
+            },
+            || {
+                assert!(String::from_utf8_lossy(&state.borrow().records[1]).contains("returned"));
+                Ok(())
+            },
+        )?;
+        let state = RefCell::new(Memory::default());
+        let mut store = Store(&state);
+        let clear = ClearContext {
+            boot: "boot",
+            session: [3; 16],
+            interface: "en0",
+            stage_identity,
+            removal_identity,
+        };
+        clear_with(
+            &mut store,
+            &clear,
+            || {
+                assert!(String::from_utf8_lossy(&state.borrow().records[0]).contains("intent"));
+                Ok(())
+            },
+            || {
+                assert!(String::from_utf8_lossy(&state.borrow().records[1]).contains("committed"));
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_shutdown_observation_leaves_records_and_forbids_replay() -> Result<(), StageError> {
+        let stage_identity = RecordIdentity::new([1; 32])?;
+        let hook_identity = RecordIdentity::new([2; 32])?;
+        let ticket = NonZeroU64::new(42).ok_or(StageError::Unconfirmed)?;
+        let state = RefCell::new(Memory::default());
+        let mut store = Store(&state);
+        let removal = RemovalContext {
+            boot: "boot",
+            session: [3; 16],
+            index: 1,
+            ticket,
+            stage_identity,
+            hook_identity,
+        };
+        assert!(matches!(
+            remove_with(
+                &mut store,
+                &removal,
+                || Ok(()),
+                || Err(StageError::Unconfirmed)
+            ),
+            Err(StageError::Unconfirmed)
+        ));
+        assert_eq!(state.borrow().records.len(), 2);
+        let retried = Cell::new(false);
+        assert!(
+            remove_with(
+                &mut store,
+                &removal,
+                || {
+                    retried.set(true);
+                    Ok(())
+                },
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert!(!retried.get());
+        let state = RefCell::new(Memory {
+            records: vec![],
+            fail_at: Some(0),
+        });
+        let mut store = Store(&state);
+        let clear = ClearContext {
+            boot: "boot",
+            session: [3; 16],
+            interface: "en0",
+            stage_identity,
+            removal_identity: hook_identity,
+        };
+        let submitted = Cell::new(false);
+        assert!(
+            clear_with(
+                &mut store,
+                &clear,
+                || {
+                    submitted.set(true);
+                    Ok(())
+                },
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert!(!submitted.get());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_after_commit_failure_preserves_the_intent_and_does_not_retry()
+    -> Result<(), StageError> {
+        let state = RefCell::new(Memory {
+            records: vec![],
+            fail_at: Some(1),
+        });
+        let mut store = Store(&state);
+        let context = ClearContext {
+            boot: "boot",
+            session: [3; 16],
+            interface: "en0",
+            stage_identity: RecordIdentity::new([1; 32])?,
+            removal_identity: RecordIdentity::new([2; 32])?,
+        };
+        let submissions = Cell::new(0);
+        let observed = Cell::new(false);
+        assert!(matches!(
+            clear_with(
+                &mut store,
+                &context,
+                || {
+                    submissions.set(submissions.get() + 1);
+                    Ok(())
+                },
+                || {
+                    observed.set(true);
+                    Ok(())
+                }
+            ),
+            Err(StageError::Unconfirmed)
+        ));
+        assert_eq!(state.borrow().records.len(), 1);
+        assert!(!observed.get());
+        assert!(
+            clear_with(
+                &mut store,
+                &context,
+                || {
+                    submissions.set(submissions.get() + 1);
+                    Ok(())
+                },
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(submissions.get(), 1);
         Ok(())
     }
 }

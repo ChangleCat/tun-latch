@@ -235,7 +235,10 @@ pub fn inspect_record() -> Result<ReferenceRecordStatus, AcquireError> {
     if store.read(RecordKind::PfReferenceRelease)?.is_some() {
         return Ok(ReferenceRecordStatus::ReleaseRecordPresent);
     }
-    if store.read(RecordKind::PfHook)?.is_some() || store.read(RecordKind::PfAnchorStage)?.is_some()
+    if store.read(RecordKind::PfAnchorClear)?.is_some()
+        || store.read(RecordKind::PfHookRemoval)?.is_some()
+        || store.read(RecordKind::PfHook)?.is_some()
+        || store.read(RecordKind::PfAnchorStage)?.is_some()
     {
         return Ok(ReferenceRecordStatus::AnchorRecordPresent);
     }
@@ -478,6 +481,8 @@ pub fn acquire_once() -> Result<AcquiredReference, AcquireError> {
         || store.read(RecordKind::PfReferenceRelease)?.is_some()
         || store.read(RecordKind::PfAnchorStage)?.is_some()
         || store.read(RecordKind::PfHook)?.is_some()
+        || store.read(RecordKind::PfHookRemoval)?.is_some()
+        || store.read(RecordKind::PfAnchorClear)?.is_some()
     {
         return Err(AcquireError::Refused(
             "reference or release record already exists",

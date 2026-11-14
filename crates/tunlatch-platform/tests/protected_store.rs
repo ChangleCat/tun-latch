@@ -124,18 +124,24 @@ fn record_slots_preserve_identity_and_reject_cross_slot_copies() -> TestResult {
     let release = record(1, b"opaque PF reference release intent")?;
     let anchor = record(1, b"opaque PF anchor intent")?;
     let hook = record(1, b"opaque PF hook intent")?;
+    let removal = record(1, b"opaque PF hook removal intent")?;
+    let clear = record(1, b"opaque PF anchor clearing intent")?;
     store.replace(RecordKind::Policy, &policy)?;
     store.replace(RecordKind::Recovery, &recovery)?;
     store.replace(RecordKind::PfReference, &reference)?;
     store.replace(RecordKind::PfReferenceRelease, &release)?;
     store.replace(RecordKind::PfAnchorStage, &anchor)?;
     store.replace(RecordKind::PfHook, &hook)?;
+    store.replace(RecordKind::PfHookRemoval, &removal)?;
+    store.replace(RecordKind::PfAnchorClear, &clear)?;
     assert_eq!(store.read(RecordKind::Policy)?, Some(policy));
     assert_eq!(store.read(RecordKind::Recovery)?, Some(recovery));
     assert_eq!(store.read(RecordKind::PfReference)?, Some(reference));
     assert_eq!(store.read(RecordKind::PfReferenceRelease)?, Some(release));
     assert_eq!(store.read(RecordKind::PfAnchorStage)?, Some(anchor));
     assert_eq!(store.read(RecordKind::PfHook)?, Some(hook));
+    assert_eq!(store.read(RecordKind::PfHookRemoval)?, Some(removal));
+    assert_eq!(store.read(RecordKind::PfAnchorClear)?, Some(clear));
     fs::copy(
         path.join(RecordKind::Policy.file_name()),
         path.join(RecordKind::Recovery.file_name()),
@@ -174,6 +180,22 @@ fn record_slots_preserve_identity_and_reject_cross_slot_copies() -> TestResult {
     )?;
     assert!(matches!(
         store.read(RecordKind::PfHook),
+        Err(StoreError::InvalidRecord(_))
+    ));
+    fs::copy(
+        path.join(RecordKind::Policy.file_name()),
+        path.join(RecordKind::PfHookRemoval.file_name()),
+    )?;
+    assert!(matches!(
+        store.read(RecordKind::PfHookRemoval),
+        Err(StoreError::InvalidRecord(_))
+    ));
+    fs::copy(
+        path.join(RecordKind::Policy.file_name()),
+        path.join(RecordKind::PfAnchorClear.file_name()),
+    )?;
+    assert!(matches!(
+        store.read(RecordKind::PfAnchorClear),
         Err(StoreError::InvalidRecord(_))
     ));
     Ok(())
