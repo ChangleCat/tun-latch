@@ -2,6 +2,7 @@
 
 use tunlatch_core::status::{ObservedProtection, UnknownReason};
 
+pub mod anchor;
 pub mod hook_readback;
 pub mod qualification;
 pub mod reference;

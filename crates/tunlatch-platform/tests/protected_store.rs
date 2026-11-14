@@ -122,14 +122,20 @@ fn record_slots_preserve_identity_and_reject_cross_slot_copies() -> TestResult {
     let recovery = record(1, b"opaque recovery intent")?;
     let reference = record(1, b"opaque PF reference intent")?;
     let release = record(1, b"opaque PF reference release intent")?;
+    let anchor = record(1, b"opaque PF anchor intent")?;
+    let hook = record(1, b"opaque PF hook intent")?;
     store.replace(RecordKind::Policy, &policy)?;
     store.replace(RecordKind::Recovery, &recovery)?;
     store.replace(RecordKind::PfReference, &reference)?;
     store.replace(RecordKind::PfReferenceRelease, &release)?;
+    store.replace(RecordKind::PfAnchorStage, &anchor)?;
+    store.replace(RecordKind::PfHook, &hook)?;
     assert_eq!(store.read(RecordKind::Policy)?, Some(policy));
     assert_eq!(store.read(RecordKind::Recovery)?, Some(recovery));
     assert_eq!(store.read(RecordKind::PfReference)?, Some(reference));
     assert_eq!(store.read(RecordKind::PfReferenceRelease)?, Some(release));
+    assert_eq!(store.read(RecordKind::PfAnchorStage)?, Some(anchor));
+    assert_eq!(store.read(RecordKind::PfHook)?, Some(hook));
     fs::copy(
         path.join(RecordKind::Policy.file_name()),
         path.join(RecordKind::Recovery.file_name()),
@@ -152,6 +158,22 @@ fn record_slots_preserve_identity_and_reject_cross_slot_copies() -> TestResult {
     )?;
     assert!(matches!(
         store.read(RecordKind::PfReferenceRelease),
+        Err(StoreError::InvalidRecord(_))
+    ));
+    fs::copy(
+        path.join(RecordKind::Policy.file_name()),
+        path.join(RecordKind::PfAnchorStage.file_name()),
+    )?;
+    assert!(matches!(
+        store.read(RecordKind::PfAnchorStage),
+        Err(StoreError::InvalidRecord(_))
+    ));
+    fs::copy(
+        path.join(RecordKind::Policy.file_name()),
+        path.join(RecordKind::PfHook.file_name()),
+    )?;
+    assert!(matches!(
+        store.read(RecordKind::PfHook),
         Err(StoreError::InvalidRecord(_))
     ));
     Ok(())

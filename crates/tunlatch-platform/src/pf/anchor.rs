@@ -1,0 +1,653 @@
+//! Guarded PF anchor rule staging for the retained product session.
+//!
+//! Staging does not attach the anchor or prove that traffic is filtered. Its authorization has
+//! no constructor until the privileged backend can establish resource ownership and scope.
+
+use std::fs::File;
+use std::num::NonZeroU64;
+
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
+use pfctl::{AnchorChange, Transaction};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use super::{
+    hook_readback, native_hook, qualification, reference, reference_acquire::AcquiredReference,
+    rules, snapshot,
+};
+use crate::store::{RecordIdentity, RecordKind, StoreError, StoredRecord, SystemRecordStore};
+
+/// Authority to stage a rule for one approved interface and one live PF session.
+///
+/// No constructor is provided until the privileged backend verifies the interface, fresh anchor,
+/// execution scope and writer coordination. Configuration or interface names do not grant it.
+///
+/// ```compile_fail
+/// use tunlatch_platform::pf::anchor::StageAuthorization;
+/// let _ = StageAuthorization { session: [1; 16], interface: "en0".into() };
+/// ```
+pub struct StageAuthorization {
+    session: [u8; 16],
+    interface: String,
+}
+
+/// Error while recording, submitting or observing an anchor rule transaction.
+#[derive(Debug, thiserror::Error)]
+pub enum StageError {
+    /// The protected record could not be accessed before submission.
+    #[error("PF anchor record error: {0}")]
+    Store(#[from] StoreError),
+    /// The session, scope, candidate or existing record was not acceptable.
+    #[error("PF anchor operation refused: {0}")]
+    Refused(&'static str),
+    /// A PF write may have occurred but the complete outcome was not confirmed.
+    #[error("PF anchor operation outcome is unconfirmed; inspect the protected record")]
+    Unconfirmed,
+}
+
+/// A successful stage and independent rule readback, not a protection capability.
+#[derive(Debug)]
+pub struct StagedAnchor {
+    session: [u8; 16],
+    interface: String,
+    stage_identity: RecordIdentity,
+}
+
+/// Authority to attach the staged anchor after checking root rules and writer coordination.
+/// No constructor is available until those guarantees are established by the real backend.
+///
+/// ```compile_fail
+/// use tunlatch_platform::pf::anchor::HookAuthorization;
+/// let _ = HookAuthorization { session: [1; 16] };
+/// ```
+pub struct HookAuthorization {
+    session: [u8; 16],
+}
+
+/// A root hook observed after insertion, without a claim of effective packet protection.
+#[derive(Debug)]
+pub struct AttachedAnchor {
+    session: [u8; 16],
+    index: u32,
+    ticket: NonZeroU64,
+}
+
+impl AttachedAnchor {
+    /// Name of the attached project anchor.
+    pub fn name(&self) -> String {
+        anchor_name(self.session)
+    }
+    /// Observed native filter index; subsequent changes can invalidate it.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+    /// The nonzero per-rule ticket returned by the native insertion.
+    pub fn ticket(&self) -> NonZeroU64 {
+        self.ticket
+    }
+}
+
+impl StagedAnchor {
+    /// The product-owned anchor name corresponding to this staged session.
+    pub fn name(&self) -> String {
+        anchor_name(self.session)
+    }
+    /// Interface selected by the staged rule; identity and ongoing ownership are not proved.
+    pub fn interface(&self) -> &str {
+        &self.interface
+    }
+
+    /// Attach this staged anchor through the fixed native root-filter insertion.
+    ///
+    /// The authorization cannot currently be constructed. Intent and the returned per-rule
+    /// ticket are durably recorded before independent native and textual readback. An error
+    /// after insertion never triggers removal or retry. The fixed system daemon and its parent
+    /// path must be root-owned and protected. This does not prove traffic is protected.
+    pub fn attach(
+        self,
+        owner: &mut AcquiredReference,
+        authorization: HookAuthorization,
+    ) -> Result<AttachedAnchor, StageError> {
+        if self.session != owner.session || authorization.session != self.session {
+            return Err(StageError::Refused("hook session mismatch"));
+        }
+        owner
+            .recheck_current()
+            .map_err(|_| StageError::Refused("PF reference session unavailable"))?;
+        let stage = owner
+            .store
+            .read(RecordKind::PfAnchorStage)?
+            .ok_or(StageError::Refused("anchor stage record missing"))?;
+        if stage.identity() != self.stage_identity {
+            return Err(StageError::Refused("anchor stage record changed"));
+        }
+        qualification::check_root_filter()
+            .map_err(|_| StageError::Refused("root filter qualification failed"))?;
+        let (build, kernel) = snapshot::host_identity()
+            .map_err(|_| StageError::Refused("host identity unavailable"))?;
+        let device: File = open(
+            "/dev/pf",
+            OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| StageError::Refused("cannot open PF device"))?
+        .into();
+        let suffix = suffix(self.session);
+        let name = self.name();
+        let writer = native_hook::Writer::new(&device, &build, &kernel, &suffix)
+            .map_err(|_| StageError::Refused("protected root writer unavailable"))?;
+        let index = writer
+            .index()
+            .map_err(|_| StageError::Refused("root insertion position unavailable"))?;
+        if writer
+            .observe()
+            .map_err(|_| StageError::Refused("root hook observation failed"))?
+            .is_some()
+        {
+            return Err(StageError::Refused("root hook already exists"));
+        }
+        let baseline = snapshot::query(snapshot::Query::RootRules)
+            .map_err(|_| StageError::Refused("root rules unavailable"))?;
+        let text_rules = native_hook::parse_rules(&baseline)
+            .map_err(|_| StageError::Refused("unsupported root rules"))?;
+        let native_rules = native_hook::readonly_rules(&device, &build, &kernel)
+            .map_err(|_| StageError::Refused("native root read failed"))?;
+        if text_rules != native_rules
+            || snapshot::query(snapshot::Query::RootRules)
+                .map_err(|_| StageError::Refused("root rules unavailable"))?
+                != baseline
+        {
+            return Err(StageError::Refused("root rules changed during inspection"));
+        }
+        hook_readback::validate_index(
+            hook_readback::Observation {
+                bytes: &baseline,
+                complete: true,
+            },
+            &name,
+            index as usize,
+        )
+        .map_err(StageError::Refused)?;
+        let leaf = || {
+            snapshot::query(snapshot::Query::AnchorRules { session: &suffix })
+                .map_err(|_| StageError::Unconfirmed)
+        };
+        if !matches_block(&leaf()?, &self.interface) {
+            return Err(StageError::Refused("staged anchor changed"));
+        }
+        let boot = owner.boot_session.clone();
+        let token = owner.token();
+        let pid = owner.creator_pid();
+        let check_reference = || -> Result<(), StageError> {
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot {
+                return Err(StageError::Unconfirmed);
+            }
+            let refs = snapshot::query(snapshot::Query::References)
+                .map_err(|_| StageError::Unconfirmed)?;
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot
+                || !reference::contains_reference(&refs, token, pid)
+                    .map_err(|_| StageError::Unconfirmed)?
+            {
+                return Err(StageError::Unconfirmed);
+            }
+            Ok(())
+        };
+        let context = HookContext {
+            boot: &boot,
+            session: self.session,
+            index,
+            baseline: &baseline,
+        };
+        let ticket = attach_with(
+            &mut owner.store,
+            &context,
+            || {
+                check_reference()?;
+                if snapshot::query(snapshot::Query::RootRules)
+                    .map_err(|_| StageError::Unconfirmed)?
+                    != baseline
+                    || !matches_block(&leaf()?, &self.interface)
+                {
+                    return Err(StageError::Unconfirmed);
+                }
+                writer.insert(index).map_err(|_| StageError::Unconfirmed)
+            },
+            |ticket| {
+                check_reference()?;
+                if writer.observe().map_err(|_| StageError::Unconfirmed)?
+                    != Some(native_hook::Hook { index, ticket })
+                    || !matches_block(&leaf()?, &self.interface)
+                {
+                    return Err(StageError::Unconfirmed);
+                }
+                let current = snapshot::query(snapshot::Query::RootRules)
+                    .map_err(|_| StageError::Unconfirmed)?;
+                hook_readback::verify(
+                    hook_readback::Observation {
+                        bytes: &baseline,
+                        complete: true,
+                    },
+                    hook_readback::Observation {
+                        bytes: &current,
+                        complete: true,
+                    },
+                    &name,
+                    index as usize,
+                )
+                .map_err(|_| StageError::Unconfirmed)?;
+                Ok(())
+            },
+        )?;
+        owner
+            .recheck_current()
+            .map_err(|_| StageError::Unconfirmed)?;
+        Ok(AttachedAnchor {
+            session: self.session,
+            index,
+            ticket,
+        })
+    }
+}
+
+impl AcquiredReference {
+    /// Stage one stateless outbound drop rule in the session anchor using a PF transaction.
+    ///
+    /// The authorization is currently unconstructible. The protected session lock is retained,
+    /// intent is persisted before submission, and one independent readback follows. Neither a
+    /// successful transaction nor this readback verifies root attachment, TUN identity, old
+    /// states or effective protection. The synchronous PF transaction may block indefinitely.
+    pub fn stage_anchor(
+        &mut self,
+        authorization: StageAuthorization,
+    ) -> Result<StagedAnchor, StageError> {
+        if authorization.session != self.session {
+            return Err(StageError::Refused("authorization session mismatch"));
+        }
+        let interface = authorization.interface;
+        let rule = rules::outbound_block(&interface)
+            .map_err(|_| StageError::Refused("invalid interface or rule"))?;
+        self.recheck_current()
+            .map_err(|_| StageError::Refused("PF reference session unavailable"))?;
+        let session = self.session;
+        let boot = self.boot_session.clone();
+        let suffix = suffix(session);
+        let token = self.token();
+        let pid = self.creator_pid();
+        let mut change = AnchorChange::new();
+        change.set_filter_rules(vec![rule]);
+        let mut transaction = Transaction::new();
+        transaction.add_change(&anchor_name(session), change);
+        let read = || {
+            snapshot::query(snapshot::Query::AnchorRules { session: &suffix })
+                .map_err(|_| StageError::Unconfirmed)
+        };
+        let stage_identity = stage_with(&mut self.store, &boot, session, &interface, read, || {
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot {
+                return Err(StageError::Unconfirmed);
+            }
+            let listing = snapshot::query(snapshot::Query::References)
+                .map_err(|_| StageError::Unconfirmed)?;
+            if snapshot::boot_session().map_err(|_| StageError::Unconfirmed)? != boot
+                || !reference::contains_reference(&listing, token, pid)
+                    .map_err(|_| StageError::Unconfirmed)?
+            {
+                return Err(StageError::Unconfirmed);
+            }
+            transaction.commit().map_err(|_| StageError::Unconfirmed)
+        })?;
+        self.recheck_current()
+            .map_err(|_| StageError::Unconfirmed)?;
+        Ok(StagedAnchor {
+            session,
+            interface,
+            stage_identity,
+        })
+    }
+}
+
+fn suffix(session: [u8; 16]) -> String {
+    session.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn anchor_name(session: [u8; 16]) -> String {
+    format!("tunlatch-lab-{}", suffix(session))
+}
+
+#[derive(Serialize)]
+struct StageRecord<'a> {
+    version: u8,
+    boot_session: &'a str,
+    session: [u8; 16],
+    interface: &'a str,
+    stage: &'static str,
+}
+
+trait StageRecords {
+    fn stage_exists(&self) -> Result<bool, StoreError>;
+    fn save_stage(&mut self, value: &StoredRecord) -> Result<(), StoreError>;
+}
+
+impl StageRecords for SystemRecordStore {
+    fn stage_exists(&self) -> Result<bool, StoreError> {
+        Ok(self.read(RecordKind::PfAnchorStage)?.is_some())
+    }
+    fn save_stage(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+        self.replace(RecordKind::PfAnchorStage, value)
+    }
+}
+
+fn save(
+    records: &mut impl StageRecords,
+    record: &StageRecord<'_>,
+) -> Result<RecordIdentity, StageError> {
+    let payload = serde_json::to_vec(record)
+        .map_err(|_| StageError::Refused("cannot encode stage record"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-anchor-stage-v1\0");
+    hash.update(&payload);
+    let identity = RecordIdentity::new(hash.finalize().into())?;
+    records.save_stage(&StoredRecord::new(identity, payload)?)?;
+    Ok(identity)
+}
+
+fn stage_with(
+    records: &mut impl StageRecords,
+    boot: &str,
+    session: [u8; 16],
+    interface: &str,
+    read: impl Fn() -> Result<Vec<u8>, StageError>,
+    submit: impl FnOnce() -> Result<(), StageError>,
+) -> Result<RecordIdentity, StageError> {
+    if session == [0; 16] || boot.is_empty() || records.stage_exists()? {
+        return Err(StageError::Refused("existing or invalid anchor session"));
+    }
+    if !read()?.is_empty() {
+        return Err(StageError::Refused("anchor is not empty"));
+    }
+    let mut record = StageRecord {
+        version: 1,
+        boot_session: boot,
+        session,
+        interface,
+        stage: "intent",
+    };
+    save(records, &record)?;
+    submit().map_err(|_| StageError::Unconfirmed)?;
+    record.stage = "committed";
+    let identity = save(records, &record).map_err(|_| StageError::Unconfirmed)?;
+    let observed = read().map_err(|_| StageError::Unconfirmed)?;
+    if !matches_block(&observed, interface) {
+        return Err(StageError::Unconfirmed);
+    }
+    Ok(identity)
+}
+
+struct HookContext<'a> {
+    boot: &'a str,
+    session: [u8; 16],
+    index: u32,
+    baseline: &'a [u8],
+}
+
+#[derive(Serialize)]
+struct HookRecord<'a> {
+    version: u8,
+    boot_session: &'a str,
+    session: [u8; 16],
+    index: u32,
+    root_before: &'a str,
+    ticket: Option<u64>,
+}
+
+trait HookRecords {
+    fn hook_exists(&self) -> Result<bool, StoreError>;
+    fn save_hook(&mut self, value: &StoredRecord) -> Result<(), StoreError>;
+}
+
+impl HookRecords for SystemRecordStore {
+    fn hook_exists(&self) -> Result<bool, StoreError> {
+        Ok(self.read(RecordKind::PfHook)?.is_some())
+    }
+    fn save_hook(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+        self.replace(RecordKind::PfHook, value)
+    }
+}
+
+fn save_hook(records: &mut impl HookRecords, record: &HookRecord<'_>) -> Result<(), StageError> {
+    let payload =
+        serde_json::to_vec(record).map_err(|_| StageError::Refused("cannot encode hook record"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-hook-v1\0");
+    hash.update(&payload);
+    let identity = RecordIdentity::new(hash.finalize().into())?;
+    records.save_hook(&StoredRecord::new(identity, payload)?)?;
+    Ok(())
+}
+
+fn attach_with(
+    records: &mut impl HookRecords,
+    context: &HookContext<'_>,
+    insert: impl FnOnce() -> Result<NonZeroU64, StageError>,
+    observe: impl FnOnce(NonZeroU64) -> Result<(), StageError>,
+) -> Result<NonZeroU64, StageError> {
+    if context.session == [0; 16] || context.boot.is_empty() || records.hook_exists()? {
+        return Err(StageError::Refused("existing or invalid hook session"));
+    }
+    let baseline = std::str::from_utf8(context.baseline)
+        .map_err(|_| StageError::Refused("invalid root baseline"))?;
+    let mut record = HookRecord {
+        version: 1,
+        boot_session: context.boot,
+        session: context.session,
+        index: context.index,
+        root_before: baseline,
+        ticket: None,
+    };
+    save_hook(records, &record)?;
+    let ticket = insert().map_err(|_| StageError::Unconfirmed)?;
+    record.ticket = Some(ticket.get());
+    save_hook(records, &record).map_err(|_| StageError::Unconfirmed)?;
+    observe(ticket).map_err(|_| StageError::Unconfirmed)?;
+    Ok(ticket)
+}
+
+fn matches_block(raw: &[u8], interface: &str) -> bool {
+    if raw.len() > 512
+        || !raw.is_ascii()
+        || !raw.ends_with(b"\n")
+        || raw
+            .iter()
+            .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\t'))
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    let words: Vec<_> = line.split_ascii_whitespace().collect();
+    words == ["block", "drop", "out", "quick", "on", interface, "all"]
+        || words
+            == [
+                "block", "drop", "out", "quick", "on", interface, "all", "no", "state",
+            ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Default)]
+    struct Memory {
+        records: Vec<Vec<u8>>,
+        fail_at: Option<usize>,
+    }
+    struct Store<'a>(&'a RefCell<Memory>);
+    impl StageRecords for Store<'_> {
+        fn stage_exists(&self) -> Result<bool, StoreError> {
+            Ok(!self.0.borrow().records.is_empty())
+        }
+        fn save_stage(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+            let mut state = self.0.borrow_mut();
+            if state.fail_at == Some(state.records.len()) {
+                return Err(StoreError::Refused("injected failure"));
+            }
+            state.records.push(value.payload().to_vec());
+            Ok(())
+        }
+    }
+    impl HookRecords for Store<'_> {
+        fn hook_exists(&self) -> Result<bool, StoreError> {
+            self.stage_exists()
+        }
+        fn save_hook(&mut self, value: &StoredRecord) -> Result<(), StoreError> {
+            self.save_stage(value)
+        }
+    }
+    #[test]
+    fn stages_only_after_intent_and_checks_independent_rules() -> Result<(), StageError> {
+        let state = RefCell::new(Memory::default());
+        let mut store = Store(&state);
+        let reads = Cell::new(0);
+        stage_with(
+            &mut store,
+            "boot",
+            [1; 16],
+            "en0",
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n == 0 {
+                    Ok(vec![])
+                } else {
+                    assert!(
+                        String::from_utf8_lossy(&state.borrow().records[1]).contains("committed")
+                    );
+                    Ok(b"block drop out quick on en0 all\n".to_vec())
+                }
+            },
+            || {
+                assert!(String::from_utf8_lossy(&state.borrow().records[0]).contains("intent"));
+                Ok(())
+            },
+        )?;
+        assert_eq!(reads.get(), 2);
+        Ok(())
+    }
+    #[test]
+    fn failure_retains_intent_and_prevents_replay() {
+        let state = RefCell::new(Memory {
+            records: vec![],
+            fail_at: Some(1),
+        });
+        let mut store = Store(&state);
+        let reads = Cell::new(0);
+        let result = stage_with(
+            &mut store,
+            "boot",
+            [1; 16],
+            "en0",
+            || {
+                reads.set(reads.get() + 1);
+                Ok(vec![])
+            },
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(StageError::Unconfirmed)));
+        assert_eq!(reads.get(), 1);
+        assert_eq!(state.borrow().records.len(), 1);
+        assert!(stage_with(&mut store, "boot", [1; 16], "en0", || Ok(vec![]), || Ok(())).is_err());
+    }
+    #[test]
+    fn rule_reader_rejects_broader_or_changed_rules() {
+        for valid in [
+            "block drop out quick on en0 all\n",
+            "block drop out quick on en0 all no state\n",
+        ] {
+            assert!(matches_block(valid.as_bytes(), "en0"));
+        }
+        for invalid in [
+            "block drop out on en0 all\n",
+            "pass out quick on en0 all\n",
+            "block drop out quick on en1 all\n",
+            "block drop out quick on en0 all keep state\n",
+            "block drop out quick on en0 all\npass all\n",
+            "block drop out quick on en0 all",
+        ] {
+            assert!(!matches_block(invalid.as_bytes(), "en0"));
+        }
+    }
+
+    #[test]
+    fn hook_receipt_is_durable_before_independent_observation() -> Result<(), StageError> {
+        let state = RefCell::new(Memory::default());
+        let mut store = Store(&state);
+        let context = HookContext {
+            boot: "boot",
+            session: [1; 16],
+            index: 1,
+            baseline: b"pass all\n",
+        };
+        let ticket = NonZeroU64::new(42).ok_or(StageError::Unconfirmed)?;
+        let result = attach_with(
+            &mut store,
+            &context,
+            || {
+                assert!(
+                    String::from_utf8_lossy(&state.borrow().records[0]).contains("\"ticket\":null")
+                );
+                Ok(ticket)
+            },
+            |observed| {
+                assert_eq!(observed, ticket);
+                assert!(
+                    String::from_utf8_lossy(&state.borrow().records[1]).contains("\"ticket\":42")
+                );
+                Ok(())
+            },
+        )?;
+        assert_eq!(result, ticket);
+        Ok(())
+    }
+
+    #[test]
+    fn hook_unconfirmed_after_insert_is_never_replayed() -> Result<(), StageError> {
+        let state = RefCell::new(Memory {
+            records: vec![],
+            fail_at: Some(1),
+        });
+        let mut store = Store(&state);
+        let context = HookContext {
+            boot: "boot",
+            session: [1; 16],
+            index: 1,
+            baseline: b"pass all\n",
+        };
+        let ticket = NonZeroU64::new(42).ok_or(StageError::Unconfirmed)?;
+        let observed = Cell::new(false);
+        assert!(matches!(
+            attach_with(
+                &mut store,
+                &context,
+                || Ok(ticket),
+                |_| {
+                    observed.set(true);
+                    Ok(())
+                }
+            ),
+            Err(StageError::Unconfirmed)
+        ));
+        assert!(!observed.get());
+        assert_eq!(state.borrow().records.len(), 1);
+        assert!(attach_with(&mut store, &context, || Ok(ticket), |_| Ok(())).is_err());
+        Ok(())
+    }
+}

@@ -1,11 +1,10 @@
-//! Experimental root filter hook ABI. Writes are confined to the fixed protected trial.
+//! Qualified root filter hook ABI. Writes are confined to the fixed protected product daemon.
 
 use std::fs::{File, symlink_metadata};
 use std::io;
 use std::num::NonZeroU64;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
 
 use nix::libc;
 
@@ -351,13 +350,8 @@ impl<'a> Writer<'a> {
 }
 
 fn check_writer_location() -> Result<()> {
-    if !nix::unistd::geteuid().is_root()
-        || std::env::current_exe()?
-            != Path::new("/private/var/root/tunlatch-pf-first-flow/pf-lab-first-flow")
-    {
-        return Err(Error::Refused("requires fixed protected writer executable"));
-    }
-    Ok(())
+    crate::store::check_fixed_daemon()
+        .map_err(|_| Error::Refused("requires fixed protected product daemon"))
 }
 
 /// Static candidate layout gate. Identifiers must come from the current host. Matching

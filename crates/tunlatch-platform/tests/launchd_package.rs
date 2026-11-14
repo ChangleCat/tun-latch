@@ -25,6 +25,8 @@ fn preview_has_fixed_private_resources_and_no_deployment_authority() {
         RecordKind::Recovery,
         RecordKind::PfReference,
         RecordKind::PfReferenceRelease,
+        RecordKind::PfAnchorStage,
+        RecordKind::PfHook,
     ] {
         let path = format!("{SYSTEM_STORE_DIRECTORY}/{}", kind.file_name());
         assert!(resource(&path).is_some_and(|r| r.kind == ResourceKind::File && r.mode == 0o600));
@@ -93,7 +95,7 @@ fn preview_has_fixed_private_resources_and_no_deployment_authority() {
             "{path}"
         );
     }
-    assert_eq!(preview.resources.len(), 17);
+    assert_eq!(preview.resources.len(), 19);
 }
 
 #[test]

@@ -42,6 +42,10 @@ pub enum RecordKind {
     PfReference,
     /// Private PF reference release receipt and unresolved-operation record.
     PfReferenceRelease,
+    /// Private PF anchor transaction intent and receipt.
+    PfAnchorStage,
+    /// Private PF root-hook insertion intent and receipt.
+    PfHook,
 }
 
 impl RecordKind {
@@ -52,6 +56,8 @@ impl RecordKind {
             Self::Recovery => "recovery.record",
             Self::PfReference => "pf-reference.record",
             Self::PfReferenceRelease => "pf-reference-release.record",
+            Self::PfAnchorStage => "pf-anchor-stage.record",
+            Self::PfHook => "pf-hook.record",
         }
     }
 
@@ -61,6 +67,8 @@ impl RecordKind {
             Self::Recovery => "recovery.pending",
             Self::PfReference => "pf-reference.pending",
             Self::PfReferenceRelease => "pf-reference-release.pending",
+            Self::PfAnchorStage => "pf-anchor-stage.pending",
+            Self::PfHook => "pf-hook.pending",
         }
     }
 
@@ -70,6 +78,8 @@ impl RecordKind {
             Self::Recovery => 2,
             Self::PfReference => 3,
             Self::PfReferenceRelease => 4,
+            Self::PfAnchorStage => 5,
+            Self::PfHook => 6,
         }
     }
 }
@@ -472,10 +482,20 @@ struct DirectoryChain {
     directories: Vec<(PathBuf, File)>,
     owner: u32,
     system: bool,
+    private_leaf: bool,
 }
 
 impl DirectoryChain {
     fn open(path: &Path, owner: u32, system: bool) -> Result<Self, StoreError> {
+        Self::open_with_leaf(path, owner, system, true)
+    }
+
+    fn open_with_leaf(
+        path: &Path,
+        owner: u32,
+        system: bool,
+        private_leaf: bool,
+    ) -> Result<Self, StoreError> {
         if !path.is_absolute() || path.as_os_str().len() > 1024 {
             return Err(StoreError::Refused(
                 "store requires a bounded absolute path",
@@ -487,6 +507,7 @@ impl DirectoryChain {
             directories: vec![(PathBuf::from("/"), root)],
             owner,
             system,
+            private_leaf,
         };
         for component in path.components().skip(1) {
             let Component::Normal(name) = component else {
@@ -528,7 +549,13 @@ impl DirectoryChain {
         for (index, (path, file)) in self.directories.iter().enumerate() {
             let metadata = file.metadata()?;
             let leaf = index + 1 == self.directories.len();
-            check_directory(&metadata, self.owner, self.system, path, leaf)?;
+            check_directory(
+                &metadata,
+                self.owner,
+                self.system,
+                path,
+                leaf && self.private_leaf,
+            )?;
             check_empty_acl(file, path)?;
             if index > 0 {
                 let parent = &self.directories[index - 1].1;
@@ -560,6 +587,40 @@ impl DirectoryChain {
         }
         Ok(())
     }
+}
+
+// The live hook writer is confined to the future root-installed product daemon. Check every
+// path component with held descriptors and empty ACLs, just as for protected records. This
+// does not establish a code signature or defend against malicious root replacement.
+pub(crate) fn check_fixed_daemon() -> Result<(), StoreError> {
+    const DIRECTORY: &str = "/Library/PrivilegedHelperTools/io.github.changlecat.tunlatch";
+    const PROGRAM: &str = "/Library/PrivilegedHelperTools/io.github.changlecat.tunlatch/tunlatchd";
+    if !Uid::effective().is_root() || std::env::current_exe()? != Path::new(PROGRAM) {
+        return Err(StoreError::Refused(
+            "requires the fixed root-installed daemon",
+        ));
+    }
+    let chain = DirectoryChain::open_with_leaf(Path::new(DIRECTORY), 0, true, false)?;
+    let file: File = openat(chain.directory()?, "tunlatchd", file_flags(), Mode::empty())?.into();
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o755
+    {
+        return Err(StoreError::Refused(
+            "daemon must be a root-owned single-link 0755 file",
+        ));
+    }
+    check_empty_acl(&file, Path::new(PROGRAM))?;
+    chain.recheck()?;
+    let named: File = openat(chain.directory()?, "tunlatchd", file_flags(), Mode::empty())?.into();
+    if identity(&metadata) != identity(&named.metadata()?)
+        || identity(&metadata) != identity(&file.metadata()?)
+    {
+        return Err(StoreError::Refused("daemon file changed during validation"));
+    }
+    Ok(())
 }
 
 fn check_directory(

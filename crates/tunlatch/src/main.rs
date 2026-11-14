@@ -124,6 +124,9 @@ fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()>
                 ReferenceRecordStatus::ReleaseRecordPresent => {
                     "release record exists; outcome requires reconciliation"
                 }
+                ReferenceRecordStatus::AnchorRecordPresent => {
+                    "anchor or hook record exists; outcome requires reconciliation"
+                }
                 ReferenceRecordStatus::Missing => "no reference acquisition record",
                 ReferenceRecordStatus::AcquisitionUnconfirmed => "acquisition outcome unconfirmed",
                 ReferenceRecordStatus::RecordedBootDiffers => "record belongs to a different boot",

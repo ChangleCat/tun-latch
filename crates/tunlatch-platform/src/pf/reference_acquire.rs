@@ -40,12 +40,12 @@ pub enum AcquireError {
 pub struct AcquiredReference {
     token: reference::ReferenceToken,
     creator_pid: u32,
-    boot_session: String,
-    session: [u8; 16],
+    pub(super) boot_session: String,
+    pub(super) session: [u8; 16],
     acquisition_identity: RecordIdentity,
     // Keep the protected store's cooperating-writer lock for the entire live handle.
     // Dropping it never releases the PF reference or removes its durable receipt.
-    store: SystemRecordStore,
+    pub(super) store: SystemRecordStore,
 }
 
 impl std::fmt::Debug for AcquiredReference {
@@ -59,6 +59,27 @@ impl std::fmt::Debug for AcquiredReference {
 }
 
 impl AcquiredReference {
+    pub(super) fn recheck_current(&self) -> Result<(), AcquireError> {
+        let current = self
+            .store
+            .read(RecordKind::PfReference)?
+            .ok_or(AcquireError::Refused("acquisition record missing"))?;
+        if current.identity() != self.acquisition_identity
+            || self.store.read(RecordKind::PfReferenceRelease)?.is_some()
+            || snapshot::boot_session()? != self.boot_session
+        {
+            return Err(AcquireError::Unconfirmed);
+        }
+        let listing = snapshot::query(snapshot::Query::References)?;
+        if snapshot::boot_session()? != self.boot_session
+            || !reference::contains_reference(&listing, self.token, self.creator_pid)
+                .map_err(|_| AcquireError::Unconfirmed)?
+        {
+            return Err(AcquireError::Unconfirmed);
+        }
+        Ok(())
+    }
+
     /// PID reported by the completed `pfctl -E` child.
     pub fn creator_pid(&self) -> u32 {
         self.creator_pid
@@ -189,6 +210,8 @@ struct ReadRecord {
 pub enum ReferenceRecordStatus {
     /// A release record exists and requires separate reconciliation.
     ReleaseRecordPresent,
+    /// An anchor transaction or hook record exists and requires separate reconciliation.
+    AnchorRecordPresent,
     /// No reference acquisition record exists in the fixed protected slot.
     Missing,
     /// An intent or a child return cannot establish a successful acquisition.
@@ -211,6 +234,10 @@ pub fn inspect_record() -> Result<ReferenceRecordStatus, AcquireError> {
     let store = SystemRecordStore::open()?;
     if store.read(RecordKind::PfReferenceRelease)?.is_some() {
         return Ok(ReferenceRecordStatus::ReleaseRecordPresent);
+    }
+    if store.read(RecordKind::PfHook)?.is_some() || store.read(RecordKind::PfAnchorStage)?.is_some()
+    {
+        return Ok(ReferenceRecordStatus::AnchorRecordPresent);
     }
     let Some(record) = store.read(RecordKind::PfReference)? else {
         return Ok(ReferenceRecordStatus::Missing);
@@ -447,7 +474,11 @@ fn save(records: &mut impl Records, record: &Record<'_>) -> Result<RecordIdentit
 /// The synchronous OS calls and child reaping can block beyond the nominal query deadline.
 pub fn acquire_once() -> Result<AcquiredReference, AcquireError> {
     let mut store = SystemRecordStore::open()?;
-    if store.existing()? || store.read(RecordKind::PfReferenceRelease)?.is_some() {
+    if store.existing()?
+        || store.read(RecordKind::PfReferenceRelease)?.is_some()
+        || store.read(RecordKind::PfAnchorStage)?.is_some()
+        || store.read(RecordKind::PfHook)?.is_some()
+    {
         return Err(AcquireError::Refused(
             "reference or release record already exists",
         ));
