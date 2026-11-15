@@ -252,6 +252,11 @@ async fn handle(mut stream: UnixStream, state: ServiceState) -> Result<(), IpcEr
                     code: ErrorCode::SimulationUnavailable,
                 },
             },
+            Request::PfSessionStatus {} | Request::PfStart {} | Request::PfStop {} => {
+                Reply::Error {
+                    code: ErrorCode::PfOperationUnavailable,
+                }
+            }
         }
     };
     tokio::time::timeout_at(

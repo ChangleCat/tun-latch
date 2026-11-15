@@ -93,6 +93,45 @@ pub fn verify(
     Ok(())
 }
 
+/// Derive the exact foreign-rule baseline from a current, complete root observation.
+///
+/// This only compares bytes and the expected position; it does not establish ownership or make
+/// the subsequent deletion atomic against other PF writers.
+pub(super) fn baseline_for_removal(
+    current: Observation<'_>,
+    anchor: &str,
+    native_index: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let observed = lines(Observation {
+        bytes: current.bytes,
+        complete: current.complete,
+    })?;
+    let scrub_offset = usize::from(observed.first() == Some(&SYSTEM_SCRUB));
+    let display_index = native_index
+        .checked_add(scrub_offset)
+        .ok_or("invalid insertion index")?;
+    let call = format!("anchor \"{anchor}\" all\n");
+    if observed.get(display_index) != Some(&call.as_bytes()) {
+        return Err("root call missing, malformed, or at wrong index");
+    }
+    let mut baseline = Vec::with_capacity(current.bytes.len().saturating_sub(call.len()));
+    for (index, line) in observed.into_iter().enumerate() {
+        if index != display_index {
+            baseline.extend_from_slice(line);
+        }
+    }
+    verify(
+        Observation {
+            bytes: &baseline,
+            complete: true,
+        },
+        current,
+        anchor,
+        native_index,
+    )?;
+    Ok(baseline)
+}
+
 /// Validate an insertion position in the native PF_PASS filter ruleset.
 pub fn validate_index(
     baseline: Observation<'_>,
@@ -176,6 +215,52 @@ mod tests {
             assert!(verify(observe(BASE), observe(&current), ANCHOR, index).is_ok());
         }
         assert!(verify(observe(b""), observe(call().as_bytes()), ANCHOR, 0).is_ok());
+    }
+
+    #[test]
+    fn removal_baseline_preserves_foreign_rules_changed_during_session() -> Result<(), &'static str>
+    {
+        let current = format!(
+            "pass in all\n{}anchor \"com.apple/*\" all\nblock out all\npass out proto tcp all\n",
+            call()
+        );
+        let before_removal = baseline_for_removal(observe(current.as_bytes()), ANCHOR, 1)?;
+        assert_eq!(
+            before_removal,
+            b"pass in all\nanchor \"com.apple/*\" all\nblock out all\npass out proto tcp all\n"
+        );
+        assert!(
+            verify_detached(observe(&before_removal), observe(&before_removal), ANCHOR).is_ok()
+        );
+        assert!(baseline_for_removal(observe(current.as_bytes()), ANCHOR, 0).is_err());
+        let duplicate = format!("{current}{}", call());
+        assert!(baseline_for_removal(observe(duplicate.as_bytes()), ANCHOR, 1).is_err());
+        assert!(
+            baseline_for_removal(
+                Observation {
+                    bytes: current.as_bytes(),
+                    complete: false
+                },
+                ANCHOR,
+                1
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removal_baseline_accounts_for_system_scrub() -> Result<(), &'static str> {
+        let current = format!(
+            "scrub-anchor \"com.apple/*\" all fragment reassemble\n{}pass all\n",
+            call()
+        );
+        let before_removal = baseline_for_removal(observe(current.as_bytes()), ANCHOR, 0)?;
+        assert_eq!(
+            before_removal,
+            b"scrub-anchor \"com.apple/*\" all fragment reassemble\npass all\n"
+        );
+        Ok(())
     }
 
     #[test]

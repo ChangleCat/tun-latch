@@ -50,6 +50,8 @@ pub enum RecordKind {
     PfHookRemoval,
     /// Private PF anchor clearing intent and receipt.
     PfAnchorClear,
+    /// Durable marker for retiring a fully verified PF session's local records.
+    PfRetirement,
 }
 
 impl RecordKind {
@@ -64,6 +66,7 @@ impl RecordKind {
             Self::PfHook => "pf-hook.record",
             Self::PfHookRemoval => "pf-hook-removal.record",
             Self::PfAnchorClear => "pf-anchor-clear.record",
+            Self::PfRetirement => "pf-retirement.record",
         }
     }
 
@@ -77,6 +80,7 @@ impl RecordKind {
             Self::PfHook => "pf-hook.pending",
             Self::PfHookRemoval => "pf-hook-removal.pending",
             Self::PfAnchorClear => "pf-anchor-clear.pending",
+            Self::PfRetirement => "pf-retirement.pending",
         }
     }
 
@@ -90,6 +94,7 @@ impl RecordKind {
             Self::PfHook => 6,
             Self::PfHookRemoval => 7,
             Self::PfAnchorClear => 8,
+            Self::PfRetirement => 9,
         }
     }
 }
@@ -254,6 +259,25 @@ impl UserRecordStore {
     pub fn replace(&mut self, kind: RecordKind, record: &StoredRecord) -> Result<(), StoreError> {
         self.inner.replace(kind, record, |_| Ok(()))
     }
+
+    #[cfg(test)]
+    pub(crate) fn require_no_pending(&self, kind: RecordKind) -> Result<(), StoreError> {
+        self.inner.require_no_pending(kind)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_checked(
+        &mut self,
+        kind: RecordKind,
+        expected: &StoredRecord,
+    ) -> Result<(), StoreError> {
+        self.inner.remove_checked(kind, expected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_records_directory(&self) -> Result<(), StoreError> {
+        self.inner.sync_records_directory()
+    }
 }
 
 /// Fixed system-path storage, not a `ProtectedRoot` or administrator authorization credential.
@@ -286,6 +310,19 @@ impl SystemRecordStore {
         self.inner.require_no_pending(kind)
     }
 
+    // PF retirement uses this only for records bound by a verified-shutdown completion marker.
+    pub(crate) fn remove_checked(
+        &mut self,
+        kind: RecordKind,
+        expected: &StoredRecord,
+    ) -> Result<(), StoreError> {
+        self.inner.remove_checked(kind, expected)
+    }
+
+    pub(crate) fn sync_records_directory(&self) -> Result<(), StoreError> {
+        self.inner.sync_records_directory()
+    }
+
     /// Replace fixed record data only; this operation never changes PF or system services.
     pub fn replace(&mut self, kind: RecordKind, record: &StoredRecord) -> Result<(), StoreError> {
         self.inner.replace(kind, record, |_| Ok(()))
@@ -298,6 +335,56 @@ struct Store {
 }
 
 impl Store {
+    fn sync_records_directory(&self) -> Result<(), StoreError> {
+        self.recheck()?;
+        self.chain.directory()?.sync_all()?;
+        self.recheck()
+    }
+
+    fn remove_checked(
+        &mut self,
+        kind: RecordKind,
+        expected: &StoredRecord,
+    ) -> Result<(), StoreError> {
+        self.require_no_pending(kind)?;
+        if self.read(kind)?.as_ref() != Some(expected) {
+            return Err(StoreError::Refused("record changed before removal"));
+        }
+        let file: File = openat(
+            self.chain.directory()?,
+            kind.file_name(),
+            file_flags(),
+            Mode::empty(),
+        )?
+        .into();
+        check_file(
+            &file,
+            self.chain.owner,
+            &self.chain.path().join(kind.file_name()),
+        )?;
+        self.recheck()?;
+        if self.read(kind)?.as_ref() != Some(expected) {
+            return Err(StoreError::Refused("record changed before removal"));
+        }
+        check_file(
+            &file,
+            self.chain.owner,
+            &self.chain.path().join(kind.file_name()),
+        )?;
+        unlinkat(
+            self.chain.directory()?,
+            kind.file_name(),
+            UnlinkatFlags::NoRemoveDir,
+        )?;
+        self.chain
+            .directory()?
+            .sync_all()
+            .map_err(|error| unknown(CommitStage::DirectorySync, error.into()))?;
+        self.recheck()
+            .map_err(|error| unknown(CommitStage::DirectorySync, error))?;
+        Ok(())
+    }
+
     fn require_no_pending(&self, kind: RecordKind) -> Result<(), StoreError> {
         self.recheck()?;
         match fstatat(
@@ -832,6 +919,26 @@ mod tests {
             store.inner.require_no_pending(kind),
             Err(StoreError::PendingRecord(RecordKind::PfHook))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn checked_removal_preserves_changed_or_pending_records() -> TestResult {
+        let (directory, mut store, record) = fixture()?;
+        let kind = RecordKind::PfReference;
+        store.replace(kind, &record)?;
+        let other = StoredRecord::new(RecordIdentity::new([2; 32])?, b"different".to_vec())?;
+        assert!(store.inner.remove_checked(kind, &other).is_err());
+        assert_eq!(store.read(kind)?, Some(record.clone()));
+        let pending = directory.path().join(kind.temporary_name());
+        std::fs::write(&pending, b"unresolved")?;
+        assert!(matches!(
+            store.inner.remove_checked(kind, &record),
+            Err(StoreError::PendingRecord(_))
+        ));
+        std::fs::remove_file(pending)?;
+        store.inner.remove_checked(kind, &record)?;
+        assert!(store.read(kind)?.is_none());
         Ok(())
     }
 

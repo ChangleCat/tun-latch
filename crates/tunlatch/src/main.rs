@@ -1,4 +1,4 @@
-//! CLI and terminal interface. PF inspection requires root and is read-only.
+//! CLI and terminal interface, including explicit privileged PF-session control.
 
 mod config_command;
 mod identity_command;
@@ -13,14 +13,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tunlatch_core::config::DesiredProtection;
 use tunlatch_core::control::{SimulationRequest, SimulationStatus};
 use tunlatch_ipc::{
-    query_network_status, query_simulation, query_status, query_system_network_status,
-    query_system_status, submit_simulation,
+    PfStartResult, PfStopResult, query_network_status, query_pf_session, query_simulation,
+    query_status, query_system_network_status, query_system_status, start_pf_session,
+    stop_pf_session, submit_simulation,
 };
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "TunLatch macOS firewall framework (PF enforcement not yet available)"
+    about = "TunLatch macOS firewall framework (protection not yet verified)"
 )]
 struct Args {
     #[command(subcommand)]
@@ -66,7 +67,7 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
-    /// Read bounded PF observations as root; this does not change protection.
+    /// Inspect PF, control the live block-only session, or clean validated local records.
     Pf {
         #[command(subcommand)]
         command: PfCommand,
@@ -75,6 +76,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PfCommand {
+    /// Read the daemon's last local PF-session checkpoint; protection remains unknown.
+    SessionStatus {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start the same preconfigured block-only session again after its verified shutdown.
+    Start,
+    /// Ask the root-only endpoint to stop its live block-only session.
+    Stop,
     /// Read PF status, starter references, or filter rules.
     Inspect {
         #[arg(value_enum)]
@@ -83,6 +93,11 @@ enum PfCommand {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Finish local record retirement after an independently verified PF reference release.
+    /// This never changes PF and requires root and the fixed protected store.
+    FinishRetirement,
+    /// Discard one prior boot's validated local PF records without changing current PF.
+    DiscardPreviousBoot,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -123,6 +138,9 @@ fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()>
             let status = inspect_record()
                 .context("cannot inspect PF reference record; protection remains unknown")?;
             let description = match status {
+                ReferenceRecordStatus::RetirementPending => {
+                    "verified-release record retirement is unfinished"
+                }
                 ReferenceRecordStatus::ReleaseRecordPresent => {
                     "release record exists; outcome requires reconciliation"
                 }
@@ -146,6 +164,15 @@ fn inspect_pf(what: PfInspection, session: Option<String>) -> anyhow::Result<()>
             let report = tunlatch_platform::pf::recovery::inspect()
                 .context("cannot inspect PF recovery state; protection remains unknown")?;
             println!("boot: {:?}", report.boot);
+            if let Some(remaining) = report.retirement_remaining {
+                println!("verified-release record retirement pending: {remaining} records remain");
+                println!("diagnostic only; current PF state and protection remain unknown");
+                return Ok(());
+            }
+            println!(
+                "initial PF: {:?}, starter references: {:?}",
+                report.initial_pf, report.initial_reference_count
+            );
             println!(
                 "records: acquire={:?}, stage={:?}, hook={:?}, removal={:?}, clear={:?}, release={:?}",
                 report.acquisition,
@@ -360,8 +387,84 @@ async fn main() -> anyhow::Result<()> {
             command: IdentityCommand::Correlate { pid, cdhash, json },
         } => identity_command::correlate(pid, cdhash, json).await?,
         Command::Pf {
+            command: PfCommand::SessionStatus { json },
+        } => {
+            let status = query_pf_session()
+                .await
+                .context("cannot obtain PF session checkpoint; protection remains unknown")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "PF session phase: {:?}; last stop: {:?}",
+                    status.phase, status.last_stop
+                );
+                println!("Local checkpoint only; current PF state and protection remain unknown.");
+            }
+        }
+        Command::Pf {
+            command: PfCommand::Start,
+        } => {
+            anyhow::ensure!(
+                nix::unistd::geteuid().is_root(),
+                "PF start requires effective UID 0; no request was sent"
+            );
+            let result = start_pf_session().await.map_err(|error| match error {
+                tunlatch_ipc::IpcError::Remote(_) => anyhow::anyhow!("PF start was rejected: {error}"),
+                _ => anyhow::anyhow!("PF start exchange failed: {error}; the request may have been accepted, so check pf session-status before another request"),
+            })?;
+            match result {
+                PfStartResult::Accepted => println!(
+                    "PF start accepted; check pf session-status for its result. Protection remains unknown."
+                ),
+                PfStartResult::AlreadyAttached => println!(
+                    "The last verified session phase is already attached; current PF state and protection remain unknown."
+                ),
+            }
+        }
+        Command::Pf {
+            command: PfCommand::Stop,
+        } => {
+            anyhow::ensure!(
+                nix::unistd::geteuid().is_root(),
+                "PF stop requires effective UID 0; no request was sent"
+            );
+            let result = stop_pf_session().await.map_err(|error| match error {
+                tunlatch_ipc::IpcError::Remote(_) => anyhow::anyhow!("PF stop was rejected: {error}"),
+                _ => anyhow::anyhow!("PF stop exchange failed: {error}; the request may have been accepted, so check pf session-status before another request"),
+            })?;
+            match result {
+                PfStopResult::Accepted => println!(
+                    "PF stop accepted; check pf session-status for its result. Protection remains unknown."
+                ),
+                PfStopResult::AlreadyStopped => println!(
+                    "This live session already completed shutdown; protection remains unknown."
+                ),
+            }
+        }
+        Command::Pf {
             command: PfCommand::Inspect { what, session },
         } => tokio::task::spawn_blocking(move || inspect_pf(what, session)).await??,
+        Command::Pf {
+            command: PfCommand::FinishRetirement,
+        } => {
+            let finished =
+                tokio::task::spawn_blocking(tunlatch_platform::pf::retirement::finish_completed)
+                    .await??;
+            if finished {
+                println!("completed PF session records retired; PF was not changed");
+            } else {
+                println!("no completed PF session retirement marker; PF was not changed");
+            }
+        }
+        Command::Pf {
+            command: PfCommand::DiscardPreviousBoot,
+        } => {
+            let count =
+                tokio::task::spawn_blocking(tunlatch_platform::pf::recovery::discard_previous_boot)
+                    .await??;
+            println!("discarded {count} previous-boot PF records; current PF was not changed");
+        }
         Command::Simulate {
             runtime_dir,
             json,

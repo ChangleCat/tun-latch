@@ -8,11 +8,12 @@ pub mod qualification;
 pub mod recovery;
 pub mod reference;
 pub mod reference_acquire;
+pub mod retirement;
 pub mod rules;
+pub mod session;
 pub mod snapshot;
 
-// The retained writer remains restricted to the removed lab executable until a protected
-// product session and recovery protocol are in place. Only reads are connected here.
+// The native writer is restricted to the protected installed daemon and its guarded session.
 #[allow(dead_code)]
 mod native_hook;
 

@@ -1,4 +1,4 @@
-//! Versioned local status and isolated simulation protocol. No PF mutation is exposed.
+//! Versioned local status, simulation and separately authenticated PF-session protocol.
 
 pub mod endpoint;
 pub mod frame;
@@ -14,7 +14,7 @@ use tunlatch_core::control::{SimulationError, SimulationRequest, SimulationStatu
 use tunlatch_core::status::{NetworkObservation, Status};
 
 use crate::protocol::{
-    ErrorCode, PROTOCOL_VERSION, Reply, Request, RequestEnvelope, ResponseEnvelope,
+    ErrorCode, PROTOCOL_VERSION, PfSessionStatus, Reply, Request, RequestEnvelope, ResponseEnvelope,
 };
 
 /// Upper bound for a complete request/response exchange, including connect and partial frames.
@@ -136,8 +136,74 @@ pub async fn read_system_query(
     match envelope.request {
         Request::Status {} => Ok(SystemQuery::Status),
         Request::NetworkStatus {} => Ok(SystemQuery::NetworkStatus),
-        Request::Simulate { .. } | Request::SimulationStatus {} => Err(IpcError::QueryOperation),
+        Request::Simulate { .. }
+        | Request::SimulationStatus {}
+        | Request::PfSessionStatus {}
+        | Request::PfStart {}
+        | Request::PfStop {} => Err(IpcError::QueryOperation),
     }
+}
+
+/// Read the block-only session's last checkpoint via the owner-readable system query socket.
+/// The returned phase does not establish actual protection or current PF state.
+pub async fn query_pf_session() -> Result<PfSessionStatus, IpcError> {
+    match exchange_system(Request::PfSessionStatus {}).await? {
+        Reply::PfSessionStatus { status } => Ok(status),
+        _ => Err(IpcError::UnexpectedReply),
+    }
+}
+
+/// Result of submitting a stop request to the root-only system control endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PfStopResult {
+    /// The request was accepted, but may still be running or may later fail.
+    Accepted,
+    /// This live session already completed its verified shutdown.
+    AlreadyStopped,
+}
+
+/// Result of asking the root-only endpoint to start the preconfigured session again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PfStartResult {
+    /// The request was accepted, but may still be running or may later fail.
+    Accepted,
+    /// This live session's last locally verified phase is already attached.
+    AlreadyAttached,
+}
+
+/// Start the same preconfigured block-only session after its verified shutdown.
+/// A transport error or timeout does not establish rejection or cancellation; check
+/// the session status before considering another explicit request.
+pub async fn start_pf_session() -> Result<PfStartResult, IpcError> {
+    match exchange_pf_control(Request::PfStart {}).await? {
+        Reply::PfStartAccepted {} => Ok(PfStartResult::Accepted),
+        Reply::PfAlreadyAttached {} => Ok(PfStartResult::AlreadyAttached),
+        _ => Err(IpcError::UnexpectedReply),
+    }
+}
+
+/// Request shutdown of the live block-only session. Actual effective UID must be root.
+/// A transport error or timeout does not mean the request was rejected or cancelled;
+/// query the session status before considering another explicit request.
+pub async fn stop_pf_session() -> Result<PfStopResult, IpcError> {
+    match exchange_pf_control(Request::PfStop {}).await? {
+        Reply::PfStopAccepted {} => Ok(PfStopResult::Accepted),
+        Reply::PfAlreadyStopped {} => Ok(PfStopResult::AlreadyStopped),
+        _ => Err(IpcError::UnexpectedReply),
+    }
+}
+
+async fn exchange_pf_control(request: Request) -> Result<Reply, IpcError> {
+    let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+    tokio::time::timeout_at(deadline, async {
+        let stream = privileged_endpoint::connect_control().await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(IpcError::Timeout);
+        }
+        exchange_connected(stream, request).await
+    })
+    .await
+    .map_err(|_| IpcError::Timeout)?
 }
 
 /// Query only the explicitly enabled in-memory simulation.

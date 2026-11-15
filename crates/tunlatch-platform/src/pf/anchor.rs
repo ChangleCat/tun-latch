@@ -1,7 +1,7 @@
 //! Guarded PF anchor rule staging for the retained product session.
 //!
-//! Staging does not attach the anchor or prove that traffic is filtered. Its authorization has
-//! no constructor until the privileged backend can establish resource ownership and scope.
+//! Staging does not attach the anchor or prove that traffic is filtered. Authorization is
+//! constructed inside the PF backend and is not available to external callers.
 
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -20,16 +20,15 @@ use crate::store::{RecordIdentity, RecordKind, StoreError, StoredRecord, SystemR
 
 /// Authority to stage a rule for one approved interface and one live PF session.
 ///
-/// No constructor is provided until the privileged backend verifies the interface, fresh anchor,
-/// execution scope and writer coordination. Configuration or interface names do not grant it.
+/// Only the internal session backend constructs this value for the selected interface and session.
 ///
 /// ```compile_fail
 /// use tunlatch_platform::pf::anchor::StageAuthorization;
 /// let _ = StageAuthorization { session: [1; 16], interface: "en0".into() };
 /// ```
 pub struct StageAuthorization {
-    session: [u8; 16],
-    interface: String,
+    pub(super) session: [u8; 16],
+    pub(super) interface: String,
 }
 
 /// Error while recording, submitting or observing an anchor rule transaction.
@@ -55,36 +54,36 @@ pub struct StagedAnchor {
 }
 
 /// Authority to attach the staged anchor after checking root rules and writer coordination.
-/// No constructor is available until those guarantees are established by the real backend.
+/// Only the internal session backend constructs this value.
 ///
 /// ```compile_fail
 /// use tunlatch_platform::pf::anchor::HookAuthorization;
 /// let _ = HookAuthorization { session: [1; 16] };
 /// ```
 pub struct HookAuthorization {
-    session: [u8; 16],
+    pub(super) session: [u8; 16],
 }
 
 /// Authority to remove the exact hook after an explicit, verified shutdown decision.
-/// There is no constructor until the privileged control and resource-ownership checks exist.
+/// Only the internal session backend constructs this value.
 ///
 /// ```compile_fail
 /// use tunlatch_platform::pf::anchor::DetachAuthorization;
 /// let _ = DetachAuthorization { session: [1; 16] };
 /// ```
 pub struct DetachAuthorization {
-    session: [u8; 16],
+    pub(super) session: [u8; 16],
 }
 
 /// Authority to clear a detached, exclusively owned session anchor.
-/// The product currently provides no constructor for this authority.
+/// Only the internal session backend constructs this value.
 ///
 /// ```compile_fail
 /// use tunlatch_platform::pf::anchor::ClearAuthorization;
 /// let _ = ClearAuthorization { session: [1; 16] };
 /// ```
 pub struct ClearAuthorization {
-    session: [u8; 16],
+    pub(super) session: [u8; 16],
 }
 
 /// A root hook observed after insertion, without a claim of effective packet protection.
@@ -95,7 +94,6 @@ pub struct AttachedAnchor {
     interface: String,
     stage_identity: RecordIdentity,
     hook_identity: RecordIdentity,
-    root_before: Vec<u8>,
 }
 
 impl std::fmt::Debug for AttachedAnchor {
@@ -155,12 +153,12 @@ impl DetachedAnchor {
 
     /// Clear only the detached session anchor's filter rules.
     ///
-    /// The authority is currently unconstructible. Existing stage and removal receipts,
+    /// Existing stage and removal receipts,
     /// current root rules, hook absence, anchor contents and PF reference are checked first.
     /// The transaction is recorded before submission; failures are never retried or cleaned up
     /// here. This does not release the PF reference or prove ownership against foreign writers.
     pub fn clear(
-        self,
+        &self,
         owner: &mut AcquiredReference,
         authorization: ClearAuthorization,
     ) -> Result<ClearedAnchor, StageError> {
@@ -301,12 +299,12 @@ impl AttachedAnchor {
 
     /// Remove this exact root hook after an explicit, independently authorized shutdown.
     ///
-    /// The authorization is currently unconstructible. The original session lock and
+    /// The original session lock and
     /// records must still match; intent is durable before deletion and the returned state
     /// is independently checked. An uncertain result is never retried or cleaned up here.
     /// This removes the hook but does not clear its anchor or release the PF reference.
     pub fn detach(
-        self,
+        &self,
         owner: &mut AcquiredReference,
         authorization: DetachAuthorization,
     ) -> Result<DetachedAnchor, StageError> {
@@ -364,6 +362,17 @@ impl AttachedAnchor {
             }
             Ok(())
         };
+        let current_root = snapshot::query(snapshot::Query::RootRules)
+            .map_err(|_| StageError::Refused("root rules unavailable"))?;
+        let removal_baseline = hook_readback::baseline_for_removal(
+            hook_readback::Observation {
+                bytes: &current_root,
+                complete: true,
+            },
+            &name,
+            self.index as usize,
+        )
+        .map_err(|_| StageError::Refused("original hook or current root rules changed"))?;
         let verify_attached = || -> Result<(), StageError> {
             check_reference()?;
             if writer.observe().map_err(|_| StageError::Unconfirmed)?
@@ -379,7 +388,7 @@ impl AttachedAnchor {
                 snapshot::query(snapshot::Query::RootRules).map_err(|_| StageError::Unconfirmed)?;
             hook_readback::verify(
                 hook_readback::Observation {
-                    bytes: &self.root_before,
+                    bytes: &removal_baseline,
                     complete: true,
                 },
                 hook_readback::Observation {
@@ -399,6 +408,7 @@ impl AttachedAnchor {
             ticket: self.ticket,
             stage_identity: self.stage_identity,
             hook_identity: self.hook_identity,
+            root_before: &removal_baseline,
         };
         let removal_identity = remove_with(
             &mut owner.store,
@@ -423,7 +433,7 @@ impl AttachedAnchor {
                     .map_err(|_| StageError::Unconfirmed)?;
                 hook_readback::verify_detached(
                     hook_readback::Observation {
-                        bytes: &self.root_before,
+                        bytes: &removal_baseline,
                         complete: true,
                     },
                     hook_readback::Observation {
@@ -440,10 +450,10 @@ impl AttachedAnchor {
             .map_err(|_| StageError::Unconfirmed)?;
         Ok(DetachedAnchor {
             session: self.session,
-            interface: self.interface,
+            interface: self.interface.clone(),
             stage_identity: self.stage_identity,
             removal_identity,
-            root_before: self.root_before,
+            root_before: removal_baseline,
         })
     }
 }
@@ -460,12 +470,12 @@ impl StagedAnchor {
 
     /// Attach this staged anchor through the fixed native root-filter insertion.
     ///
-    /// The authorization cannot currently be constructed. Intent and the returned per-rule
+    /// Intent and the returned per-rule
     /// ticket are durably recorded before independent native and textual readback. An error
     /// after insertion never triggers removal or retry. The fixed system daemon and its parent
     /// path must be root-owned and protected. This does not prove traffic is protected.
     pub fn attach(
-        self,
+        &self,
         owner: &mut AcquiredReference,
         authorization: HookAuthorization,
     ) -> Result<AttachedAnchor, StageError> {
@@ -607,10 +617,9 @@ impl StagedAnchor {
             session: self.session,
             index,
             ticket,
-            interface: self.interface,
+            interface: self.interface.clone(),
             stage_identity: self.stage_identity,
             hook_identity,
-            root_before: baseline,
         })
     }
 }
@@ -618,7 +627,7 @@ impl StagedAnchor {
 impl AcquiredReference {
     /// Stage one stateless outbound drop rule in the session anchor using a PF transaction.
     ///
-    /// The authorization is currently unconstructible. The protected session lock is retained,
+    /// The protected session lock is retained,
     /// intent is persisted before submission, and one independent readback follows. Neither a
     /// successful transaction nor this readback verifies root attachment, TUN identity, old
     /// states or effective protection. The synchronous PF transaction may block indefinitely.
@@ -841,6 +850,7 @@ struct RemovalContext<'a> {
     ticket: NonZeroU64,
     stage_identity: RecordIdentity,
     hook_identity: RecordIdentity,
+    root_before: &'a [u8],
 }
 
 #[derive(Serialize)]
@@ -852,6 +862,7 @@ struct RemovalRecord<'a> {
     ticket: u64,
     stage_identity: String,
     hook_identity: String,
+    root_before: &'a str,
     stage: &'static str,
 }
 
@@ -892,14 +903,26 @@ fn remove_with(
     if context.session == [0; 16] || context.boot.is_empty() || records.removal_exists()? {
         return Err(StageError::Refused("existing or invalid hook removal"));
     }
+    hook_readback::validate_index(
+        hook_readback::Observation {
+            bytes: context.root_before,
+            complete: true,
+        },
+        &anchor_name(context.session),
+        context.index as usize,
+    )
+    .map_err(StageError::Refused)?;
+    let root_before = std::str::from_utf8(context.root_before)
+        .map_err(|_| StageError::Refused("invalid root baseline"))?;
     let mut record = RemovalRecord {
-        version: 1,
+        version: 2,
         boot_session: context.boot,
         session: context.session,
         index: context.index,
         ticket: context.ticket.get(),
         stage_identity: context.stage_identity.to_string(),
         hook_identity: context.hook_identity.to_string(),
+        root_before,
         stage: "intent",
     };
     save_removal(records, &record)?;
@@ -1229,6 +1252,7 @@ mod tests {
             ticket,
             stage_identity,
             hook_identity,
+            root_before: b"pass all\n",
         };
         let removal_identity = remove_with(
             &mut store,
@@ -1280,6 +1304,7 @@ mod tests {
             ticket,
             stage_identity,
             hook_identity,
+            root_before: b"pass all\n",
         };
         assert!(matches!(
             remove_with(

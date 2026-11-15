@@ -3,6 +3,7 @@
 //! A token and creator PID parsed here are observations, not proof of ownership: the caller
 //! must protect the receipt, bind it to the current boot and serialize writers before using it.
 
+use sha2::{Digest, Sha256};
 use std::num::NonZeroU64;
 
 const MAX_OUTPUT: usize = 65_536;
@@ -105,9 +106,38 @@ pub fn contains_reference(
     if creator_pid == 0 {
         return Err(InvalidReferenceOutput);
     }
+    for row in rows(listing)? {
+        if row.token == token.0 {
+            if row.pid != creator_pid || row.process != "pfctl" {
+                return Err(InvalidReferenceOutput);
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+struct Row<'a> {
+    pid: u32,
+    process: &'a str,
+    token: NonZeroU64,
+}
+
+fn take_last_field(line: &str) -> Result<(&str, &str), InvalidReferenceOutput> {
+    let line = line.trim_end_matches([' ', '\t']);
+    let split = line.rfind([' ', '\t']).ok_or(InvalidReferenceOutput)?;
+    let head = line[..split].trim_end_matches([' ', '\t']);
+    let tail = &line[split + 1..];
+    if head.is_empty() || tail.is_empty() {
+        return Err(InvalidReferenceOutput);
+    }
+    Ok((head, tail))
+}
+
+fn rows(listing: &[u8]) -> Result<Vec<Row<'_>>, InvalidReferenceOutput> {
     let listing = text(listing)?;
     if listing == "No pf starter references held\n" {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let mut lines = listing.lines();
     if lines.next() != Some("TOKENS:")
@@ -120,26 +150,29 @@ pub fn contains_reference(
         return Err(InvalidReferenceOutput);
     }
     let mut seen = std::collections::BTreeSet::new();
-    let mut found = false;
-    let mut count = 0;
+    let mut result = Vec::new();
     for line in lines {
-        count += 1;
-        if count > MAX_ROWS {
+        if result.len() >= MAX_ROWS {
             return Err(InvalidReferenceOutput);
         }
-        let fields: Vec<_> = line.split_ascii_whitespace().collect();
-        if fields.len() != 6 || fields[1].is_empty() || fields[4] != "days" {
+        let (rest, clock_text) = take_last_field(line.trim_start_matches([' ', '\t']))?;
+        let (rest, days_word) = take_last_field(rest)?;
+        let (rest, days) = take_last_field(rest)?;
+        let (rest, token_text) = take_last_field(rest)?;
+        let split = rest.find([' ', '\t']).ok_or(InvalidReferenceOutput)?;
+        let process = rest[split..].trim_matches([' ', '\t']);
+        if process.is_empty() || process.len() > 255 || days_word != "days" {
             return Err(InvalidReferenceOutput);
         }
-        let pid = decimal(fields[0])?.get();
+        let pid = decimal(&rest[..split])?.get();
         if pid > u64::from(u32::MAX) {
             return Err(InvalidReferenceOutput);
         }
-        let row_token = decimal(fields[2])?;
-        if !seen.insert(row_token) || fields[3].parse::<u32>().is_err() {
+        let row_token = decimal(token_text)?;
+        if !seen.insert(row_token) || days.parse::<u32>().is_err() {
             return Err(InvalidReferenceOutput);
         }
-        let mut clock = fields[5].split(':');
+        let mut clock = clock_text.split(':');
         for max in [23_u8, 59, 59] {
             let component = clock.next().ok_or(InvalidReferenceOutput)?;
             if component.len() != 2
@@ -152,17 +185,43 @@ pub fn contains_reference(
         if clock.next().is_some() {
             return Err(InvalidReferenceOutput);
         }
-        if row_token == token.0 {
-            if pid != u64::from(creator_pid) || fields[1] != "pfctl" {
-                return Err(InvalidReferenceOutput);
-            }
-            found = true;
-        }
+        result.push(Row {
+            pid: pid as u32,
+            process,
+            token: row_token,
+        });
     }
-    if count == 0 {
+    if result.is_empty() {
         return Err(InvalidReferenceOutput);
     }
-    Ok(found)
+    Ok(result)
+}
+
+/// Count and order-independent digest of the complete starter-reference inventory.
+/// Timestamp changes do not change the digest. This does not establish ownership or exclusivity.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct Inventory {
+    pub(super) count: u16,
+    pub(super) digest: [u8; 32],
+}
+
+pub(super) fn inventory(listing: &[u8]) -> Result<Inventory, InvalidReferenceOutput> {
+    let mut entries = rows(listing)?;
+    entries.sort_unstable_by_key(|row| row.token);
+    let count = u16::try_from(entries.len()).map_err(|_| InvalidReferenceOutput)?;
+    let mut hash = Sha256::new();
+    hash.update(b"tunlatch-pf-reference-inventory-v1\0");
+    hash.update(count.to_be_bytes());
+    for row in entries {
+        hash.update(row.token.get().to_be_bytes());
+        hash.update(row.pid.to_be_bytes());
+        hash.update((row.process.len() as u32).to_be_bytes());
+        hash.update(row.process.as_bytes());
+    }
+    Ok(Inventory {
+        count,
+        digest: hash.finalize().into(),
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +280,53 @@ mod tests {
         ] {
             assert!(contains_reference(bad.as_bytes(), token, 123).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_ignores_order_and_age_but_detects_identity_changes()
+    -> Result<(), InvalidReferenceOutput> {
+        let header = "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n";
+        let first = format!("{header}123 pfctl 42 0 days 00:00:01\n99 daemon 43 0 days 00:00:02\n");
+        let reordered =
+            format!("{header}99 daemon 43 2 days 12:30:00\n123 pfctl 42 1 days 01:00:00\n");
+        let changed = reordered.replace("99 daemon 43", "98 daemon 43");
+        let expected = inventory(first.as_bytes())?;
+        assert_eq!(expected.count, 2);
+        assert!(expected == inventory(reordered.as_bytes())?);
+        assert!(expected != inventory(changed.as_bytes())?);
+        assert_eq!(inventory(b"No pf starter references held\n")?.count, 0);
+        assert!(
+            inventory(
+                format!("{header}123 pfctl 42 0 days 00:00:01\n123 pfctl 42 0 days 00:00:01\n")
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_foreign_process_names_with_spaces_without_weakening_owner_checks()
+    -> Result<(), InvalidReferenceOutput> {
+        let header = "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n";
+        let listing = format!(
+            "{header}   99 Network Extension 43 0 days 00:00:02\n123 pfctl 42 0 days 00:00:01\n"
+        );
+        let token = parse_acquisition(true, b"Token : 42\n", b"")?;
+        assert!(contains_reference(listing.as_bytes(), token, 123)?);
+        let expected = inventory(listing.as_bytes())?;
+        assert_eq!(expected.count, 2);
+        assert!(
+            expected
+                != inventory(
+                    listing
+                        .replace("Network Extension", "Network  Extension")
+                        .as_bytes()
+                )?
+        );
+        let wrong_owner = listing.replace("123 pfctl 42", "123 pfctl helper 42");
+        assert!(contains_reference(wrong_owner.as_bytes(), token, 123).is_err());
         Ok(())
     }
 }
